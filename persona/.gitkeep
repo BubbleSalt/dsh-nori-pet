@@ -1,0 +1,5 @@
+# 人设资产占位目录
+# 授权文件由用户放置（不入库、不随 Release 分发）：
+#   persona/prompt.txt   → 人设 system prompt（内容为授权文本，源出人设原文档）
+#   persona/reframe.txt  → 改写任务补充指令
+# 缺失时桌宠改写层自动关闭（照常朗读 agent 原始输出），安装脚本末尾有提示。

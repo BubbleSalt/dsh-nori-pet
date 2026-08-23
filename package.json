@@ -1,0 +1,58 @@
+{
+  "name": "@dsh-external/dsh-nori-pet",
+  "version": "0.0.1",
+  "description": "Nori 桌宠：Live2D 立绘 + 唇同步 + 以 Nori 声线朗读 agent 输出",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "main": "./lib/index.js",
+  "types": "./lib/types/index.d.ts",
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "nori.config.example.json",
+    "README.md"
+  ],
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BubbleSalt/dsh-nori-pet.git"
+  },
+  "homepage": "https://github.com/BubbleSalt/dsh-nori-pet",
+  "bugs": {
+    "url": "https://github.com/BubbleSalt/dsh-nori-pet/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.0",
+    "tsdown": "^0.22.14",
+    "cordis": "npm:@deepseek-ai/cordis@^4.0.1",
+    "schemastery": "npm:@deepseek-ai/schemastery@^3.18.1",
+    "cosmokit": "npm:@deepseek-ai/cosmokit@^1.8.2",
+    "pixi.js": "^7.4.0",
+    "pixi-live2d-display": "^0.4.0",
+    "url": "^0.11.3"
+  },
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build:client": "tsdown",
+    "test:smoke": "node scripts/smoke-test.mjs",
+    "guard": "node scripts/guard-release.mjs",
+    "guard:staged": "node scripts/guard-release.mjs --staged"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  }
+}

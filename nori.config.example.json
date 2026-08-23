@@ -1,0 +1,12 @@
+{
+  "_comment": "Nori 桌宠安装配置（install.ps1 读取）。留空 = 使用默认约定（探测仓库内 Nori_web/、voice/、core 自动下载）。复制本文件为 nori.config.json 后编辑；nori.config.json 不进 git（含机器路径）。",
+  "modelDir": "",
+  "refAudio": "",
+  "refPrompt": "你好,初次见面,我的名字是Nori",
+  "ttsUrl": "http://127.0.0.1:9880/tts",
+  "sovits": {
+    "_comment": "GPT-SoVITS 服务配置（可选）。未配置时安装照常完成，但语音功能不可用——可运行 .\\install-sovits.ps1 一键部署后在此填写，或填外部已有部署的路径。",
+    "gsvBase": "",
+    "venvPy": ""
+  }
+}

@@ -1,0 +1,33 @@
+# ── 构建产物 ────────────────────────────────────
+node_modules/
+/lib/
+dist/
+*.tsbuildinfo
+*.tgz
+
+# ── 本地缓存 / 备份（不入库）───────────────────
+.npm-cache/
+.backup-*/
+*.bak*
+
+# ── 本机日志与排障痕迹 ──────────────────────────
+*.log
+
+# ── 团队资产原件：授权人设由用户放置到 persona/（不入库）；人设原文档如置于根目录请勿提交 ──
+
+# ── 人设资产（授权文本不入库：persona/prompt.txt + persona/reframe.txt）─
+persona/*
+!.gitkeep
+
+# ── 本机安装配置（含机器路径；模板 nori.config.example.json 入库）─
+nori.config.json
+
+# ── 模型/语音等外部资产从不入库 ──────────────────
+# 资产约定在仓库内占位目录（克隆即得结构，README 有说明）；内容不入库，.gitkeep 保留结构。
+Nori_web/*
+cubism_sdk/*
+voice/*
+GPT-SoVITS/*
+audio/*
+ffmpeg/*
+!.gitkeep

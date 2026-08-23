@@ -1,0 +1,19 @@
+name: guard
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      # 发布守卫：人设文本 / 机器路径 / 密钥 / 资产文件入树即失败
+      - run: node scripts/guard-release.mjs
+      # host 类型门禁（client 构建需本机下载的 Live2D Core，不在 CI 跑）
+      - run: npm run typecheck
