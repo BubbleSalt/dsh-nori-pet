@@ -19,6 +19,30 @@
 
 安装完长这样：浏览器右下角的 Nori——回话时张嘴、眨眼、跟着情绪换表情。
 
+### ✨ 功能一览
+
+- **Live2D 立绘常驻**：浏览器角落的 Nori，回话时张嘴、眨眼、跟情绪换表情；带睡眠与摸头小交互。
+- **Nori 声线朗读**：agent 的输出经本地 GPT-SoVITS 合成 Nori 声线，音量实时驱动口型（唇同步）。
+- **改写层（Nori 口吻）**：LLM 把输出改写成 Nori 的说话方式再朗读；可开关、可换声线、内置防幻觉（不虚构未发生的事）。
+- **流式分批低延迟**：句子成句即改写广播，长 turn 中途就开始播，不用等整轮结束；顺序不乱、不重排、不劈英文词。
+- **中英混排保护**：自动在中文与英文词之间补逗号、清反引号，避免 AR 对齐跳字/吞句（读出率实测 ~25% → ~90%+）。
+- **ttsWatch 守护**：GPT-SoVITS（9880）掉线后 30s 内自动拉起。
+- **会话全景广播**：assistant / user / tool / approval / turn-end / emote 事件实时推给 widget。
+- **权限申请播报**：agent 请求权限时**打断当前朗读**、优先播报"有权限申请：工具。原因：…"（原文播报、不走改写，保证准确），并切惊讶表情提醒你回来处理。
+- **一键部署**：`install-sovits.ps1` 可顺手装 GPT-SoVITS（约 2~3GB，可选默认权重 1GB+）；`install.ps1` 首次交互引导配置。
+- **安全边界**：仅放行本地来源；路径穿越 403；body 上限 16KB；会话维度 WS 过滤。
+
+### 🖱 交互操作
+
+Nori 常驻在浏览器角落，随时可以摆弄：
+
+- **移动位置**：按住 Nori 顶部那条细拖柄拖动，松手即固定；位置自动记住，下次打开还在原位。
+- **放大缩小**：点 Nori 身上的 **＋ / －** 按钮，或把鼠标放在 Nori 身上（或顶部拖柄上）滚轮缩放；比例同样自动记忆。
+- **调整体型**：点 **体型** 按钮打开面板，拖 **少女体型 / Q版** 两条滑槽（各 0~1）：少女曲线与 Q 版比例可自由混合、实时生效。
+- **摸头**：在 Nori 身上按住并来回摩擦一小会，会触发摸头台词和表情反应。
+- **睡眠**：90 秒没有交互会自己睡着（闭眼），戳她一下就醒。
+- **穿透画布**：Nori 所占区域不挡页面文字选取，把她放在内容上也不影响浏览。
+
 ---
 
 <a id="你需要准备的资产"></a>
@@ -70,7 +94,7 @@ git clone <仓库地址>
 |---|---|---|
 | `assetsDir` / `coreFile` | 空（探测 `Nori_web/`、`cubism_sdk/Core`） | 模型目录 / core 文件，绝对或相对仓库根 |
 | `ttsUrl` | `http://127.0.0.1:9880/tts` | GPT-SoVITS 地址（api_v2 端点） |
-| `refAudio` / `refPrompt` | 空（回退 `voice/nori.wav`） / `你好,初次见面,我的名字是Nori` | 声线 wav 路径与其转写文本 ⚠ 见下方[参考音频须知](#参考音频须知refaudio--refprompt) |
+| `refAudio` / `refPrompt` | 空（留空自动探测 `voice/` 下的 wav） / `你好,初次见面,我的名字是Nori` | 声线 wav 路径与其转写文本 ⚠ 见下方[参考音频须知](#参考音频须知refaudio--refprompt) |
 | `gsvBase` / `venvPy` | 空（探测 `GPT-SoVITS/`） | 守护拉起 api_v2 用的目录与 venv python |
 | `personaPrompt` / `personaReframe` | 空（探测 `persona/`） | 人设文件路径覆盖 |
 | `maxSentence` / `ttsTemperature` / `ttsTopK` / `ttsSpeedFactor` | 140 / 0.9 / 12 / 1.0 | 断句与合成参数，多数无需改动（0.9/12 为防 AR 循环卡顿的推荐值，勿降回低温低 top_k） |
@@ -84,7 +108,7 @@ git clone <仓库地址>
 
 - **换 `refAudio` 时，`refPrompt` 要同步换成新音频的转写**，否则 GPT-SoVITS 的 AR 条件作用会劣化：
   表现为**跳字/吞句**（中英混排时更明显）、音色漂移、听感不稳——不是偶发，是配置错误。
-- `refAudio` 留空时自动回退插件自带 `voice/nori.wav`（对应 `refPrompt` 默认值）。建议长度 3~10 秒（api_v2 强制要求）。
+- `refAudio` 留空时，install 会自动探测 `voice/` 目录下你放入的 wav（以相对路径写入配置）；`voice/` 也是空则用 GPT-SoVITS 服务端默认音色。建议参考音频长度 3~10 秒（api_v2 强制要求）。
 - 想要更"高昂/开心"的声线：换一段语气上扬的 wav 并填它的转写即可（本项目仓库不含声线资产，需自行放置）。
 
 ### 朗读文本规整（speak 自动处理，无需配置）
@@ -98,19 +122,22 @@ git clone <仓库地址>
 
 默认开启：把 assistant 输出改写成 Nori 的说话方式再朗读。
 
+- **总开关**：`nori.config.json` 的 `reframe.reframe`（`true` 开 / `false` 关）；关闭后直接朗读原文。
 - **API**：优先直连 **DeepSeek 官方 API**。在 `nori.config.json` 的 `reframe.apiKey` 填入你的 key，
   安装脚本会自动写入 dsh 的 credentials（`DEEPSEEK_NORI_API_KEY` ref），卸载脚本会一并移除——全程不用手动开文件；
   留空则自动回退到 dsh 内置 llm 服务（`deepseek-official` / `deepseek-chat`，与主会话共用计量）。
+- **流式分批（低延迟）**：句子成句即攒批（~150 字或 1.2s 无新句就改写广播），长 turn 中途就开始播；断句保序，无标点长段按自然断点软切——不会从英文单词中间劈开。
+- **防幻觉**：改写指令内置约束——只讲材料里真实有的内容；进行中的动作（"正在检查…"）不虚构完成结果，检查/验证类描述不自造结论。
 - **人设**：system 提示来自 `persona/prompt.txt`（授权文本，用户放置）+ `persona/reframe.txt`（改写任务指令，随仓库提供）；
   授权文本缺失时改写层自动关闭，直接朗读原文。
-- 进阶参数（`reframe` 总开关 / 超时 / 输入截断 / 追踪日志）见 `nori.config.example.json` 或 `src/index.ts` 的 Config 注释。
+- 进阶参数（超时 / 输入截断 / 追踪日志）见 `nori.config.example.json` 或 `src/index.ts` 的 Config 注释。
 
 ---
 
 <a id="gpt-sovits可选"></a>
 ## 🔊 GPT-SoVITS（可选）
 
-install **不会自动安装** GPT-SoVITS——没部署时一切照常，只是没有语音。
+GPT-SoVITS 是本地语音合成引擎（TTS）——Nori 用它把文字念成你的声线。install **不会自动安装**它——没部署时一切照常，只是没有语音。
 
 ```powershell
 .\install-sovits.ps1                      # 一键部署（clone + venv + 依赖）
@@ -123,7 +150,7 @@ install **不会自动安装** GPT-SoVITS——没部署时一切照常，只是
 **模型文件在哪？**
 - 一键：`.\install-sovits.ps1 -DownloadModels` 会把官方默认权重（HuggingFace，约 1GB+）自动放进 **`GPT-SoVITS/GPT_SoVITS/pretrained_models/`**；
 - 已有权重 / 想换音色：把下载或微调好的模型（`*.pth` 等）手动放进**同一个** `GPT-SoVITS/GPT_SoVITS/pretrained_models/` 目录即可（GPT-SoVITS 的推理默认落点）；
-- 该目录为空时 api.py 推理会失败（表现为没声音）——补上权重后重跑 `.\install.sovits.ps1` 或直接重启 ttsWatch 即可。权重为官方闭源，仅本机使用、不入仓库。
+- 该目录为空时 api.py 推理会失败（表现为没声音）——补上权重后重跑 `.\install-sovits.ps1` 或直接重启 ttsWatch 即可。权重为官方闭源，仅本机使用、不入仓库。
 
 ---
 
@@ -173,6 +200,37 @@ install **不会自动安装** GPT-SoVITS——没部署时一切照常，只是
 
 ---
 
+<a id="调试接口"></a>
+## 🔬 调试接口（本地开发）
+
+所有端点挂在插件前缀下：`http://127.0.0.1:3080/@bubblesalt/dsh-nori-pet`
+
+| 接口 | 方法 | 用途 |
+|---|---|---|
+| `/api/status` | GET | 运行状态与统计：TTS 地址、WS 连接数、事件/分块/播报计数、最近广播与最近一帧——排障先看这里 |
+| `/api/ws-test?text=你好` | GET | 向所有连接中的 widget 推一条文本（走正常朗读链路），不打扰业务也能验证"能不能响" |
+| `/api/emote?e=happy&text=可选` | GET | 手动触发情绪联动：`e` 取 13 种情绪之一（`happy / excited / angry / sad / doubt / troubled / shy / surprised / dizzy / serious / speechless / think / default`），带 `text` 则同时播报 |
+| `/api/speak` | POST | 朗读代理：body 为 JSON `{"text":"…"}`（上限 16KB / 512 字），经本地 GPT-SoVITS 合成 Nori 声线 WAV 并让 widget 播放；也可用 curl 直接取音频验证 TTS 链路 |
+
+示例：
+
+```powershell
+# 1) 状态
+Invoke-RestMethod "http://127.0.0.1:3080/@bubblesalt/dsh-nori-pet/api/status"
+# 2) 让 Nori 说一句话
+Invoke-RestMethod "http://127.0.0.1:3080/@bubblesalt/dsh-nori-pet/api/ws-test?text=你好呀，我是Nori"
+# 3) 情绪联动（顺带播报）
+Invoke-RestMethod "http://127.0.0.1:3080/@bubblesalt/dsh-nori-pet/api/emote?e=happy&text=好开心"
+# 4) 直接拿语音（跳过播放，验证 TTS）
+Invoke-WebRequest -Method POST -ContentType 'application/json' `
+  -Body '{"text":"你好，Nori在这里。"}' `
+  -OutFile out.wav "http://127.0.0.1:3080/@bubblesalt/dsh-nori-pet/api/speak"
+```
+
+> 这些接口仅放行本地来源（见下文[安全边界](#安全边界本地服务)）。
+
+---
+
 <a id="安全边界本地服务"></a>
 ## 🔒 安全边界（本地服务）
 
@@ -213,10 +271,10 @@ scripts/               guard-release.mjs（发布守卫）、smoke-test.mjs（�
 
 面向想改代码/排查深层问题的人，日常使用可以跳过。
 
-**装配链路**：`install.ps1` 先把仓库 stage 到无空格 junction（`%LOCALAPPDATA%\dsh-links\dsh-nori-pet`，规避 cmd.exe 转发 pnpm 时把含空格路径拆断的问题），执行官方 `dsh plugin add link:<junction>`；插件行由 bundle 层（`dsh.bundle.patch` → `cordis.patch.yml`）装配；运行配置作为 **Loader PatchOptions 条目**（顶层 `- id:` + `config:`）写入 profile 的 `cordis.patch.yml`，**config 是整块替换**——手动改字段须 restate 全部字段。patch 由 dsh 热应用（watchUserPatches），几秒内生效。
+**装配链路**：`install.ps1` 先把仓库 stage 到无空格 junction（`%LOCALAPPDATA%\dsh-links\dsh-nori-pet`，规避 cmd.exe 转发 pnpm 时把含空格路径拆断的问题），执行官方 `dsh plugin add link:<junction>`；插件行由 bundle 层（`dsh.bundle.patch` → `cordis.patch.yml`）装配；运行配置作为 **Loader PatchOptions 条目**（顶层 `- id:` + `config:`）写入 profile 的 `cordis.patch.yml`，**config 是整块替换**——手动改字段须 restate 全部字段。patch 在 dsh 启动 / 热应用（watchUserPatches）时生效。
 
-**数据流**：dsh 会话事件（`assistant/chunk`、`assistant/message`、`turn/end`…）→ 按句断句（中英标点）→ 改写层（LLM 改写成 Nori 口吻，批处理 + 串行队列防 OOM）→ WS 推给 widget；同时 `/api/speak` 把文本代理给本地 GPT-SoVITS 合成为 WAV，widget 逐句解码播放，用音量实时驱动 `ParamMouthOpenY` 口型。
+**数据流**：dsh 会话事件（`assistant/chunk`、`assistant/message`、`turn/end`…）→ 按句断句（中英标点）→ 改写层（LLM 改写成 Nori 口吻：句子成句即分批改写、长 turn 中途即播；串行队列防 OOM）→ WS 推给 widget；同时 `/api/speak` 把文本代理给本地 GPT-SoVITS 合成为 WAV，widget 逐句解码播放，用音量实时驱动 `ParamMouthOpenY` 口型。
 
 **睡眠适配**：pixi-live2d-display 不消费 motion3 的 `Loop` 字段（睡眠动作播完会回落 Idle 睁眼）；且**只适配原版 Nori 模型**——其睡眠动作 `00_Sleep` 位于 **Idle 组**（idle 池一员），通过 `setIsLoop(true)` + `setIsLoopFadeIn(false)` 让闭眼动作稳定循环；入睡用 FORCE 优先级绕过库的同级覆盖守卫。
 
-**WebSocket 协议**（`{prefix}/ws`）：客户端连上先发 `{type:'hello', sessionId}`；服务端推送 `assistant`（含情绪标签的逐句文本）/ `approval`（权限申请提醒）/ `user` / `tool` / `turn-end` / `emote`；ACK 随意，仅计数。
+**WebSocket 协议**（`{prefix}/ws`）：客户端连上先发 `{type:'hello', sessionId}`；服务端推送 `assistant`（含情绪标签的逐句文本）/ `approval`（权限申请——widget 收到会打断当前朗读、原样播报并切惊讶表情）/ `user` / `tool` / `turn-end` / `emote`；ACK 随意，仅计数。
