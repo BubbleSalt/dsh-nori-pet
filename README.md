@@ -63,7 +63,8 @@ git clone <仓库地址>
 
 所有配置外置在 `nori.config.json`（复制 `nori.config.example.json` 得到；本机文件不进 git）。
 **留空 = 走默认约定**（探测仓库内资产）；改了之后重跑 `.\install.ps1` 生效。
-首次安装若没有 `nori.config.json`（或为空），`install.ps1` 会**交互式引导**逐项询问（声线 wav、转写文本、GPT-SoVITS 路径、改写层 apiKey）并自动生成该文件；非交互环境（如 CI）自动跳过询问、全部走默认约定。
+- 安装前**先检测 `Nori_web` 模型**（`Nori.model3.json`）——缺失直接拒绝安装；
+- 首次若没有 `nori.config.json`（或为空），`install.ps1` 会**交互式引导**逐项询问：声线 wav、转写文本、**是否安装 GPT-SoVITS**（约 2~3GB，可选默认权重另约 1GB+，同意则顺手调用 `install-sovits.ps1` 部署并写配置）、**改写层开关**、改写层 apiKey，并自动生成该文件；非交互环境（如 CI）自动跳过询问、全部走默认约定。
 
 | 键 | 默认 | 说明 |
 |---|---|---|

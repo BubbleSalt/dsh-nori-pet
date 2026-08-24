@@ -56,9 +56,22 @@ if (Test-Path $ConfigPath) {
   catch { Write-Warning "nori.config.json 解析失败，按默认约定继续：$($_.Exception.Message)" }
 }
 
-# ---- 0b) 配置引导：nori.config.json 缺失/为空时，交互式生成并让用户填写 ----
+# ---- 0b) 模型预检：Nori Live2D 模型不存在则拒绝安装 ----
+# 优先用配置的 modelDir，否则探测仓库 Nori_web。缺失即抛错，避免"引导填半天最后才发现模型缺失"。
+$preModelDir = if ([string]$cfgFile.modelDir) { [string]$cfgFile.modelDir } else { Join-Path $Repo 'Nori_web' }
+if (-not (Test-Path (Join-Path $preModelDir 'Nori.model3.json'))) {
+  throw "Nori 模型缺失：未找到 Nori.model3.json（$preModelDir）。请先把 Live2D 模型放入仓库 Nori_web/ 目录（含 Nori.model3.json），再重跑本脚本。"
+}
+
+# ---- 0c) 配置引导：nori.config.json 缺失/为空时，交互式生成并让用户填写 ----
 # 仅当文件不存在或解析为空对象才触发；已填配置则跳过，不打扰。
 # 非交互环境（stdin 被重定向，如 CI/脚本调用）自动跳过询问，全部走默认约定。
+function Confirm-Prompt($label, $default) {
+  $suffix = if ($default) { '[Y/n]' } else { '[y/N]' }
+  $r = (Read-Host "  $label $suffix").Trim().ToLower()
+  if ($r -eq '') { return $default }
+  return ($r -in @('y', 'yes', '是', '1'))
+}
 $cfgProps = @($cfgFile.PSObject.Properties)
 $NeedConfigGuide = -not (Test-Path $ConfigPath) -or ($cfgProps.Count -eq 0)
 $Interactive = -not [Console]::IsInputRedirected
@@ -69,14 +82,32 @@ if ($NeedConfigGuide) {
     Write-Host '    非交互环境（stdin 重定向），跳过配置询问，全部走默认约定。'
     Write-Host "    之后可手动生成：Copy-Item nori.config.example.json nori.config.json 后编辑，再重跑本脚本。"
   } else {
-    Write-Host '    将逐项询问并生成配置（直接回车 = 该项留空用默认约定）。'
+    Write-Host '    将逐项询问并生成配置（直接回车 = 默认；Y/n 类问题回车=括号内默认）。'
     Write-Host '    完整可配置项见 nori.config.example.json；生成后可随时编辑再重跑。'
     Write-Host ''
-    $aRefAudio  = Read-Host '  参考音频 wav 路径（声线；回车=自动探测 voice/ 目录）'
-    $aRefPrompt = Read-Host '  参考音频转写文本（与上面 wav 配套；回车=默认"你好,初次见面,我的名字是Nori"）'
-    $aGsvBase   = Read-Host '  GPT-SoVITS 根目录 gsvBase（回车=未配置，语音暂不可用；可先跑 install-sovits.ps1）'
-    $aVenvPy    = Read-Host '  venv python 路径（回车=<gsvBase>/.venv/Scripts/python.exe）'
-    $aApiKey    = Read-Host '  改写层 DeepSeek apiKey（回车=回退 dsh 内置 llm）'
+    $aRefAudio  = Read-Host '  ① 参考音频 wav 路径（声线；回车=自动探测 voice/ 目录）'
+    $aRefPrompt = Read-Host '  ② 参考音频转写文本（与 wav 配套；回车=默认"你好,初次见面,我的名字是Nori"）'
+    # ③ GPT-SoVITS 安装询问（体积提示）；同意则调用 install-sovits.ps1 自动部署并写配置
+    $aInstallSovits = Confirm-Prompt '  ③ 是否安装 GPT-SoVITS 语音引擎（基础依赖约 2~3GB，含 torch 等大件；需要 Python 3.9~3.11 与 git，耗时取决于网络）？' $false
+    $aGsvBase = ''
+    $aVenvPy = ''
+    if ($aInstallSovits) {
+      $aDlModels = Confirm-Prompt '    同时下载官方默认权重（HuggingFace，另需约 1GB+，可选）？' $false
+      $sovitsScript = Join-Path $Repo 'install-sovits.ps1'
+      if (-not (Test-Path $sovitsScript)) {
+        Write-Warning '    install-sovits.ps1 缺失，无法自动安装；可稍后手动运行它。'
+      } else {
+        Write-Host '    ==> 运行 install-sovits.ps1（clone + venv + 依赖，自动写入 sovits 配置）...'
+        if ($aDlModels) { & $sovitsScript -DownloadModels } else { & $sovitsScript }
+        if ($LASTEXITCODE -ne 0) { Write-Warning '    install-sovits.ps1 退出码非 0，部署可能未完成（可稍后重跑）' }
+      }
+    } else {
+      $aGsvBase = Read-Host '  ④ GPT-SoVITS 根目录 gsvBase（外部已有部署时填；回车=未配置，语音暂不可用）'
+      $aVenvPy  = Read-Host '  ⑤ venv python 路径（回车=<gsvBase>/.venv/Scripts/python.exe）'
+    }
+    # ⑥ 改写层开关（进配置，reframe: true/false 写入 patch）
+    $aReframe = Confirm-Prompt '  ⑥ 是否启用 Nori 口吻改写层（assistant 输出先经 LLM 改写再朗读）？' $true
+    $aApiKey  = Read-Host '  ⑦ 改写层 DeepSeek apiKey（回车=回退 dsh 内置 llm）'
     # 组装最小结构 JSON（手写字符串保留中文，不依赖 ConvertTo-Json 的 \u 转义）
     $pairs = @()
     if ($aRefAudio.Trim())  { $pairs += "`"refAudio`": `"$($aRefAudio.Trim() -replace '"', '\"')`"" }
@@ -87,7 +118,9 @@ if ($NeedConfigGuide) {
       if ($aVenvPy.Trim())  { $sov += "`"venvPy`": `"$($aVenvPy.Trim() -replace '"', '\"')`"" }
       $pairs += "`"sovits`": { $($sov -join ', ') }"
     }
-    if ($aApiKey.Trim()) { $pairs += "`"reframe`": { `"apiKey`": `"$($aApiKey.Trim() -replace '"', '\"')`" }" }
+    $refSub = @("`"reframe`": $(if ($aReframe) { 'true' } else { 'false' })")
+    if ($aApiKey.Trim()) { $refSub += "`"apiKey`": `"$($aApiKey.Trim() -replace '"', '\"')`"" }
+    $pairs += "`"reframe`": { $($refSub -join ', ') }"
     $json = "{ $($pairs -join ', ') }"
     Write-U8 $ConfigPath $json
     Write-Host "  配置已生成: $ConfigPath"
