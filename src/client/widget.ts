@@ -455,7 +455,8 @@ async function speakText(text: string, token: number): Promise<void> {
   for (let i = 0; i < sentences.length; i++) {
     if (token !== playToken) break
     ensureFetches(i + MAX_INFLIGHT) // 播放到 i 时，窗口推进预取到 i+4
-    if (sentences[i].emo && !sleeping) setEmotion(sentences[i].emo) // LLM 情绪标签 → 逐句激活表情
+    const emo = sentences[i].emo
+    if (emo && !sleeping) setEmotion(emo) // LLM 情绪标签 → 逐句激活表情
     // 句首清场：表情切换可能残留嘴部参数，先归零再开播（保证口型从 0 跟随音量）
     try { (model as any).internalModel.coreModel.setParameterValueById(MOUTH_ID, 0, 1.0) } catch { /* ignore */ }
     showBubble(sentences[i].text)
@@ -673,6 +674,26 @@ function setRendering(on: boolean): void {
   }
 }
 
+/**
+ * 禁用 Live2D 模型的 pixi 层命中测试（v6/v7 版本混装兼容垫片，见 startModel 注释）。
+ * v6 DisplayObject 的 isInteractive 是 getter 属性（原型上无 setter、严格模式赋值会抛错），
+ * 故用 Object.defineProperty 定义自有属性覆盖；interactive/interactiveChildren 一并关掉，
+ * 让 v7 EventBoundary 在进入模型子树前就短路，指针移动不再崩溃。
+ */
+function disableLive2DHitTest(m: any): void {
+  const fix = (o: any): void => {
+    if (!o || typeof o !== 'object') return
+    try { Object.defineProperty(o, 'isInteractive', { value: () => false, configurable: true }) } catch { /* ignore */ }
+    try { o.interactive = false } catch { /* ignore */ }
+    try { o.interactiveChildren = false } catch { /* ignore */ }
+  }
+  const walk = (o: any): void => {
+    fix(o)
+    for (const c of o.children ?? []) walk(c)
+  }
+  walk(m)
+}
+
 async function startModel(): Promise<void> {
   try {
     app = new PIXI.Application({
@@ -690,6 +711,11 @@ async function startModel(): Promise<void> {
       motionPreload: 'none' as any, // 库类型枚举与实际运行值不一致，运行时行为正确
     })
     model = m
+    // pixi-live2d-display@0.4 的 peerDeps 是 @pixi/* v6，而本 bundle 的 EventBoundary 来自 pixi.js v7：
+    // v6 对象把 isInteractive 当作布尔属性，v7 命中测试按方法调用 → 指针移到画布即抛
+    // "currentTarget.isInteractive is not a function"（console 刷屏）。桌宠交互全部走 DOM 热区
+    // （hitZone），pixi 层不需要任何命中测试 → 把挂到舞台的 v6 模型子树统一降级为不可交互。
+    disableLive2DHitTest(m as any)
     // 渲染链强写口型（前置写）：库 _render 顺序 = internalModel.update()（csmUpdateModel 顶点
     // 变形在此按参数计算）→ draw()。把音量 MouthOpenY 写在 cm.update 之前，变形直接用音量值；
     // expression 的 MouthOpenY 也被我们压过（表达式在 update 流程内执行，早于这里）。
@@ -712,7 +738,7 @@ async function startModel(): Promise<void> {
     baseScale = Math.min(LOGICAL_W / m.width, LOGICAL_H / m.height) * 0.92
     if (isFinite(m.width / m.height) && m.height > 0) modelRatio = m.width / m.height
     m.anchor.set(0.5, 0.5)
-    app.stage.addChild(m)
+    app.stage.addChild(m as any)
     // 应用记忆的缩放因子（resize + scale + 居中）
     applyScale(scaleFactor)
     // 一次性测量默认头顶高度（此时 scale 已是最终比例；失败则按比例估算兜底）
@@ -776,7 +802,7 @@ async function startModel(): Promise<void> {
     tick()
     // ── 苏醒流程：初始呈现睡眠（Sleep 组 00_Sleep）→ 首次点击页面后醒来打招呼（手势解锁音频，语音才能出声）→ 微笑驻留超时回落纯 idle ──
     sleeping = true // 初始睡眠态（不启动入睡计时，唤醒后 resetSleepTimer 自然接管）
-    playSleepMotion() // 00_Sleep（独立 Sleep 组，不进库的 idle 随机池；加载完成后自动置真循环）
+    playSleepMotion() // 00_Sleep（原版 Idle 组内成员：指定 index 播放 + 置永续 loop）
     const GREETING = '你回来啦！Nori真的等你好久了呀......这里一下子又暖起来了。'
     let greetingDone = false
     function greetOnce(): void {
@@ -843,7 +869,7 @@ function connect(): void {
       // 情绪联动：优先 LLM 情绪标签（首句）；普通句只有命中关键词才切情绪——无情绪句
       // 不打断当前表情（驻留由 scheduleEmotionReset 统一管理，避免逐句推流把表情秒打回 default）
       const firstTag = parseTagged(msg.text).find((t) => t.emo)
-      if (firstTag) setEmotion(firstTag.emo)
+      if (firstTag && firstTag.emo) setEmotion(firstTag.emo)
       else {
         const c = classifyEmotion(msg.text)
         if (c !== 'default') setEmotion(c)
@@ -960,9 +986,9 @@ function endStroke(): void {
   // 恢复待机动作（idle 或睡眠闭眼），头部控制权交还原动作；睡眠恢复用 FORCE（同 NORMAL 守卫）
   if (sleeping) {
     const t = sleepMotionTarget()
-    if (t) { try { model.motion(t.group, t.index, 3) } catch { /* ignore */ } }
+    if (t && model) { try { model.motion(t.group, t.index, 3) } catch { /* ignore */ } }
     ensureSleepLoop()
-  } else { try { model.motion('Idle', 0) } catch { /* ignore */ } }
+  } else if (model) { try { model.motion('Idle', 0) } catch { /* ignore */ } }
 }
 
 hitZone.addEventListener('pointerdown', (e) => {
@@ -1057,14 +1083,14 @@ function sleepMotionTarget(): { group: string; index: number } | null {
   } catch { /* ignore */ }
   return null
 }
-/** 播入睡动作（Sleep 组 或 Idle 组内的睡眠动作）+ 加载完成后置真循环。
+/** 播入睡动作（Idle 组内的睡眠动作）+ 加载完成后置真循环。
  * 必须用 MotionPriority.FORCE(=3)：goSleep 前 setEmotion('default') 会先播 Idle(NORMAL=2)，
  * 库的 reserve 守卫 `priority <= currentPriority` 会拒绝同优先级的睡眠动作 → 从未播放
  * （sleeping=true 但动作停留在 Idle）。FORCE 绕过守卫必定切入睡姿。 */
 function playSleepMotion(): void {
   try {
     const t = sleepMotionTarget()
-    if (!t) return
+    if (!t || !model) return
     const p = model.motion(t.group, t.index, 3) // MotionPriority.FORCE
     if ((p as any)?.then) (p as any).then(ensureSleepLoop)
     // 一次性兜底（仅入睡这一刻，非 per-frame）：00_Sleep 时长 3s，若 loop 因任何原因
@@ -1074,7 +1100,7 @@ function playSleepMotion(): void {
         const t2 = sleepMotionTarget()
         const mm = (model as any)?.internalModel?.motionManager
         const active = !!t2 && !!mm?.state && mm.state.currentGroup === t2.group
-        if (sleeping && t2 && !active) {
+        if (sleeping && t2 && model && !active) {
           const p2 = model.motion(t2.group, t2.index, 3)
           if ((p2 as any)?.then) (p2 as any).then(ensureSleepLoop)
         }
@@ -1118,12 +1144,12 @@ connect()
     pos: root.style.left || root.style.right, top: root.style.top || root.style.bottom }),
   // 调试：让 Nori 说一段带标签的句子（完整走朗读 + 情绪标签链路）。
   // 用法：__noriPetWidget.say('【happy】晚饭吃什么好呀~\n【think】嗯……想想')
-  say(text) {
+  say(text: string | string[]) {
     try { speak(Array.isArray(text) ? text.join('\n') : String(text)) }
     catch (e) { console.error('[nori-pet] say', e) }
   },
   // 调试：单个情绪标签 + 一句话。用法：__noriPetWidget.sayTag('angry', '不许这样！')
-  sayTag(tag, text) {
+  sayTag(tag: string, text: string) {
     this.say('【' + tag + '】' + text)
   },
   // 查看当前动作/表情/状态。用法：__noriPetWidget.motion()

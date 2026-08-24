@@ -10,14 +10,14 @@
 import type { Context } from 'cordis'
 import z from 'schemastery'
 import { createHash } from 'node:crypto'
-import { createReadStream, readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs'
+import { createReadStream, readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { join, dirname, normalize, extname, resolve, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Socket } from 'node:net'
 import { homedir } from 'node:os'
-import { loadPersona, type Persona } from './prompt.js'
+import { loadPersona } from './prompt.js'
 
 // 宿主以 ESM 方式被 loader import（无 __dirname），用 import.meta.url 推导包目录
 const HOST_DIR = fileURLToPath(new URL('.', import.meta.url))
@@ -39,9 +39,13 @@ export const Config = z.object({
   refPrompt: z.string().default('你好,初次见面,我的名字是Nori'),
   /** 单句推送的最大长度（超出强制截断） */
   maxSentence: z.number().default(140),
-  /** TTS 推理参数（lowtemp：更稳更收敛，避免采样噪声导致电音感） */
-  ttsTemperature: z.number().default(0.65),
-  ttsTopK: z.number().default(5),
+  /**
+   * TTS 推理参数。低温度更稳更收敛（避免采样噪声导致电音感），但温度过低 + top_k 过小
+   * 会让 AR 模型在"嗯/唔"等鼻音叹词上进入采样循环：某个字无限拖长、随后吞掉句尾一小段。
+   * 实测 0.65/5 约 1/6 卡顿；0.9/12 基本消除，且 speak 路径内置"拖长自动热参数重试"兜底。
+   */
+  ttsTemperature: z.number().default(0.9),
+  ttsTopK: z.number().default(12),
   ttsSpeedFactor: z.number().default(1.0),
   /** Nori 人设改写层：agent 输出先经 LLM 改写为 Nori 口吻再朗读 */
   reframe: z.boolean().default(true),
@@ -111,7 +115,79 @@ export interface Config {
 const PREFIX = '/@dsh-external/dsh-nori-pet'
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 /** 断句符（中英标点 + 换行） */
-const BOUNDARY = new Set(['。', '！', '？', '!', '?', '；', ';', '\n'])
+const BOUNDARY = new Set(['。', '！', '？', '!', '?', '；', ';', '…', '\n'])
+
+/** 朗读文本规整：仅保证句尾有断句标点（便于 GPT-SoVITS cut5 分句）。
+ *  注意不要给叹词硬插逗号：实测会把句子切碎（某些 ref 下时长翻倍、听感断断续续）。 */
+function normalizeSpeakText(raw: string): string {
+  let t = String(raw).replace(/\r/g, '').trim()
+  if (!t) return t
+  if (!/[。！？!?；;…]$/.test(t)) t += '。'
+  return t
+}
+
+/** 解析 WAV（RIFF/WAVE，PCM 8/16/32 位，单/双声道），返回每 100ms 帧的 RMS 能量数组（失败返回 []） */
+function wavFrameRms(buf: Buffer): number[] {
+  try {
+    if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return []
+    let off = 12
+    let channels = 1
+    let sampleRate = 24000
+    let bits = 16
+    let dataOff = 0
+    let dataLen = 0
+    while (off + 8 <= buf.length) {
+      const id = buf.toString('ascii', off, off + 4)
+      const size = buf.readUInt32LE(off + 4)
+      if (id === 'fmt ') {
+        channels = Math.max(1, buf.readUInt16LE(off + 10))
+        sampleRate = buf.readUInt32LE(off + 12)
+        bits = buf.readUInt16LE(off + 22)
+      } else if (id === 'data') {
+        dataOff = off + 8
+        dataLen = size
+        break
+      }
+      off += 8 + size + (size % 2)
+    }
+    if (!dataLen) return []
+    const bytesPer = bits / 8
+    const frameN = Math.max(1, Math.floor(sampleRate * 0.1))
+    const stride = frameN * bytesPer * channels
+    const nFrames = Math.floor(dataLen / stride)
+    if (nFrames <= 0) return []
+    const rms: number[] = new Array(nFrames)
+    for (let f = 0; f < nFrames; f++) {
+      const base = dataOff + f * stride
+      let sum = 0
+      for (let i = 0; i < frameN; i++) {
+        const p = base + i * bytesPer * channels
+        let v: number
+        if (bits === 16) v = buf.readInt16LE(p) / 32768
+        else if (bits === 32) v = buf.readFloatLE(p)
+        else v = (buf.readInt8(p) & 0xff - 128) / 128
+        sum += v * v
+      }
+      rms[f] = Math.sqrt(sum / frameN)
+    }
+    return rms
+  } catch {
+    return []
+  }
+}
+
+/** 最长连续语音时长（秒）。GPT-SoVITS AR 采样循环（如"嗯/唔"鼻音拖长）会形成 >3.5s 不间断长音 */
+function maxContiguousSpeech(buf: Buffer): number {
+  const rms = wavFrameRms(buf)
+  if (!rms.length) return 0
+  let mx = 0
+  let cur = 0
+  for (const r of rms) {
+    cur = r > 0.01 ? cur + 1 : 0
+    if (cur > mx) mx = cur
+  }
+  return mx * 0.1
+}
 /** 本地 Origin 主机白名单（WS / API 跨站防护；自定义访问来源用配置 allowedOrigins 扩展） */
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
 
@@ -205,7 +281,9 @@ export function apply(ctx: AppContext, config: Config) {
     applyInner(ctx, config)
   } catch (e) {
     try {
-      const p = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'super-injector', 'nori-pet-error.log')
+      const logBase = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'logs', 'nori-pet')
+      try { mkdirSync(logBase, { recursive: true }) } catch { /* ignore */ }
+      const p = join(logBase, 'nori-pet-error.log')
       appendFileSync(p, '[' + new Date().toISOString() + ']\n' + (e && (e as Error).stack ? (e as Error).stack : String(e)) + '\n')
     } catch { /* ignore */ }
     throw e
@@ -324,7 +402,11 @@ function applyInner(ctx: AppContext, config: Config) {
       for (;;) {
         let idx = -1
         for (let i = 0; i < rest.length; i++) {
-          if (BOUNDARY.has(rest[i])) { idx = i + 1; break }
+          if (BOUNDARY.has(rest[i])) {
+            idx = i + 1
+            while (idx < rest.length && BOUNDARY.has(rest[idx])) idx++ // 连续标点整组归当前句（"！！""……"不再劈半）
+            break
+          }
         }
         if (idx < 0) break
         const sentence = rest.slice(0, idx).trim()
@@ -347,7 +429,11 @@ function applyInner(ctx: AppContext, config: Config) {
     for (;;) {
       let idx = -1
       for (let i = 0; i < buf.length; i++) {
-        if (BOUNDARY.has(buf[i])) { idx = i + 1; break }
+        if (BOUNDARY.has(buf[i])) {
+          idx = i + 1
+          while (idx < buf.length && BOUNDARY.has(buf[idx])) idx++ // 连续标点整组归当前句
+          break
+        }
       }
       if (idx < 0) break
       const sentence = buf.slice(0, idx).trim()
@@ -369,10 +455,14 @@ function applyInner(ctx: AppContext, config: Config) {
    * key 路径：reframeApiKeyRef 配置了专用 key → 直连 DeepSeek 官方 API（独立计量）；
    * 否则走 dsh 内置 llm 服务（与主会话共用计量）。
    */
-  async function reframeText(text: string): Promise<string | null> {
+  async function reframeText(text: string, prior?: string): Promise<string | null> {
     if (!persona) return text // 人设缺失：不改写，直接以原文朗读（保持链路通）
     const t0 = Date.now()
     const input = text.length > config.reframeMaxInput ? text.slice(0, config.reframeMaxInput) + '……' : text
+    // 前情清单（方案 B）：同 turn 前面已广播内容 → 本块只讲新增，防跨块重复论述
+    const userContent = prior && prior.trim()
+      ? `【前面本回合已经讲过】（这些已经说过了，不要重复展开；若本块材料对其中某点有更进一步的新信息再补充）\n${prior}\n\n【本块材料】\n${input}`
+      : input
     const system = persona.prompt + '\n\n' + persona.reframe
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), config.reframeTimeoutMs)
@@ -394,7 +484,7 @@ function applyInner(ctx: AppContext, config: Config) {
             model: config.reframeModel,
             messages: [
               { role: 'system', content: system },
-              { role: 'user', content: input },
+              { role: 'user', content: userContent },
             ],
             temperature: 0.8,
             max_tokens: 512,
@@ -411,7 +501,7 @@ function applyInner(ctx: AppContext, config: Config) {
         const out = (data?.choices?.[0]?.message?.content as string) ?? ''
         const trimmed = out.trim()
         if (!trimmed) appendErr('reframe direct API EMPTY output; model=' + config.reframeModel)
-        traceReframe(input, trimmed, Date.now() - t0)
+        traceReframe(input, trimmed, Date.now() - t0, prior)
         return trimmed || null
       }
       // 路径 2：dsh 内置 llm 服务
@@ -421,7 +511,7 @@ function applyInner(ctx: AppContext, config: Config) {
       for await (const chunk of llm.stream({
         provider: config.reframeProvider,
         model: config.reframeModel,
-        messages: [{ role: 'user', content: [{ type: 'text', text: input }] }],
+        messages: [{ role: 'user', content: [{ type: 'text', text: userContent }] }],
         system,
         temperature: 0.8,
         maxTokens: 512,
@@ -431,7 +521,7 @@ function applyInner(ctx: AppContext, config: Config) {
       }
       const trimmed = out.trim()
       if (!trimmed) appendErr('reframe llm EMPTY output; provider=' + config.reframeProvider + ' model=' + config.reframeModel)
-      traceReframe(input, trimmed, Date.now() - t0)
+      traceReframe(input, trimmed, Date.now() - t0, prior)
       return trimmed || null
     } catch (e) {
       log('[dsh-nori-pet] reframe failed: ' + String(e))
@@ -442,7 +532,10 @@ function applyInner(ctx: AppContext, config: Config) {
     }
   }
 
-  const logDir = () => join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'super-injector')
+  // 日志目录独立于注入器（~/.dsh/super-injector 是 dsh-super-injector 的地盘），
+  // 迁到 ~/.dsh/logs/nori-pet/（DSH_HOME 未设置则用 ~/.dsh）
+  const logDir = () => join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'logs', 'nori-pet')
+  try { mkdirSync(logDir(), { recursive: true }) } catch { /* ignore */ }
   // 日志条数内存计数（文件裁剪阈值 100 → 保留 50）；trace 为 5 文件轮转 + 满 1000 删最早 200
   const errCount = { n: 0 }
   const traceCount = { n: 0 }
@@ -498,13 +591,15 @@ function applyInner(ctx: AppContext, config: Config) {
   }
 
   /** 改写层输入/输出追踪（reframeTrace 开启时写入 nori-pet-trace*.log）：材料→改写结果，
-   * 供定位"Nori 在哪轮、用什么材料开始讲某内容"（如背景设定介绍）。
-   * 存储：5 文件轮转（slot0~4）；当前文件满 1000 条 → 删最早 200（保留 800）→ 轮换下一文件。 */
-  function traceReframe(input: string, output: string, ms: number): void {
+   * 三列记录：IN=当前块材料本体、PR=前情（前面块已讲内容，如有）、OUT=改写输出。PR 与 IN 分离，
+   * 避免前情文本混入 IN 造成"IN/OUT 内容重复"的观感。存储：5 文件轮转（slot0~4）；当前文件满
+   * 1000 条 → 删最早 200（保留 800）→ 轮换下一文件。 */
+  function traceReframe(input: string, output: string, ms: number, prior = ''): void {
     try {
       if (!config.reframeTrace) return
       const p = join(logDir(), tracePath(traceSlot.n))
-      appendFileSync(p, `[${new Date().toISOString()}] (${ms}ms)\nIN : ${input.slice(0, 500)}\nOUT: ${output.slice(0, 500)}\n────\n`)
+      const priorLine = prior.trim() ? 'PR : ' + prior.trim().slice(0, 300) + '\n' : ''
+      appendFileSync(p, `[${new Date().toISOString()}] (${ms}ms)\nIN : ${input.slice(0, 500)}\n${priorLine}OUT: ${output.slice(0, 500)}\n────\n`)
       traceCount.n += 1
       if (traceCount.n >= TRACE_MAX) {
         // 文件内裁剪：保留最近 TRACE_KEEP（满 1000 → 删最早 200）
@@ -561,7 +656,11 @@ function applyInner(ctx: AppContext, config: Config) {
         if (buf.length + s.length <= MAX) { buf += s; continue }
         if (buf) { out.push(buf); buf = '' }
         let rest = s
-        while (rest.length > MAX) { out.push(rest.slice(0, MAX)); rest = rest.slice(MAX) }
+        while (rest.length > MAX) {
+          const cut = softCut(rest, MAX) // 软切：尽量保住自然断点，避免"奇怪位置切断"
+          out.push(rest.slice(0, cut))
+          rest = rest.slice(cut)
+        }
         buf = rest
       }
       if (buf) out.push(buf)
@@ -578,10 +677,35 @@ function applyInner(ctx: AppContext, config: Config) {
     return merged
   }
 
+  // ── 前情清单（方案 B）：同 turn 串行改写的去重记忆。只维护当前 turn——
+  //     turn/end 登记后，该 turn 队列清空时删除；防止跨块重复论述（材料繁复的主源）。
+  const priorMap = new Map<string, string>()
+  const turnEnded = new Set<string>()
+  const PRIOR_KEEP_PER_BLOCK = 180 // 每块改写输出追加进前情的截断长度
+  const PRIOR_MAX_CHARS = 1200     // 前情总上限（超出从头部截，防超长 turn 爆 context）
+  const MEM_MAX_KEYS = 32          // 防泄漏：priorMap / turnEnded 最多保留 key 数
+
+  /** 软切断点：在 [60%, max] 窗口内从后往前找最后一个自然断点（断句标点 > 分句标点 > 空白），
+   *  找不到才在 max 处硬切（纯 URL/代码长串）。防止长句在任意字符位置被劈开。 */
+  function softCut(rest: string, max: number): number {
+    const lo = Math.floor(max * 0.6)
+    const breakers = '。！？!?…；;、，,．. '
+    for (let i = max; i > lo; i--) {
+      if (breakers.includes(rest[i - 1])) return i
+    }
+    return max
+  }
+
   /** 逐句改写并广播（流式路径；改写失败降级原文） */
   async function reframeAndBroadcast(sid: string, turn: number, text: string): Promise<void> {
-    const reframed = await reframeText(text)
+    const key = `${sid}/${turn}`
+    const prior = priorMap.get(key) ?? ''
+    const reframed = await reframeText(text, prior)
     const out = reframed || text
+    // 追加前情：无论改写成功还是降级原文都记（防止后续块把原文内容再讲一遍）
+    const append = out.trim().slice(0, PRIOR_KEEP_PER_BLOCK).trim()
+    if (append) priorMap.set(key, ((prior ? prior + '\n' : '') + append).slice(-PRIOR_MAX_CHARS))
+    if (priorMap.size > MEM_MAX_KEYS) { const k0 = priorMap.keys().next().value; if (k0 !== undefined) priorMap.delete(k0) }
     statAssistant += 1
     lastAssistant = out.slice(0, 60)
     broadcast({ type: 'assistant', session: sid, text: out, turn })
@@ -605,6 +729,15 @@ function applyInner(ctx: AppContext, config: Config) {
       while (reframeQueue.length) {
         const job = reframeQueue.shift()!
         await reframeAndBroadcast(job.sid, job.turn, job.text)
+      }
+      // 清扫已结束 turn 的前情：队列中已无该 turn 的 job 才删除（只维护当前 turn）
+      for (const key of [...turnEnded]) {
+        const stillQueued = reframeQueue.some((j) => `${j.sid}/${j.turn}` === key)
+        if (!stillQueued) { priorMap.delete(key); turnEnded.delete(key) }
+      }
+      if (turnEnded.size > MEM_MAX_KEYS) {
+        const k0 = turnEnded.values().next().value
+        if (k0 !== undefined) { turnEnded.delete(k0); priorMap.delete(k0) }
       }
     } finally {
       reframeBusy = false
@@ -672,6 +805,7 @@ function applyInner(ctx: AppContext, config: Config) {
         if (config.reframe) {
           // 收尾合并批，然后处理残留（冷却期只清残留）
           flushBatch()
+          turnEnded.add(`${sid}/${data.turn}`) // 登记 turn 结束：前情清空时机（队列清空后删除）
           const full = collectTurnText(sid, data.turn).trim()
           if (!cooling && full) {
             const blocks = splitBlocks(full)
@@ -741,16 +875,30 @@ function applyInner(ctx: AppContext, config: Config) {
       res.end(JSON.stringify({ error: 'empty text' }))
       return
     }
-    const url = new URL(config.ttsUrl)
-    url.searchParams.set('text', text)
+    // TTS 配置以 nori.config.json 为运行时真相（注入器热重载不重读该文件，这里请求时即时读取，
+    // 改 refAudio/refPrompt/温度/top_k 无需重载插件即生效）
+    const fileCfg: Record<string, unknown> = {}
+    try {
+      Object.assign(fileCfg, JSON.parse(readFileSync(join(dirname(HOST_DIR), 'nori.config.json'), 'utf8')))
+    } catch { /* 文件缺失/损坏则回退注入配置 */ }
+    const tts = { ...config }
+    if (typeof fileCfg.ttsTemperature === 'number') tts.ttsTemperature = fileCfg.ttsTemperature
+    if (typeof fileCfg.ttsTopK === 'number') tts.ttsTopK = fileCfg.ttsTopK
+    if (typeof fileCfg.ttsSpeedFactor === 'number') tts.ttsSpeedFactor = fileCfg.ttsSpeedFactor
+    if (typeof fileCfg.refAudio === 'string' && fileCfg.refAudio) tts.refAudio = fileCfg.refAudio
+    if (typeof fileCfg.refPrompt === 'string' && fileCfg.refPrompt) tts.refPrompt = fileCfg.refPrompt
+    const url = new URL(tts.ttsUrl)
+    url.searchParams.set('text', normalizeSpeakText(text))
     url.searchParams.set('text_lang', 'zh')
     url.searchParams.set('prompt_lang', 'zh')
     url.searchParams.set('media_type', 'wav')
-    url.searchParams.set('temperature', String(config.ttsTemperature))
-    url.searchParams.set('top_k', String(config.ttsTopK))
-    url.searchParams.set('speed_factor', String(config.ttsSpeedFactor))
-    if (config.refAudio) url.searchParams.set('ref_audio_path', resolveConfigPath(config.refAudio))
-    if (config.refPrompt) url.searchParams.set('prompt_text', config.refPrompt)
+    url.searchParams.set('temperature', String(tts.ttsTemperature))
+    url.searchParams.set('top_k', String(tts.ttsTopK))
+    url.searchParams.set('speed_factor', String(tts.ttsSpeedFactor))
+    // ref 兜底：配置未设 refAudio 时回退到插件自带 voice/nori.wav（否则上游 400 → /speak 502 静音）
+    const refPath = tts.refAudio ? resolveConfigPath(tts.refAudio) : join(dirname(HOST_DIR), 'voice', 'nori.wav')
+    if (existsSync(refPath)) url.searchParams.set('ref_audio_path', refPath)
+    if (tts.refPrompt) url.searchParams.set('prompt_text', tts.refPrompt)
     try {
       // 上游偶发推理 400（GPT-SoVITS Windows 热路径偶发 "tts failed"）：对 4xx/5xx 单次重试
       let lastStatus = 0
@@ -777,6 +925,29 @@ function applyInner(ctx: AppContext, config: Config) {
         res.writeHead(502, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ error: 'tts http ' + lastStatus, ref: !!config.refAudio, upstream: upBody }))
         return
+      }
+      // 安全网：最长连续语音 >3.5s 判定为 AR 采样循环拖长（"嗯/唔"等鼻音叹词偶发），
+      // 用更高随机性参数（0.95/15）重生成替换，最多 3 次；仅当结果更短才采用。
+      let guardLoops = 0
+      while (buf && maxContiguousSpeech(buf) > 3.5 && guardLoops < 3) {
+        guardLoops++
+        const warm = new URL(url)
+        warm.searchParams.set('temperature', '0.95')
+        warm.searchParams.set('top_k', '15')
+        const ctrl = new AbortController()
+        const timer = setTimeout(() => ctrl.abort(), 30000)
+        try {
+          const w = await fetch(warm, { signal: ctrl.signal })
+          if (w.ok) {
+            const nb = Buffer.from(await w.arrayBuffer())
+            if (maxContiguousSpeech(nb) <= maxContiguousSpeech(buf)) buf = nb
+            else break
+          } else break
+        } catch {
+          break
+        } finally {
+          clearTimeout(timer)
+        }
       }
       res.writeHead(200, { 'content-type': ct, 'content-length': buf.length, 'cache-control': 'no-store' })
       res.end(buf)
@@ -889,7 +1060,6 @@ function applyInner(ctx: AppContext, config: Config) {
 
     const client: PetClient = { sessionId: null, send: () => undefined, close: () => undefined }
     let buffer = Buffer.alloc(0)
-    let fragOpcode = 0
     let fragParts: Buffer[] = []
 
     client.send = (obj: unknown) => {
@@ -907,7 +1077,6 @@ function applyInner(ctx: AppContext, config: Config) {
       }
       if (frame.opcode === 0x8) { clients.delete(client); socket.end(); return }
       if (frame.opcode === 0x1 || frame.opcode === 0x0) {
-        if (frame.opcode === 0x1) { fragOpcode = 0x1; fragParts = [] }
         fragParts.push(frame.payload)
         // 简化：单帧即完整消息（浏览器 WebSocket 发送小 JSON 不会分片）
         const text = Buffer.concat(fragParts).toString('utf8')

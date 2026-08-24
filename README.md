@@ -126,8 +126,8 @@ install **不会自动安装** GPT-SoVITS——没部署时一切照常，只是
 |---|---|
 | 语音 502 `tts http 400` | api_v2 强制要求参考音频：把 wav 放进 `voice/` 或配置 `refAudio` 后重跑 install |
 | 语音 503 `tts offline` | 9880 不可达：`Test-NetConnection 127.0.0.1 -Port 9880`；ttsWatch 会在 30s 内自动拉起 |
-| 睡眠睁眼 / 头每 3 秒回正 | 已修复（独立睡眠动作组 + 强制循环）；如换过模型就是"只适配原版"的限制 |
-| 日志 | 错误：`~/.dsh/super-injector/nori-pet-error.log`；改写追踪：`nori-pet-trace*.log` |
+| 睡眠睁眼 / 头每 3 秒回正 | 已适配原版模型解决（睡眠动作在 Idle 组，配 `setIsLoop(true)` 稳住）；换成别的模型会睡眠退化 |
+| 日志 | 错误：`~/.dsh/logs/nori-pet/nori-pet-error.log`；改写追踪：`~/.dsh/logs/nori-pet/nori-pet-trace*.log` |
 
 ---
 
@@ -181,6 +181,6 @@ scripts/               guard-release.mjs（发布守卫）、smoke-test.mjs（�
 
 **数据流**：dsh 会话事件（`assistant/chunk`、`assistant/message`、`turn/end`…）→ 按句断句（中英标点）→ 改写层（LLM 改写成 Nori 口吻，批处理 + 串行队列防 OOM）→ WS 推给 widget；同时 `/api/speak` 把文本代理给本地 GPT-SoVITS 合成为 WAV，widget 逐句解码播放，用音量实时驱动 `ParamMouthOpenY` 口型。
 
-**睡眠适配**：pixi-live2d-display 不消费 motion3 的 `Loop` 字段，睡眠动作靠"独立动作组 + `setIsLoop(true)` + 关闭 loop fade"实现稳定闭眼；入睡用 FORCE 优先级绕过库的同级覆盖守卫。
+**睡眠适配**：pixi-live2d-display 不消费 motion3 的 `Loop` 字段（睡眠动作播完会回落 Idle 睁眼）；且**只适配原版 Nori 模型**——其睡眠动作 `00_Sleep` 位于 **Idle 组**（idle 池一员），通过 `setIsLoop(true)` + `setIsLoopFadeIn(false)` 让闭眼动作稳定循环；入睡用 FORCE 优先级绕过库的同级覆盖守卫。
 
 **WebSocket 协议**（`{prefix}/ws`）：客户端连上先发 `{type:'hello', sessionId}`；服务端推送 `assistant`（含情绪标签的逐句文本）/ `approval`（权限申请提醒）/ `user` / `tool` / `turn-end` / `emote`；ACK 随意，仅计数。
