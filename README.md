@@ -201,33 +201,23 @@ GPT-SoVITS 是本地语音合成引擎（TTS）——Nori 用它把文字念成�
 ---
 
 <a id="调试接口"></a>
-## 🔬 调试接口（本地开发）
+## 🔬 浏览器调试（Console）
 
-所有端点挂在插件前缀下：`http://127.0.0.1:3080/@bubblesalt/dsh-nori-pet`
+Nori 打开时会往页面挂一个全局对象 **`__noriPetWidget`**——按 **F12**（或 `Ctrl+Shift+I`）打开开发者工具，切到 **Console** 标签，输入下面任一指令回车即可（Tab 有自动补全），**不需要装任何命令行工具**：
 
-| 接口 | 方法 | 用途 |
-|---|---|---|
-| `/api/status` | GET | 运行状态与统计：TTS 地址、WS 连接数、事件/分块/播报计数、最近广播与最近一帧——排障先看这里 |
-| `/api/ws-test?text=你好` | GET | 向所有连接中的 widget 推一条文本（走正常朗读链路），不打扰业务也能验证"能不能响" |
-| `/api/emote?e=happy&text=可选` | GET | 手动触发情绪联动：`e` 取 13 种情绪之一（`happy / excited / angry / sad / doubt / troubled / shy / surprised / dizzy / serious / speechless / think / default`），带 `text` 则同时播报 |
-| `/api/speak` | POST | 朗读代理：body 为 JSON `{"text":"…"}`（上限 16KB / 512 字），经本地 GPT-SoVITS 合成 Nori 声线 WAV 并让 widget 播放；也可用 curl 直接取音频验证 TTS 链路 |
+| 指令 | 作用 |
+|---|---|
+| `__noriPetWidget.sayTag('happy', '今天天气真好')` | 用指定情绪说一句话，完整走朗读 + 情绪链路 |
+| `__noriPetWidget.say('【think】嗯…我想想\n【default】就这样吧')` | 整段多标签文本，逐行播报 |
+| `__noriPetWidget.motion()` | 查看当前动作 / 表情 / 是否在说话 / 体型滑槽值 |
+| `__noriPetWidget.diag()` | 看连接状态、最近消息、静音、缩放与位置 |
+| `__noriPetWidget.showBubble('你好')` | 只显示气泡、不朗读 |
 
-示例：
+`sayTag` 的情绪标签（13 种）：`happy / excited / angry / sad / doubt / troubled / shy / surprised / dizzy / serious / speechless / think / default`
 
-```powershell
-# 1) 状态
-Invoke-RestMethod "http://127.0.0.1:3080/@bubblesalt/dsh-nori-pet/api/status"
-# 2) 让 Nori 说一句话
-Invoke-RestMethod "http://127.0.0.1:3080/@bubblesalt/dsh-nori-pet/api/ws-test?text=你好呀，我是Nori"
-# 3) 情绪联动（顺带播报）
-Invoke-RestMethod "http://127.0.0.1:3080/@bubblesalt/dsh-nori-pet/api/emote?e=happy&text=好开心"
-# 4) 直接拿语音（跳过播放，验证 TTS）
-Invoke-WebRequest -Method POST -ContentType 'application/json' `
-  -Body '{"text":"你好，Nori在这里。"}' `
-  -OutFile out.wav "http://127.0.0.1:3080/@bubblesalt/dsh-nori-pet/api/speak"
-```
+> 服务端也保留 HTTP 接口（`/api/status`、`/api/speak` 等）供程序化调用；日常调试用上面的 Console 指令就够。
 
-> 这些接口仅放行本地来源（见下文[安全边界](#安全边界本地服务)）。
+---
 
 ---
 
