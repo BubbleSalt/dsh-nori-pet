@@ -15,9 +15,10 @@ dist/
 
 # ── 团队资产原件：授权人设由用户放置到 persona/（不入库）；人设原文档如置于根目录请勿提交 ──
 
-# ── 人设资产（授权文本不入库：persona/prompt.txt + persona/reframe.txt）─
+# ── 人设资产（授权文本 prompt.txt 不入库；改写任务指令 reframe.txt 随仓库提供）─
 persona/*
 !.gitkeep
+!persona/reframe.txt
 
 # ── 本机安装配置（含机器路径；模板 nori.config.example.json 入库）─
 nori.config.json

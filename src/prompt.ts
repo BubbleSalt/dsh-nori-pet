@@ -1,10 +1,9 @@
 /**
  * Nori 人设 Prompt 加载器（资产化版）。
  *
- * 人设 system prompt 与改写任务文本不再内嵌在代码里（I_NORI 团队资产，公开仓库不得携带），
- * 改为从仓库内 gitignored 的 persona/ 目录读取授权文件：
- *   - persona/prompt.txt   → 人设 system prompt（原 NORI_PROMPT 内容：授权文本，源出人设原文档）
- *   - persona/reframe.txt  → 改写任务补充指令（原 NORI_REFRAME_TASK 内容）
+ * 人设 system prompt 与改写任务文本已从代码中拆出：
+ *   - persona/prompt.txt   → 人设 system prompt（原 NORI_PROMPT 内容：I_NORI 授权文本，源出人设原文档，不入库）
+ *   - persona/reframe.txt  → 改写任务补充指令（原 NORI_REFRAME_TASK 内容；无版权问题，随仓库提供）
  * 文件缺失/为空时返回 null，由宿主决定降级策略（改写层关闭、朗读原始输出）。
  * 路径可被配置 personaPrompt / personaReframe 覆盖（绝对路径或相对仓库根）。
  */

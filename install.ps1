@@ -186,6 +186,24 @@ if ($RefAudio) { $cfg += "    refAudio: $(Y $RefAudio)" }
 if ($GsvBase) { $cfg += "    gsvBase: $(Y $GsvBase)" }
 if ($VenvPy)  { $cfg += "    venvPy: $(Y $VenvPy)" }
 
+# 改写层配置（可选）：nori.config.json 的 reframe 段 → patch 键。
+# 值类型按 Config schema（src/index.ts）：字符串加引号，布尔/数字裸写（数字加引号会被 z.number 拒绝）。
+# 未填的键跳过 → 插件用源码默认（默认：reframeApiKeyRef=DEEPSEEK_NORI_API_KEY，解析到即直连官方 API，否则回退 dsh llm）。
+$ReframeCfg = $cfgFile.reframe
+if ($ReframeCfg) {
+  foreach ($k in @('reframe', 'reframeProvider', 'reframeModel', 'reframeApiKeyRef', 'reframeBaseUrl', 'reframeTimeoutMs', 'reframeMaxInput', 'reframeTrace')) {
+    $v = $ReframeCfg.$k
+    if ($null -eq $v) { continue }
+    if ($v -is [bool]) { $cfg += "    ${k}: $(if ($v) { 'true' } else { 'false' })"; continue }
+    if ($v -is [int] -and $v -gt 0)  { $cfg += "    ${k}: $v"; continue }
+    if ($v -is [double] -and $v -gt 0 -and [math]::Abs($v - [math]::Round($v)) -lt 1e-9) { $cfg += "    ${k}: $([int]$v)"; continue }
+    if ($v -is [int] -or $v -is [double]) { continue }  # 0/负数/非整数 → 视为未设置，跳过（防 '0' 字符串被 z.number 拒绝）
+    $s = [string]$v
+    if ($s -eq '') { continue }
+    $cfg += "    ${k}: $(Y $s)"
+  }
+}
+
 # Loader PatchOptions 格式（dsh-app-boot applyEntryPatches）：顶层数组条目 = {id, name?, config?, ...}，
 # config 子键缩进 4 空格。禁止 update:/insert: 包装（非法字段会被静默跳过 → patch 从未生效：
 # 曾致 refAudio 从未注入，直连 9880 正常但 /api/speak 一直 502 tts http 400）。
@@ -232,6 +250,6 @@ if ($SovitsConfigured) {
   Write-Host '  - 或已有部署：编辑 nori.config.json 的 sovits.gsvBase / sovits.venvPy 后重跑本脚本'
 }
 if (-not (Test-Path (Join-Path $Repo 'persona\prompt.txt')) -or -not (Test-Path (Join-Path $Repo 'persona\reframe.txt'))) {
-  Write-Warning '人设文件缺失（persona\prompt.txt / persona\reframe.txt）：Nori 口吻改写层将关闭，桌宠直接朗读原始输出。'
+  Write-Warning '未检测到授权人设文本（persona\prompt.txt）：Nori 口吻改写层将关闭，桌宠直接朗读原始输出。（改写任务指令 reframe.txt 随仓库提供；缺的只是授权的人设文本。）'
   Write-Host '  - 把已授权的人设文本放入 persona\ 目录（模板见 persona\.gitkeep 说明），重跑本脚本即可生效。'
 }
