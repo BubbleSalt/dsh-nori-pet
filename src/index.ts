@@ -1,5 +1,5 @@
 /**
- * @dsh-external/dsh-nori-pet — Nori 桌宠宿主（hybrid：host + web UI 面板）
+ * @bubblesalt/dsh-nori-pet — Nori 桌宠宿主（hybrid：host + web UI 面板）
  *
  * 职责：
  *  1. 观察 dsh 会话事件流（session/event：assistant/chunk …），把助手输出按句切分；
@@ -22,7 +22,7 @@ import { loadPersona } from './prompt.js'
 // 宿主以 ESM 方式被 loader import（无 __dirname），用 import.meta.url 推导包目录
 const HOST_DIR = fileURLToPath(new URL('.', import.meta.url))
 
-export const name = '@dsh-external/dsh-nori-pet'
+export const name = '@bubblesalt/dsh-nori-pet'
 export const inject = ['webServer', 'llm', 'credentials', 'sessions']
 
 export const Config = z.object({
@@ -33,9 +33,10 @@ export const Config = z.object({
   coreFile: z.string().default(''),
   /** 本地 GPT-SoVITS 服务地址（api_v2 的 /tts 端点） */
   ttsUrl: z.string().default('http://127.0.0.1:9880/tts'),
-  /** 零样本参考音频（Nori 声线 wav，绝对路径；留空则用 GPT-SoVITS 服务端默认参考音色，声线资产不入仓库） */
+  /** 零样本参考音频（Nori 声线 wav，绝对或相对仓库根；留空自动回退插件自带 voice/nori.wav）。建议 3~10 秒（api_v2 强制要求）。 */
   refAudio: z.string().default(''),
-  /** 参考音频的转写文本（prompt text，与 refAudio 配套） */
+  /** 参考音频的逐字转写文本（prompt text）。⚠ 必须与 refAudio 的音频内容完全一致：
+   *  换 refAudio 时必须同步换 refPrompt，否则 AR 条件作用劣化 → 跳字/吞句（中英混排时更明显）、音色漂移。 */
   refPrompt: z.string().default('你好,初次见面,我的名字是Nori'),
   /** 单句推送的最大长度（超出强制截断） */
   maxSentence: z.number().default(140),
@@ -112,16 +113,23 @@ export interface Config {
   allowedOrigins: string[]
 }
 
-const PREFIX = '/@dsh-external/dsh-nori-pet'
+const PREFIX = '/@bubblesalt/dsh-nori-pet'
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 /** 断句符（中英标点 + 换行） */
 const BOUNDARY = new Set(['。', '！', '？', '!', '?', '；', ';', '…', '\n'])
 
-/** 朗读文本规整：仅保证句尾有断句标点（便于 GPT-SoVITS cut5 分句）。
- *  注意不要给叹词硬插逗号：实测会把句子切碎（某些 ref 下时长翻倍、听感断断续续）。 */
+/** 朗读文本规整：
+ *  1) 保证句尾有断句标点（便于 GPT-SoVITS cut5 分句）；
+ *  2) 中英混排保护：英文词会让 AR 对齐失败，有约 75% 概率跳过它前面的中文片段
+ *     （实测"会自己移除那条 ref"→ 跳过"会自己移除那条"）。在中文与英文词之间补逗号
+ *     强制分片，让每个片段语言单一（实测把读出率提到 ~90%）。英文词须 ≥2 字符，
+ *     避免误伤"C盘"这类单字母。反引号等无关字符清掉防干扰分句。
+ *  注意：不要给叹词硬插逗号——实测会把句子切碎（某些 ref 下时长翻倍、听感断断续续）。 */
 function normalizeSpeakText(raw: string): string {
   let t = String(raw).replace(/\r/g, '').trim()
   if (!t) return t
+  t = t.replace(/[`′]/g, '')
+  t = t.replace(/([\u4e00-\u9fff])\s*([A-Za-z]{2,}[A-Za-z0-9'\-]*)/g, '$1，$2')
   if (!/[。！？!?；;…]$/.test(t)) t += '。'
   return t
 }
@@ -358,7 +366,8 @@ function applyInner(ctx: AppContext, config: Config) {
     }
   }
 
-  // ── 改写合并批（防 LLM 调用风暴 / OOM）：句子攒批，~150 字或 1.2s 无新句才改写一次 ──
+  // ── 改写合并批（低延迟流式改写）：句子成句即攒批，~150 字或 1.2s 无新句就改写广播，
+  //    长 turn 中途即开始播，避免"整轮结束才统一改写"的高延迟 ──
   let batchSid = ''
   let batchTurn = -1
   let batchText = ''
@@ -396,17 +405,25 @@ function applyInner(ctx: AppContext, config: Config) {
     const key = `${sid}/${turn}/${step}`
     chunkedSteps.add(key) // 该 step 走过了流式（assistant/message 兜底应跳过）
     const cooling = Date.now() - startTime < 1000 // 冷启动回放窗口：只收集不广播
-    if (config.reframe && !cooling) {
-      // 流式按句 → 合并批改写（中途汇报也能实时读到，但不逐句调用 LLM）
+    if (config.reframe || cooling) {
+      // 流式断句→分批改写（低延迟）：句子成句即入批，攒 ~150 字或 1.2s 无新句就 flush
+      // 改写广播，长 turn 中途即开始播（避免"整轮结束才统一改写"的高延迟）。
+      // 防顺序错乱（②③④⑤①）：BOUNDARY 不含逗号/冒号，无断句标点段落（如"先看当前 git
+      // 状态……错在哪"）若一直找不到边界会滞留 pending 到 turn/end 才被 collect 而排到
+      // 批次之后；故无边界且够长（≥maxSentence）时按自然断点软切入批，顺序恒等于原文。
       let rest = (pending.get(key) ?? '') + delta
       for (;;) {
         let idx = -1
         for (let i = 0; i < rest.length; i++) {
           if (BOUNDARY.has(rest[i])) {
             idx = i + 1
-            while (idx < rest.length && BOUNDARY.has(rest[idx])) idx++ // 连续标点整组归当前句（"！！""……"不再劈半）
+            while (idx < rest.length && BOUNDARY.has(rest[idx])) idx++ // 连续标点整组归当前句
             break
           }
+        }
+        if (idx < 0 && rest.length >= config.maxSentence) {
+          const cut = softCut(rest, config.maxSentence) // 无边界且够长 → 自然断点软切
+          if (cut > 0 && cut < rest.length) idx = cut
         }
         if (idx < 0) break
         const sentence = rest.slice(0, idx).trim()
@@ -419,12 +436,6 @@ function applyInner(ctx: AppContext, config: Config) {
       return
     }
     let buf = (pending.get(key) ?? '') + delta
-    if (config.reframe || cooling) {
-      // 整轮收集模式（冷却期）：只累积不广播，防止单个 step 无限膨胀
-      if (buf.length > config.maxSentence * 6) buf = buf.slice(-config.maxSentence * 6)
-      if (buf) pending.set(key, buf)
-      return
-    }
     // 按边界切句（reframe 关闭时的实时流式广播）
     for (;;) {
       let idx = -1
@@ -455,14 +466,11 @@ function applyInner(ctx: AppContext, config: Config) {
    * key 路径：reframeApiKeyRef 配置了专用 key → 直连 DeepSeek 官方 API（独立计量）；
    * 否则走 dsh 内置 llm 服务（与主会话共用计量）。
    */
-  async function reframeText(text: string, prior?: string): Promise<string | null> {
+  async function reframeText(text: string): Promise<string | null> {
     if (!persona) return text // 人设缺失：不改写，直接以原文朗读（保持链路通）
     const t0 = Date.now()
     const input = text.length > config.reframeMaxInput ? text.slice(0, config.reframeMaxInput) + '……' : text
-    // 前情清单（方案 B）：同 turn 前面已广播内容 → 本块只讲新增，防跨块重复论述
-    const userContent = prior && prior.trim()
-      ? `【前面本回合已经讲过】（这些已经说过了，不要重复展开；若本块材料对其中某点有更进一步的新信息再补充）\n${prior}\n\n【本块材料】\n${input}`
-      : input
+    const userContent = input
     const system = persona.prompt + '\n\n' + persona.reframe
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), config.reframeTimeoutMs)
@@ -501,7 +509,7 @@ function applyInner(ctx: AppContext, config: Config) {
         const out = (data?.choices?.[0]?.message?.content as string) ?? ''
         const trimmed = out.trim()
         if (!trimmed) appendErr('reframe direct API EMPTY output; model=' + config.reframeModel)
-        traceReframe(input, trimmed, Date.now() - t0, prior)
+        traceReframe(input, trimmed, Date.now() - t0)
         return trimmed || null
       }
       // 路径 2：dsh 内置 llm 服务
@@ -521,7 +529,7 @@ function applyInner(ctx: AppContext, config: Config) {
       }
       const trimmed = out.trim()
       if (!trimmed) appendErr('reframe llm EMPTY output; provider=' + config.reframeProvider + ' model=' + config.reframeModel)
-      traceReframe(input, trimmed, Date.now() - t0, prior)
+      traceReframe(input, trimmed, Date.now() - t0)
       return trimmed || null
     } catch (e) {
       log('[dsh-nori-pet] reframe failed: ' + String(e))
@@ -591,15 +599,13 @@ function applyInner(ctx: AppContext, config: Config) {
   }
 
   /** 改写层输入/输出追踪（reframeTrace 开启时写入 nori-pet-trace*.log）：材料→改写结果，
-   * 三列记录：IN=当前块材料本体、PR=前情（前面块已讲内容，如有）、OUT=改写输出。PR 与 IN 分离，
-   * 避免前情文本混入 IN 造成"IN/OUT 内容重复"的观感。存储：5 文件轮转（slot0~4）；当前文件满
+   * 两列记录：IN=当前块材料本体、OUT=改写输出。存储：5 文件轮转（slot0~4）；当前文件满
    * 1000 条 → 删最早 200（保留 800）→ 轮换下一文件。 */
-  function traceReframe(input: string, output: string, ms: number, prior = ''): void {
+  function traceReframe(input: string, output: string, ms: number): void {
     try {
       if (!config.reframeTrace) return
       const p = join(logDir(), tracePath(traceSlot.n))
-      const priorLine = prior.trim() ? 'PR : ' + prior.trim().slice(0, 300) + '\n' : ''
-      appendFileSync(p, `[${new Date().toISOString()}] (${ms}ms)\nIN : ${input.slice(0, 500)}\n${priorLine}OUT: ${output.slice(0, 500)}\n────\n`)
+      appendFileSync(p, `[${new Date().toISOString()}] (${ms}ms)\nIN : ${input.slice(0, 500)}\nOUT: ${output.slice(0, 500)}\n────\n`)
       traceCount.n += 1
       if (traceCount.n >= TRACE_MAX) {
         // 文件内裁剪：保留最近 TRACE_KEEP（满 1000 → 删最早 200）
@@ -677,14 +683,6 @@ function applyInner(ctx: AppContext, config: Config) {
     return merged
   }
 
-  // ── 前情清单（方案 B）：同 turn 串行改写的去重记忆。只维护当前 turn——
-  //     turn/end 登记后，该 turn 队列清空时删除；防止跨块重复论述（材料繁复的主源）。
-  const priorMap = new Map<string, string>()
-  const turnEnded = new Set<string>()
-  const PRIOR_KEEP_PER_BLOCK = 180 // 每块改写输出追加进前情的截断长度
-  const PRIOR_MAX_CHARS = 1200     // 前情总上限（超出从头部截，防超长 turn 爆 context）
-  const MEM_MAX_KEYS = 32          // 防泄漏：priorMap / turnEnded 最多保留 key 数
-
   /** 软切断点：在 [60%, max] 窗口内从后往前找最后一个自然断点（断句标点 > 分句标点 > 空白），
    *  找不到才在 max 处硬切（纯 URL/代码长串）。防止长句在任意字符位置被劈开。 */
   function softCut(rest: string, max: number): number {
@@ -698,14 +696,8 @@ function applyInner(ctx: AppContext, config: Config) {
 
   /** 逐句改写并广播（流式路径；改写失败降级原文） */
   async function reframeAndBroadcast(sid: string, turn: number, text: string): Promise<void> {
-    const key = `${sid}/${turn}`
-    const prior = priorMap.get(key) ?? ''
-    const reframed = await reframeText(text, prior)
+    const reframed = await reframeText(text)
     const out = reframed || text
-    // 追加前情：无论改写成功还是降级原文都记（防止后续块把原文内容再讲一遍）
-    const append = out.trim().slice(0, PRIOR_KEEP_PER_BLOCK).trim()
-    if (append) priorMap.set(key, ((prior ? prior + '\n' : '') + append).slice(-PRIOR_MAX_CHARS))
-    if (priorMap.size > MEM_MAX_KEYS) { const k0 = priorMap.keys().next().value; if (k0 !== undefined) priorMap.delete(k0) }
     statAssistant += 1
     lastAssistant = out.slice(0, 60)
     broadcast({ type: 'assistant', session: sid, text: out, turn })
@@ -729,15 +721,6 @@ function applyInner(ctx: AppContext, config: Config) {
       while (reframeQueue.length) {
         const job = reframeQueue.shift()!
         await reframeAndBroadcast(job.sid, job.turn, job.text)
-      }
-      // 清扫已结束 turn 的前情：队列中已无该 turn 的 job 才删除（只维护当前 turn）
-      for (const key of [...turnEnded]) {
-        const stillQueued = reframeQueue.some((j) => `${j.sid}/${j.turn}` === key)
-        if (!stillQueued) { priorMap.delete(key); turnEnded.delete(key) }
-      }
-      if (turnEnded.size > MEM_MAX_KEYS) {
-        const k0 = turnEnded.values().next().value
-        if (k0 !== undefined) { turnEnded.delete(k0); priorMap.delete(k0) }
       }
     } finally {
       reframeBusy = false
@@ -803,9 +786,8 @@ function applyInner(ctx: AppContext, config: Config) {
         statTurnEnd += 1
         const cooling = Date.now() - startTime < 1000
         if (config.reframe) {
-          // 收尾合并批，然后处理残留（冷却期只清残留）
+          // 收尾批次（低延迟流式改写的剩余句子），再 collect 未断句残留（冷却期只清残留）
           flushBatch()
-          turnEnded.add(`${sid}/${data.turn}`) // 登记 turn 结束：前情清空时机（队列清空后删除）
           const full = collectTurnText(sid, data.turn).trim()
           if (!cooling && full) {
             const blocks = splitBlocks(full)
