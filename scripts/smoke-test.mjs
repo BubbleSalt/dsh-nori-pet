@@ -12,7 +12,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import http from 'node:http'
 
 const BASE = (process.env.NORI_BASE || 'http://127.0.0.1:3080').replace(/\/+$/, '')
-const PREFIX = '/@dsh-external/dsh-nori-pet'
+const PREFIX = '/@bubblesalt/dsh-nori-pet'
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 let failed = 0
 

@@ -2,6 +2,6 @@
 # 宿主 apply() 负责：/api /assets /ws 路由 + /widget.js 注入（tapIndex）。
 # 装配校验（dsh-app-boot）要求 bundle 包声明 dsh.bundle.patch —— 这是唯一官方装配入口。
 - insert:
-    - id: '@dsh-external/dsh-nori-pet'
-      name: '@dsh-external/dsh-nori-pet'
+    - id: '@bubblesalt/dsh-nori-pet'
+      name: '@bubblesalt/dsh-nori-pet'
       config: {}

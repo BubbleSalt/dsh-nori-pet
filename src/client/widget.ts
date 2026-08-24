@@ -10,7 +10,7 @@ import * as PIXI from 'pixi.js'
 import { Live2DModel } from 'pixi-live2d-display/cubism4'
 ;(window as any).PIXI = PIXI
 
-const PREFIX = '/@dsh-external/dsh-nori-pet'
+const PREFIX = '/@bubblesalt/dsh-nori-pet'
 // 口型驱动：ParamMouthOpenY（编辑器实测 = 张嘴 open 参数，运行时表情管道证实有效）。
 // 关键时序：变形在 model.update()（csmUpdateModel）时按参数值计算，之后 setParameterValueById
 // 只改存储不重算顶点 → 必须把口型写在 coreModel.update() 之前，让变形用我们的值。
@@ -890,7 +890,7 @@ function connect(): void {
       return
     }
     // 思考表情：agent 工作中（用户发言 / 工具调用）→ 沉思；turn 结束回收
-    if (msg.type === 'tool' || msg.type === 'user') { setThinking(true); return }
+    if (msg.type === 'user') { wakeUp(); setThinking(true); return } // 用户开口即唤醒，不等到第一句回答
     if (msg.type === 'turn-end') { setThinking(false); return }
     // emote：宿主 /api/emote 手动触发（验证情绪联动用）
     if (msg.type === 'emote') {
@@ -1121,7 +1121,19 @@ function goSleep(): void {
 }
 
 function wakeUp(): void {
-  if (!sleeping) { resetSleepTimer(); return }
+  if (!sleeping) {
+    // 假醒防御：逻辑已醒，但画面可能仍卡在睡眠动作（FORCE 循环未被清掉）→ 强制切回待机
+    try {
+      const t = sleepMotionTarget()
+      const mm = (model as any)?.internalModel?.motionManager
+      if (model && t && mm?.state && mm.state.currentGroup === t.group) {
+        try { mm.stopAllMotions() } catch { /* ignore */ }
+        try { model.motion('Idle', 0) } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
+    resetSleepTimer()
+    return
+  }
   sleeping = false
   if (model) {
     // 必须先清空动作队列：00_Sleep 已被置为永续 loop（NORMAL 优先级永不 finished），
