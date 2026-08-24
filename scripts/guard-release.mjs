@@ -67,14 +67,17 @@ const KEY_PATTERNS = [
   /-----BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY-----/,
 ]
 const ASSET_EXT = /\.(png|jpe?g|webp|gif|bmp|wav|mp3|m4a|ogg|flac|moc3|motion3\.json|model3\.json|cdf|moc)$/i
+// README/ 下的文档媒体（演示图等）允许入树；其余位置的资产扩展名仍一律拒绝
+const DOC_MEDIA = /^README\//
 
 const findings = []
 function scan(file, label) { findings.push(label + '  ' + file) }
 
 for (const f of files) {
-  if (ASSET_EXT.test(f)) { scan(f, '资产文件入树'); continue }
+  if (!DOC_MEDIA.test(f) && ASSET_EXT.test(f)) { scan(f, '资产文件入树'); continue }
   let text
   try { text = readFileSync(join(root, f), 'utf8') } catch { continue }
+  if (text.includes('\0')) continue // 二进制（图片/gif/音频/模型）不是文本，跳过字符串扫描
   if (HOME_PATH.test(text)) scan(f, '家目录/机器路径')
   for (const re of KEY_PATTERNS) { if (re.test(text)) { scan(f, '疑似密钥'); break } }
   if (personaShingles) {

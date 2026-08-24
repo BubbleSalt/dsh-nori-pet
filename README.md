@@ -10,7 +10,7 @@
 
 ## ✨ 效果预览
 
-📷 *此处待补：Live2D 立绘动图 / 会话朗读演示（录制后替换本段）*
+![nori 桌宠效果演示](README/nori演示.gif)
 
 安装完长这样：浏览器右下角一只白发少女，回话时张嘴、眨眼、跟着情绪换表情。
 
@@ -81,6 +81,7 @@ git clone <仓库地址>
 
 ---
 
+<a id="gpt-sovits可选"></a>
 ## 🔊 GPT-SoVITS（可选）
 
 install **不会自动安装** GPT-SoVITS——没部署时一切照常，只是没有语音。
@@ -139,6 +140,7 @@ install **不会自动安装** GPT-SoVITS——没部署时一切照常，只是
 
 ---
 
+<a id="安全边界本地服务"></a>
 ## 🔒 安全边界（本地服务）
 
 - WS 与 API（`/api/*`）仅放行本地来源：Origin ∈ `localhost`/`127.0.0.1`/`::1`，非浏览器本地客户端放行；LAN IP/自定义域名访问需在 `allowedOrigins` 加入口。
@@ -146,6 +148,7 @@ install **不会自动安装** GPT-SoVITS——没部署时一切照常，只是
 
 ---
 
+<a id="许可与第三方资产"></a>
 ## 📜 许可与第三方资产
 
 - 仓库代码（`src/`、`scripts/`、`install*.ps1` 等）以及改写任务指令（`persona/reframe.txt`）以 **BSD-3-Clause** 授权，见 [LICENSE](LICENSE)。
