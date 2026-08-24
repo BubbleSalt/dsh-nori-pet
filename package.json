@@ -1,6 +1,6 @@
 {
   "name": "@bubblesalt/dsh-nori-pet",
-  "version": "0.0.1",
+  "version": "0.2.0",
   "description": "Nori 桌宠：Live2D 立绘 + 唇同步 + 以 Nori 声线朗读 agent 输出",
   "private": true,
   "type": "module",
