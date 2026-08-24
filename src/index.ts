@@ -453,7 +453,7 @@ function applyInner(ctx: AppContext, config: Config) {
     }
     // 超长兜底：防止单 step 无限累积
     if (buf.length > config.maxSentence * 3) {
-      const head = buf.slice(0, config.maxSentence).trim()
+      const head = buf.slice(0, softCut(buf, config.maxSentence)).trim()
       if (head) broadcast({ type: 'assistant', session: sid, text: head + '…', turn })
       buf = ''
     }
@@ -683,15 +683,23 @@ function applyInner(ctx: AppContext, config: Config) {
     return merged
   }
 
-  /** 软切断点：在 [60%, max] 窗口内从后往前找最后一个自然断点（断句标点 > 分句标点 > 空白），
-   *  找不到才在 max 处硬切（纯 URL/代码长串）。防止长句在任意字符位置被劈开。 */
+  /** 软切断点：在 [60%, max] 窗口内从后往前找最后一个自然断点（断句标点 > 分句标点 > 空白）；
+   *  没有自然断点时向前找英文/数字词边界（宁早切，也绝不在英文单词中间劈开）；
+   *  仅当整个前缀是单一无分隔串（纯 URL/超长标识符）才在 max 处硬切。 */
   function softCut(rest: string, max: number): number {
+    const len = Math.min(max, rest.length)
     const lo = Math.floor(max * 0.6)
     const breakers = '。！？!?…；;、，,．. '
-    for (let i = max; i > lo; i--) {
+    for (let i = len; i > lo; i--) {
       if (breakers.includes(rest[i - 1])) return i
     }
-    return max
+    const word = /[A-Za-z0-9_]/
+    for (let i = len; i > 0; i--) {
+      const c = rest[i - 1] ?? ''
+      const n = rest[i] ?? ''
+      if (!(word.test(c) && word.test(n))) return i
+    }
+    return len
   }
 
   /** 逐句改写并广播（流式路径；改写失败降级原文） */
