@@ -63,6 +63,7 @@ git clone <仓库地址>
 
 所有配置外置在 `nori.config.json`（复制 `nori.config.example.json` 得到；本机文件不进 git）。
 **留空 = 走默认约定**（探测仓库内资产）；改了之后重跑 `.\install.ps1` 生效。
+首次安装若没有 `nori.config.json`（或为空），`install.ps1` 会**交互式引导**逐项询问（声线 wav、转写文本、GPT-SoVITS 路径、改写层 apiKey）并自动生成该文件；非交互环境（如 CI）自动跳过询问、全部走默认约定。
 
 | 键 | 默认 | 说明 |
 |---|---|---|

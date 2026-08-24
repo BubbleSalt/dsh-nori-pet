@@ -55,6 +55,47 @@ if (Test-Path $ConfigPath) {
   try { $cfgFile = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json }
   catch { Write-Warning "nori.config.json 解析失败，按默认约定继续：$($_.Exception.Message)" }
 }
+
+# ---- 0b) 配置引导：nori.config.json 缺失/为空时，交互式生成并让用户填写 ----
+# 仅当文件不存在或解析为空对象才触发；已填配置则跳过，不打扰。
+# 非交互环境（stdin 被重定向，如 CI/脚本调用）自动跳过询问，全部走默认约定。
+$cfgProps = @($cfgFile.PSObject.Properties)
+$NeedConfigGuide = -not (Test-Path $ConfigPath) -or ($cfgProps.Count -eq 0)
+$Interactive = -not [Console]::IsInputRedirected
+if ($NeedConfigGuide) {
+  Write-Host ''
+  Write-Host '==> 未检测到 nori.config.json 配置（或为空）。'
+  if (-not $Interactive) {
+    Write-Host '    非交互环境（stdin 重定向），跳过配置询问，全部走默认约定。'
+    Write-Host "    之后可手动生成：Copy-Item nori.config.example.json nori.config.json 后编辑，再重跑本脚本。"
+  } else {
+    Write-Host '    将逐项询问并生成配置（直接回车 = 该项留空用默认约定）。'
+    Write-Host '    完整可配置项见 nori.config.example.json；生成后可随时编辑再重跑。'
+    Write-Host ''
+    $aRefAudio  = Read-Host '  参考音频 wav 路径（声线；回车=自动探测 voice/ 目录）'
+    $aRefPrompt = Read-Host '  参考音频转写文本（与上面 wav 配套；回车=默认"你好,初次见面,我的名字是Nori"）'
+    $aGsvBase   = Read-Host '  GPT-SoVITS 根目录 gsvBase（回车=未配置，语音暂不可用；可先跑 install-sovits.ps1）'
+    $aVenvPy    = Read-Host '  venv python 路径（回车=<gsvBase>/.venv/Scripts/python.exe）'
+    $aApiKey    = Read-Host '  改写层 DeepSeek apiKey（回车=回退 dsh 内置 llm）'
+    # 组装最小结构 JSON（手写字符串保留中文，不依赖 ConvertTo-Json 的 \u 转义）
+    $pairs = @()
+    if ($aRefAudio.Trim())  { $pairs += "`"refAudio`": `"$($aRefAudio.Trim() -replace '"', '\"')`"" }
+    if ($aRefPrompt.Trim()) { $pairs += "`"refPrompt`": `"$($aRefPrompt.Trim() -replace '"', '\"')`"" }
+    if ($aGsvBase.Trim() -or $aVenvPy.Trim()) {
+      $sov = @()
+      if ($aGsvBase.Trim()) { $sov += "`"gsvBase`": `"$($aGsvBase.Trim() -replace '"', '\"')`"" }
+      if ($aVenvPy.Trim())  { $sov += "`"venvPy`": `"$($aVenvPy.Trim() -replace '"', '\"')`"" }
+      $pairs += "`"sovits`": { $($sov -join ', ') }"
+    }
+    if ($aApiKey.Trim()) { $pairs += "`"reframe`": { `"apiKey`": `"$($aApiKey.Trim() -replace '"', '\"')`" }" }
+    $json = "{ $($pairs -join ', ') }"
+    Write-U8 $ConfigPath $json
+    Write-Host "  配置已生成: $ConfigPath"
+    Write-Host '  （后续可直接编辑此文件，或对照 nori.config.example.json 增删项）'
+    try { $cfgFile = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { Write-Warning "生成的配置解析失败：$($_.Exception.Message)（继续用默认约定）" }
+  }
+}
 $ModelDir  = [string]$cfgFile.modelDir
 $RefAudio  = [string]$cfgFile.refAudio
 $RefPrompt = if ([string]$cfgFile.refPrompt) { [string]$cfgFile.refPrompt } else { '你好,初次见面,我的名字是Nori' }
