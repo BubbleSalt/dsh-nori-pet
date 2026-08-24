@@ -1,16 +1,17 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-  Uninstall the Nori desktop-pet plugin (@dsh-external/dsh-nori-pet) from a dsh
+  Uninstall the Nori desktop-pet plugin (@bubblesalt/dsh-nori-pet) from a dsh
   profile using the official dsh plugin API.
 
 .DESCRIPTION
-  `dsh plugin --profile <Profile> remove` (official: removes the dependency,
-  its node_modules link and the dsh.profile.bundles entry), then removes the
-  config overlay entry from the profile's cordis.patch.yml (kept a valid
-  top-level array), then removes the staging junction under
-  %LOCALAPPDATA%\dsh-links. Never deletes repo sources. Idempotent;
-  -DryRun only reports what would change.
+  `dsh plugin --profile <Profile> remove` (official: removes the dependency and
+  its dsh.profile.bundles entry), then removes the config overlay entry from the
+  profile's cordis.patch.yml (kept a valid top-level array), then removes the
+  staging junction under %LOCALAPPDATA%\dsh-links and any leftover link junction
+  under the profile's node_modules (dsh plugin remove may leave it dangling),
+  plus the DEEPSEEK_NORI_API_KEY credentials ref if present. Never deletes repo
+  sources. Idempotent; -DryRun only reports what would change.
 
 .PARAMETER Profile
   Target dsh profile name. Default web.
@@ -33,7 +34,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-$Pkg     = '@dsh-external/dsh-nori-pet'
+$Pkg     = '@bubblesalt/dsh-nori-pet'
 $DshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
 $ProfRoot = Join-Path $DshHome "profiles\$Profile"
 if (-not (Test-Path $ProfRoot)) { throw "profile not found: $ProfRoot (use -Profile)" }
@@ -78,6 +79,46 @@ if (-not $KeepStagingLink -and (Test-Path $StagingLink)) {
   if (-not $DryRun) {
     $fi = Get-Item $StagingLink -Force
     $fi.Delete()
+  }
+}
+
+# ---- 3b) profile node_modules link cleanup ---------------------------------
+# dsh plugin remove 会清 dependencies/bundles 声明，但 profile node_modules 下的 link
+# junction 可能残留（悬空：target 已被上一步删掉的 staging link）。这里主动删除该包
+# 对应路径；scope 目录删空后一并移除。只删 junction 本体（LinkType 校验），不碰 target。
+Write-Host '==> profile node_modules link'
+$nmRoot = Join-Path $ProfRoot 'node_modules'
+$scopeName, $bareName = $Pkg -split '/', 2
+$nmLink = if ($scopeName -like '@*') { Join-Path (Join-Path $nmRoot $scopeName) $bareName } else { Join-Path $nmRoot $Pkg }
+if (Test-Path $nmLink) {
+  $it = Get-Item $nmLink -Force
+  if ($it.LinkType -eq 'Junction') {
+    $removed += "node_modules link: $nmLink"
+    if (-not $DryRun) { $it.Delete() }
+  } else {
+    Write-Host "    $nmLink 存在但不是 junction，跳过（不删除非链接内容）"
+  }
+  if ($scopeName -like '@*') {
+    $scopeDir = Join-Path $nmRoot $scopeName
+    if ((Test-Path $scopeDir) -and -not (Get-ChildItem $scopeDir -Force -ErrorAction SilentlyContinue)) {
+      $removed += "空 scope 目录: $scopeDir"
+      if (-not $DryRun) { Remove-Item $scopeDir -Force }
+    }
+  }
+}
+
+# ---- 4) credentials cleanup: DEEPSEEK_NORI_API_KEY ref ----------------------
+# 移除安装脚本写入的改写层专用 key ref（DEEPSEEK_NORI_API_KEY），保留其他 key 不动。
+Write-Host '==> credentials: remove DEEPSEEK_NORI_API_KEY ref'
+$CredPath = Join-Path $DshHome '.credentials.yaml'
+if (Test-Path $CredPath) {
+  $lines = @([System.IO.File]::ReadAllLines($CredPath, [System.Text.Encoding]::UTF8))
+  $kept = @($lines | Where-Object { $_ -notmatch '^\s*DEEPSEEK_NORI_API_KEY\s*:' })
+  if ($kept.Count -ne $lines.Count) {
+    $removed += 'credentials: DEEPSEEK_NORI_API_KEY ref'
+    if (-not $DryRun) { Write-U8 $CredPath (($kept -join "`n") + "`n") }
+  } else {
+    Write-Host '    no DEEPSEEK_NORI_API_KEY ref found; nothing to remove'
   }
 }
 

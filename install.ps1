@@ -1,7 +1,7 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-  One-click installer for the Nori desktop-pet plugin (@dsh-external/dsh-nori-pet)
+  One-click installer for the Nori desktop-pet plugin (@bubblesalt/dsh-nori-pet)
   using the official dsh plugin API.
 
 .DESCRIPTION
@@ -42,7 +42,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $Repo     = $PSScriptRoot
-$Pkg      = '@dsh-external/dsh-nori-pet'
+$Pkg      = '@bubblesalt/dsh-nori-pet'
 $PkgShort = 'dsh-nori-pet'
 $DshHome  = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
 $ProfRoot = Join-Path $DshHome "profiles\$Profile"
@@ -186,6 +186,24 @@ if ($RefAudio) { $cfg += "    refAudio: $(Y $RefAudio)" }
 if ($GsvBase) { $cfg += "    gsvBase: $(Y $GsvBase)" }
 if ($VenvPy)  { $cfg += "    venvPy: $(Y $VenvPy)" }
 
+# 顶层运行时参数（可选）：nori.config.json 同名字段 → patch 键。
+# 值类型按 Config schema（src/index.ts）：布尔/字符串按类型处理，其余数值（int/double/decimal）
+# 裸写保留原值（含小数 0.9/1.2；0/负数视为未设置跳过）。allowedOrigins 为字符串数组。
+# 未填的键跳过 → 插件用源码默认。
+foreach ($k in @('maxSentence', 'ttsTemperature', 'ttsTopK', 'ttsSpeedFactor', 'ttsWatch', 'ttsWatchIntervalMs', 'personaPrompt', 'personaReframe')) {
+  $v = $cfgFile.$k
+  if ($null -eq $v) { continue }
+  if ($v -is [bool]) { $cfg += "    ${k}: $(if ($v) { 'true' } else { 'false' })"; continue }
+  if ($v -is [string]) { if ($v -eq '') { continue }; $cfg += "    ${k}: $(Y $v)"; continue }
+  if ($v -le 0) { continue }  # 0/负数 → 未设置，跳过（防 '0' 字符串被 z.number 拒绝）
+  $cfg += "    ${k}: $v"
+}
+$Origins = $cfgFile.allowedOrigins
+if ($Origins -is [array] -and $Origins.Count -gt 0) {
+  $cfg += '    allowedOrigins:'
+  foreach ($o in $Origins) { if ([string]$o -ne '') { $cfg += "      - $(Y ([string]$o))" } }
+}
+
 # 改写层配置（可选）：nori.config.json 的 reframe 段 → patch 键。
 # 值类型按 Config schema（src/index.ts）：字符串加引号，布尔/数字裸写（数字加引号会被 z.number 拒绝）。
 # 未填的键跳过 → 插件用源码默认（默认：reframeApiKeyRef=DEEPSEEK_NORI_API_KEY，解析到即直连官方 API，否则回退 dsh llm）。
@@ -202,6 +220,29 @@ if ($ReframeCfg) {
     if ($s -eq '') { continue }
     $cfg += "    ${k}: $(Y $s)"
   }
+}
+
+# 改写层专用 key（可选）：nori.config.json 的 reframe.apiKey → 写入 dsh credentials 的
+# DEEPSEEK_NORI_API_KEY ref（与源码默认 reframeApiKeyRef=DEEPSEEK_NORI_API_KEY 一致，
+# 插件 resolve 到即直连官方 API，否则回退 dsh llm）。逐行更新该 ref，不动其他 key；
+# 未填 apiKey 则保持现有 credentials 不变。卸载时 uninstall.ps1 移除该 ref。
+$ReframeKey = [string]$ReframeCfg.apiKey
+if ($ReframeKey) {
+  $CredPath = Join-Path $DshHome '.credentials.yaml'
+  if (-not (Test-Path $DshHome)) { New-Item -ItemType Directory $DshHome -Force | Out-Null }
+  $lines = @()
+  if (Test-Path $CredPath) { $lines = @([System.IO.File]::ReadAllLines($CredPath, [System.Text.Encoding]::UTF8)) }
+  else { $lines = @('version: 1', 'refs:') }
+  $hit = -1
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match '^\s*DEEPSEEK_NORI_API_KEY\s*:') { $hit = $i; break }
+  }
+  $keyLine = '  DEEPSEEK_NORI_API_KEY: ' + $ReframeKey
+  if ($hit -ge 0) { $lines[$hit] = $keyLine } else { $lines += $keyLine }
+  Write-U8 $CredPath (($lines -join "`n") + "`n")
+  Write-Host "credentials: DEEPSEEK_NORI_API_KEY -> $CredPath"
+} else {
+  Write-Host 'credentials: reframe.apiKey 未填，跳过（现有 DEEPSEEK_NORI_API_KEY 保持不变）'
 }
 
 # Loader PatchOptions 格式（dsh-app-boot applyEntryPatches）：顶层数组条目 = {id, name?, config?, ...}，
