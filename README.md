@@ -95,7 +95,8 @@ git clone <仓库地址>
 | `assetsDir` / `coreFile` | 空（探测 `Nori_web/`、`cubism_sdk/Core`） | 模型目录 / core 文件，绝对或相对仓库根 |
 | `ttsUrl` | `http://127.0.0.1:9880/tts` | GPT-SoVITS 地址（api_v2 端点） |
 | `refAudio` / `refPrompt` | 空（留空自动探测 `voice/` 下的 wav） / `你好,初次见面,我的名字是Nori` | 声线 wav 路径与其转写文本 ⚠ 见下方[参考音频须知](#参考音频须知refaudio--refprompt) |
-| `gsvBase` / `venvPy` | 空（探测 `GPT-SoVITS/`） | 守护拉起 api_v2 用的目录与 venv python |
+| `sovits.gsvBase` / `sovits.venvPy` | 空（探测 `GPT-SoVITS/`） | 守护拉起 api_v2 用的目录与 venv python |
+| `sovits.t2sWeights` / `sovits.vitsWeights` | 空 / 空 | 推理权重路径（GPT 模型 s1 / SoVITS 模型 s2；见[GPT-SoVITS 章节](#gpt-sovits可选)） |
 | `personaPrompt` / `personaReframe` | 空（探测 `persona/`） | 人设文件路径覆盖 |
 | `maxSentence` / `ttsTemperature` / `ttsTopK` / `ttsSpeedFactor` | 140 / 0.9 / 12 / 1.0 | 断句与合成参数，多数无需改动（0.9/12 为防 AR 循环卡顿的推荐值，勿降回低温低 top_k） |
 | `ttsWatch` / `ttsWatchIntervalMs` | true / 30000 | 9880 掉线守护：30s 内自动拉起 api_v2 |
@@ -151,6 +152,20 @@ GPT-SoVITS 是本地语音合成引擎（TTS）——Nori 用它把文字念成�
 - 一键：`.\install-sovits.ps1 -DownloadModels` 会把官方默认权重（HuggingFace，约 1GB+）自动放进 **`GPT-SoVITS/GPT_SoVITS/pretrained_models/`**；
 - 已有权重 / 想换音色：把下载或微调好的模型（`*.pth` 等）手动放进**同一个** `GPT-SoVITS/GPT_SoVITS/pretrained_models/` 目录即可（GPT-SoVITS 的推理默认落点）；
 - 该目录为空时 api.py 推理会失败（表现为没声音）——补上权重后重跑 `.\install-sovits.ps1` 或直接重启 ttsWatch 即可。权重为官方闭源，仅本机使用、不入仓库。
+
+**怎么指定 / 换用模型（微调权重或官方配方）？**
+
+- `nori.config.json` 的 `sovits` 段给两个权重路径即可：
+  ```json
+  "sovits": {
+    "t2sWeights": "C:/.../audio/s1_half_weights_yinian/nori_s1_yinian-e20.ckpt",
+    "vitsWeights": "C:/.../audio/s2G_best_yinian.pth"
+  }
+  ```
+  `t2sWeights` = GPT 模型（`t2s_weights_path`）、`vitsWeights` = SoVITS 模型（`vits_weights_path`），绝对或相对仓库根；留空则用原 `tts_infer.yaml` 的 custom 块；
+- ttsWatch 下次拉起 api_v2 时自动生成**独立的运行时配置**（`GPT_SoVITS/configs/tts_infer.runtime.yaml`）启动——**原 `tts_infer.yaml` 不被修改**，随时改回；
+- 改完想立刻生效：杀掉 9880 的 api_v2 进程，等 ttsWatch 30s 内自动重拉即可；
+- 想恢复原样：删掉 `sovits` 里的 t2sWeights / vitsWeights 字段即可。
 
 ---
 

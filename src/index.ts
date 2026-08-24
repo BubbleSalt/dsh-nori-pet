@@ -18,6 +18,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Socket } from 'node:net'
 import { homedir } from 'node:os'
 import { loadPersona } from './prompt.js'
+import { buildRuntimeTtsConfig } from './modelPreset.js'
 
 // 宿主以 ESM 方式被 loader import（无 __dirname），用 import.meta.url 推导包目录
 const HOST_DIR = fileURLToPath(new URL('.', import.meta.url))
@@ -1165,9 +1166,33 @@ function applyInner(ctx: AppContext, config: Config) {
         if (probe.status < 500) return // 200/404/400 都算活着（500=缺 ref 参数也算活着）
       } catch { /* 探测失败 → 需要拉起 */ }
       if (!GSV_BASE || !VENV_PY) return
+      // 用户通过 nori.config.json sovits 段指定推理权重（t2sWeights/vitsWeights）→ 生成运行时
+      // custom 配置，不覆盖原 tts_infer.yaml（custom 块永远保留）；未配置权重则用原配置
+      let ttsCfgArg = 'GPT_SoVITS/configs/tts_infer.yaml'
+      try {
+        const nc = JSON.parse(readFileSync(join(dirname(HOST_DIR), 'nori.config.json'), 'utf8'))
+        const sovits = (nc as any)?.sovits ?? {}
+        const t2s = String(sovits.t2sWeights ?? '').trim()
+        const vits = String(sovits.vitsWeights ?? '').trim()
+        if (t2s || vits) {
+          const srcYaml = join(GSV_BASE, 'GPT_SoVITS', 'configs', 'tts_infer.yaml')
+          if (existsSync(srcYaml)) {
+            const { out, result } = buildRuntimeTtsConfig(readFileSync(srcYaml, 'utf8'), {
+              t2sWeights: t2s ? resolveConfigPath(t2s) : '',
+              vitsWeights: vits ? resolveConfigPath(vits) : '',
+            })
+            if (result.ok && result.changed && out) {
+              const rt = join(GSV_BASE, 'GPT_SoVITS', 'configs', 'tts_infer.runtime.yaml')
+              writeFileSync(rt, out, 'utf8')
+              ttsCfgArg = rt
+              log('[dsh-nori-pet] tts model preset: ' + result.message + ' -> ' + rt)
+            } else if (!result.ok) log('[dsh-nori-pet] tts model preset: ' + result.message)
+          }
+        }
+      } catch (e) { log('[dsh-nori-pet] tts model preset 读取配置失败: ' + String((e as Error)?.message ?? e)) }
       try {
         const { spawn } = await import('node:child_process')
-        const child = spawn(VENV_PY, ['api_v2.py', '-a', '127.0.0.1', '-p', '9880', '-c', 'GPT_SoVITS/configs/tts_infer.yaml'], {
+        const child = spawn(VENV_PY, ['api_v2.py', '-a', '127.0.0.1', '-p', '9880', '-c', ttsCfgArg], {
           cwd: GSV_BASE,
           stdio: 'ignore',
           detached: false,

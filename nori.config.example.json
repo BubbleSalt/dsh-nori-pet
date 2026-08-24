@@ -14,9 +14,11 @@
   "personaReframe": "",
   "allowedOrigins": [],
   "sovits": {
-    "_comment": "GPT-SoVITS 服务配置（可选）。未配置时安装照常完成，但语音功能不可用——可运行 .\\install-sovits.ps1 一键部署后在此填写，或填外部已有部署的路径。",
+    "_comment": "GPT-SoVITS 服务配置（可选）。未配置时安装照常完成，但语音功能不可用——可运行 .\\install-sovits.ps1 一键部署后在此填写，或填外部已有部署的路径。t2sWeights / vitsWeights：直接指定推理权重路径（GPT 模型 s1 / SoVITS 模型 s2，绝对或相对仓库根）；ttsWatch 下次拉起 api_v2 时自动生成独立运行时配置应用，原 tts_infer.yaml 不被修改。",
     "gsvBase": "",
-    "venvPy": ""
+    "venvPy": "",
+    "t2sWeights": "",
+    "vitsWeights": ""
   },
   "reframe": {
     "_comment": "人设改写层（可选，默认开启）。把 assistant 输出改写为 Nori 口吻后朗读：填 apiKey（DeepSeek 官方 key）由安装脚本自动写入 dsh credentials 的 DEEPSEEK_NORI_API_KEY ref → 直连官方 API（独立计量，与主会话互不影响）；留空则自动回退 dsh 内置 llm（与主会话共用计量）。其余键全部留空即用默认值，无需填。卸载脚本会同时移除该 credentials ref。",

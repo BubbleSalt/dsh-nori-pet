@@ -113,7 +113,10 @@ if ($DownloadModels) {
 $cfgPath = Join-Path $Repo 'nori.config.json'
 $cfg = @{}
 if (Test-Path $cfgPath) { try { $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { /* 保留空对象 */ } }
-$cfg.sovits = @{ gsvBase = $GsvBase; venvPy = $venvPy }
+# 字段级更新 sovits 段（保留用户已有字段，如 t2sWeights / vitsWeights）
+if ($null -eq $cfg.sovits) { $cfg.sovits = @{} }
+$cfg.sovits.gsvBase = $GsvBase
+$cfg.sovits.venvPy  = $VenvPy
 [System.IO.File]::WriteAllText($cfgPath, ($cfg | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "==> nori.config.json sovits 已写入（gsvBase, venvPy）；运行 .\install.ps1 完成插件接线"
 
