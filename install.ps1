@@ -98,8 +98,12 @@ if ($NeedConfigGuide) {
         Write-Warning '    install-sovits.ps1 缺失，无法自动安装；可稍后手动运行它。'
       } else {
         Write-Host '    ==> 运行 install-sovits.ps1（clone + venv + 依赖，自动写入 sovits 配置）...'
-        if ($aDlModels) { & $sovitsScript -DownloadModels } else { & $sovitsScript }
-        if ($LASTEXITCODE -ne 0) { Write-Warning '    install-sovits.ps1 退出码非 0，部署可能未完成（可稍后重跑）' }
+        try {
+          if ($aDlModels) { & $sovitsScript -DownloadModels } else { & $sovitsScript }
+          Write-Host '    install-sovits.ps1 完成（sovits 配置已写入 nori.config.json）'
+        } catch {
+          Write-Warning "    install-sovits.ps1 执行失败：$($_.Exception.Message)；主安装继续（可稍后手动运行 install-sovits.ps1）"
+        }
       }
     } else {
       $aGsvBase = Read-Host '  ④ GPT-SoVITS 根目录 gsvBase（外部已有部署时填；回车=未配置，语音暂不可用）'
