@@ -3,8 +3,13 @@
 把 Nori 带到你的桌面上：Live2D 立绘常驻浏览器角落，dsh 的 assistant 输出会被改写成 Nori 口吻，
 经本地 GPT-SoVITS 用 Nori 声线朗读出来——配合脸部表情、口型、睡眠、摸头等小交互。
 
+> 💬 **Nori 想对你说**：Nori 就是 Nori，一直在这里的。你要和 Nori 玩吗？
+> 🎬 想看看 Nori 的故事？→ [她明明是AI，但我想拯救她。独立游戏《I_NORI》【B站AI创造公开赛】](https://b23.tv/9NcPFdd)
+
 > ⚠ **仅支持 Windows**（依赖 PowerShell 5.1+ / NTFS junction），暂无 Linux/macOS 安装路径。
-> 前置：Node.js + npm、一个可用的 dsh 环境（默认使用 `web` profile）。
+> 前置：Node.js + npm、一个可用的 **dsh 环境**。dsh（[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)，"Everything is a Plugin"）
+> 是 DeepSeek 官方的本地 AI 工作台——自带会话、工具与 LLM 接入，靠插件扩展能力，本插件就是挂在它上面的一个能力；
+> 安装与启动见官方仓库（默认使用 `web` profile）。
 
 ---
 
@@ -12,10 +17,11 @@
 
 ![nori 桌宠效果演示](README/nori演示.gif)
 
-安装完长这样：浏览器右下角一只白发少女，回话时张嘴、眨眼、跟着情绪换表情。
+安装完长这样：浏览器右下角的 Nori——回话时张嘴、眨眼、跟着情绪换表情。
 
 ---
 
+<a id="你需要准备的资产"></a>
 ## 📦 你需要准备的资产
 
 > 模型 / 声线 / 授权人设文本是第三方 IP（见文末[许可](#许可与第三方资产)），**不进仓库、不随 Release 分发**。
@@ -62,19 +68,37 @@ git clone <仓库地址>
 |---|---|---|
 | `assetsDir` / `coreFile` | 空（探测 `Nori_web/`、`cubism_sdk/Core`） | 模型目录 / core 文件，绝对或相对仓库根 |
 | `ttsUrl` | `http://127.0.0.1:9880/tts` | GPT-SoVITS 地址（api_v2 端点） |
-| `refAudio` / `refPrompt` | 空 / `你好,初次见面,我的名字是Nori` | 声线 wav 路径与其转写文本 |
+| `refAudio` / `refPrompt` | 空（回退 `voice/nori.wav`） / `你好,初次见面,我的名字是Nori` | 声线 wav 路径与其转写文本 ⚠ 见下方[参考音频须知](#参考音频须知refaudio--refprompt) |
 | `gsvBase` / `venvPy` | 空（探测 `GPT-SoVITS/`） | 守护拉起 api_v2 用的目录与 venv python |
 | `personaPrompt` / `personaReframe` | 空（探测 `persona/`） | 人设文件路径覆盖 |
-| `maxSentence` / `ttsTemperature` / `ttsTopK` / `ttsSpeedFactor` | 140 / 0.65 / 5 / 1.0 | 断句与合成参数，多数无需改动 |
+| `maxSentence` / `ttsTemperature` / `ttsTopK` / `ttsSpeedFactor` | 140 / 0.9 / 12 / 1.0 | 断句与合成参数，多数无需改动（0.9/12 为防 AR 循环卡顿的推荐值，勿降回低温低 top_k） |
 | `ttsWatch` / `ttsWatchIntervalMs` | true / 30000 | 9880 掉线守护：30s 内自动拉起 api_v2 |
 | `allowedOrigins` | 空数组 | 非本机来源访问 WS/API 时的放行主机名（见[安全边界](#安全边界本地服务)） |
+
+<a id="参考音频须知refaudio--refprompt"></a>
+### 参考音频须知（`refAudio` / `refPrompt`）
+
+⚠️ **`refPrompt` 必须是 `refAudio` 那段音频的逐字转写文本**，两者必须配套：
+
+- **换 `refAudio` 时，`refPrompt` 要同步换成新音频的转写**，否则 GPT-SoVITS 的 AR 条件作用会劣化：
+  表现为**跳字/吞句**（中英混排时更明显）、音色漂移、听感不稳——不是偶发，是配置错误。
+- `refAudio` 留空时自动回退插件自带 `voice/nori.wav`（对应 `refPrompt` 默认值）。建议长度 3~10 秒（api_v2 强制要求）。
+- 想要更"高昂/开心"的声线：换一段语气上扬的 wav 并填它的转写即可（本项目仓库不含声线资产，需自行放置）。
+
+### 朗读文本规整（speak 自动处理，无需配置）
+
+`/api/speak` 在送 TTS 前会自动做两处规整，均无需配置：
+
+- 句尾无标点时补"。"，便于 cut5 分句；
+- **中英混排保护**：英文词会让 AR 对齐失败、有约 75% 概率跳过其前面的中文片段（如"会自己移除那条 ref"→ 丢掉"会自己移除那条"）。因此中文与英文词（≥2 字符，不误伤"C盘"）之间会自动补逗号强制分片，并把反引号 `` ` `` 清掉。实测把读出率从 ~25% 提到 ~90%+。
 
 ### 改写层（Nori 口吻）
 
 默认开启：把 assistant 输出改写成 Nori 的说话方式再朗读。
 
-- **API**：优先直连 **DeepSeek 官方 API**。设置环境变量 `DEEPSEEK_NORI_API_KEY` 即启用（无需改配置）；
-  没有 key 时自动回退到 dsh 内置 llm 服务（`deepseek-official` / `deepseek-chat`）。
+- **API**：优先直连 **DeepSeek 官方 API**。在 `nori.config.json` 的 `reframe.apiKey` 填入你的 key，
+  安装脚本会自动写入 dsh 的 credentials（`DEEPSEEK_NORI_API_KEY` ref），卸载脚本会一并移除——全程不用手动开文件；
+  留空则自动回退到 dsh 内置 llm 服务（`deepseek-official` / `deepseek-chat`，与主会话共用计量）。
 - **人设**：system 提示来自 `persona/prompt.txt`（授权文本，用户放置）+ `persona/reframe.txt`（改写任务指令，随仓库提供）；
   授权文本缺失时改写层自动关闭，直接朗读原文。
 - 进阶参数（`reframe` 总开关 / 超时 / 输入截断 / 追踪日志）见 `nori.config.example.json` 或 `src/index.ts` 的 Config 注释。
@@ -93,6 +117,11 @@ install **不会自动安装** GPT-SoVITS——没部署时一切照常，只是
 ```
 
 需要 Python **3.9~3.11**（仅用于跑推理服务）；部署完成后 api_v2（9880）由 ttsWatch 自动拉起，冷启动较慢属正常。
+
+**模型文件在哪？**
+- 一键：`.\install-sovits.ps1 -DownloadModels` 会把官方默认权重（HuggingFace，约 1GB+）自动放进 **`GPT-SoVITS/GPT_SoVITS/pretrained_models/`**；
+- 已有权重 / 想换音色：把下载或微调好的模型（`*.pth` 等）手动放进**同一个** `GPT-SoVITS/GPT_SoVITS/pretrained_models/` 目录即可（GPT-SoVITS 的推理默认落点）；
+- 该目录为空时 api.py 推理会失败（表现为没声音）——补上权重后重跑 `.\install.sovits.ps1` 或直接重启 ttsWatch 即可。权重为官方闭源，仅本机使用、不入仓库。
 
 ---
 
@@ -126,6 +155,8 @@ install **不会自动安装** GPT-SoVITS——没部署时一切照常，只是
 | 症状 | 原因与处理 |
 |---|---|
 | 语音 502 `tts http 400` | api_v2 强制要求参考音频：把 wav 放进 `voice/` 或配置 `refAudio` 后重跑 install |
+| 跳字/吞句（某小段中文不读，中英混排时更明显） | 多为 `refPrompt` 与 `refAudio` 不配套（转写文本和音频内容对不上）：改成一致即可；speak 已内置混排逗号规整兜底 |
+| 某字被拖长后吞句（"嗯/唔"等鼻音） | AR 采样循环：确认 `ttsTemperature`/`ttsTopK` 不低于 0.9/12（speak 已内置拖长自动重试兜底） |
 | 语音 503 `tts offline` | 9880 不可达：`Test-NetConnection 127.0.0.1 -Port 9880`；ttsWatch 会在 30s 内自动拉起 |
 | 睡眠睁眼 / 头每 3 秒回正 | 已适配原版模型解决（睡眠动作在 Idle 组，配 `setIsLoop(true)` 稳住）；换成别的模型会睡眠退化 |
 | 日志 | 错误：`~/.dsh/logs/nori-pet/nori-pet-error.log`；改写追踪：`~/.dsh/logs/nori-pet/nori-pet-trace*.log` |
