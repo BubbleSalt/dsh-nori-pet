@@ -46,6 +46,8 @@
     "typecheck:host": "tsc -p tsconfig.json --noEmit",
     "typecheck:client": "tsc -p tsconfig.widget.json --noEmit",
     "build:client": "tsdown",
+    "test": "npm run test:preset && npm run test:smoke",
+    "test:preset": "node scripts/test-model-preset.mjs",
     "test:smoke": "node scripts/smoke-test.mjs",
     "guard": "node scripts/guard-release.mjs",
     "guard:staged": "node scripts/guard-release.mjs --staged"

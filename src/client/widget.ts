@@ -341,13 +341,13 @@ function fetchTts(text: string, token: number): Promise<ArrayBuffer | null> {
     body: JSON.stringify({ text }),
   })
     .then(async (res) => {
-      // 给用户看的气泡文案：503/连不上 = soviits未上线（清晰易懂）；其它错误码保留 codes 便于排障
-      if (res.status === 503) { showBubble('（soviits未上线）'); return null }
+      // 给用户看的气泡文案：503/连不上 = sovits 未上线（清晰易懂）；其它错误码保留 codes 便于排障
+      if (res.status === 503) { showBubble('（sovits 未上线）'); return null }
       if (!res.ok) { showBubble('（TTS 未就绪：' + res.status + '）'); return null }
       const buf = await res.arrayBuffer()
       return token === playToken ? buf : null
     })
-    .catch(() => { showBubble('（soviits未上线）'); return null })
+    .catch(() => { showBubble('（sovits 未上线）'); return null })
 }
 
 /** 播放已合成的音频；返回 Promise，播放完或被打断时 resolve。 */
@@ -890,8 +890,20 @@ function connect(): void {
       return
     }
     // 思考表情：agent 工作中（用户发言 / 工具调用）→ 沉思；turn 结束回收
-    if (msg.type === 'user') { wakeUp(); setThinking(true); return } // 用户开口即唤醒，不等到第一句回答
-    if (msg.type === 'turn-end') { setThinking(false); return }
+    if (msg.type === 'user') {
+      turnActive = true // turn 激活：清晰睡计时器（turn 未结束不入睡）
+      if (sleepTimer) { window.clearTimeout(sleepTimer); sleepTimer = null }
+      wakeUp() // 用户开口即唤醒，不等到第一句回答
+      setThinking(true)
+      return
+    }
+    if (msg.type === 'tool') { setThinking(true); return }
+    if (msg.type === 'turn-end') {
+      turnActive = false // turn 结束：睡眠计时此刻才开始
+      setThinking(false)
+      resetSleepTimer()
+      return
+    }
     // emote：宿主 /api/emote 手动触发（验证情绪联动用）
     if (msg.type === 'emote') {
       const e = String(msg.e ?? '')
@@ -909,6 +921,19 @@ function connect(): void {
   }
   ws.onerror = () => { try { ws!.close() } catch { /* ignore */ } }
 }
+
+// ─── WS 自愈：长时间后台（document.hidden，onclose 不重连）或宿主重启后，WebSocket 会永久
+//      挂起 → 新消息收不到 → Nori 永远醒不来。恢复可见时立即唤醒 + 重连；另加周期兜底。 ──
+function ensureWs(): void {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return
+  if (!ws) connect()
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return
+  wakeUp() // 回到桌面先醒（用户回来看到的就是待机态）
+  ensureWs() // hidden 期间断掉的连接在此补上
+})
+setInterval(ensureWs, 15000) // 周期自愈：宿主重启 / 长连接被服务端回收等兜底
 
 let hidden = false
 btnClose.addEventListener('click', () => {
@@ -1024,6 +1049,7 @@ window.addEventListener('pointercancel', endStrokeP)
 const SLEEP_AFTER_MS = 90000 // 90 秒无交互入睡（原 180s 减半）
 let sleeping = false
 let sleepTimer: number | null = null
+let turnActive = false // turn 生命周期：user→turn-end 之间活跃；活跃期不启动入睡计时
 let lastMoveActivity = 0
 let lastMoveX = -1
 let lastMoveY = -1
@@ -1050,6 +1076,7 @@ root.addEventListener('pointermove', (e) => {
 })
 
 function resetSleepTimer(): void {
+  if (turnActive) { if (sleepTimer) { window.clearTimeout(sleepTimer); sleepTimer = null }; return } // turn 未结束不入睡
   if (sleepTimer) window.clearTimeout(sleepTimer)
   sleepTimer = window.setTimeout(goSleep, SLEEP_AFTER_MS)
 }

@@ -40,7 +40,7 @@ export const Config = z.object({
    *  换 refAudio 时必须同步换 refPrompt，否则 AR 条件作用劣化 → 跳字/吞句（中英混排时更明显）、音色漂移。 */
   refPrompt: z.string().default('你好,初次见面,我的名字是Nori'),
   /** 单句推送的最大长度（超出强制截断） */
-  maxSentence: z.number().default(140),
+  maxSentence: z.number().min(1).default(140),
   /**
    * TTS 推理参数。低温度更稳更收敛（避免采样噪声导致电音感），但温度过低 + top_k 过小
    * 会让 AR 模型在"嗯/唔"等鼻音叹词上进入采样循环：某个字无限拖长、随后吞掉句尾一小段。
@@ -55,10 +55,18 @@ export const Config = z.object({
   reframeProvider: z.string().default('deepseek-official'),
   /** 改写 LLM 的模型 */
   reframeModel: z.string().default('deepseek-chat'),
-  /** 改写单次调用的超时（毫秒） */
-  reframeTimeoutMs: z.number().default(15000),
-  /** 改写输入的最大字符数（超出截断） */
-  reframeMaxInput: z.number().default(1500),
+  /** 改写单次调用的超时（毫秒）。实测真实负载（11.9K 人设 system + 材料）约 10s，
+   * 网关波动时易撞线 → 放宽到 60s；失败仅降级原文，无副作用。可在 nori.config.json reframe.reframeTimeoutMs 运行时覆盖。 */
+  reframeTimeoutMs: z.number().min(1000).default(60000),
+  /** 改写输入的最大字符数（超出截断）。只作用于材料（user），不含 system 里的预设人设。
+   *  调大后超长文本可一次喂更大块，改写请求次数更少、输出更精炼（配合 splitBlocks/BATCH_MAX）。 */
+  reframeMaxInput: z.number().min(1).default(4000),
+  /**
+   * 改写单次调用的最大输出 token。推理型模型（DeepSeek-V4-Flash 等）思维链会先吃满
+   * tokens 再出 content——512 常被 reasoning 占光导致 content 空、判 EMPTY 降级原文。
+   * 非推理模型（deepseek-chat 等）512 足够，此处按需调大（如 2048）。
+   */
+  reframeMaxTokens: z.number().min(1).default(2048),
   /**
    * Nori 专用 API key 的 credentials ref（如 DEEPSEEK_NORI_API_KEY）。
    * 设置后改写层直连 DeepSeek 官方 API（独立计量，不走主会话）；留空则走 dsh 内置 llm 服务。
@@ -70,8 +78,8 @@ export const Config = z.object({
   reframeTrace: z.boolean().default(true),
   /** api_v2 守护：定时探测 9880，掉了自动拉起（桌面朗读保底） */
   ttsWatch: z.boolean().default(true),
-  /** 守护探测间隔（毫秒） */
-  ttsWatchIntervalMs: z.number().default(30000),
+  /** 守护探测间隔（毫秒）。下限 5s：填 0 会让 setInterval 退化成定时器风暴 + 反复 spawn */
+  ttsWatchIntervalMs: z.number().min(5000).default(30000),
   /**
    * GPT-SoVITS 安装根目录（api_v2.py 所在，守护拉起时作为 cwd）。
    * 留空自动探测仓库内 GPT-SoVITS；不在此处的机器用 -GsvBase 指定。
@@ -102,6 +110,7 @@ export interface Config {
   reframeModel: string
   reframeTimeoutMs: number
   reframeMaxInput: number
+  reframeMaxTokens: number
   reframeApiKeyRef: string
   reframeBaseUrl: string
   reframeTrace: boolean
@@ -173,8 +182,9 @@ function wavFrameRms(buf: Buffer): number[] {
         const p = base + i * bytesPer * channels
         let v: number
         if (bits === 16) v = buf.readInt16LE(p) / 32768
-        else if (bits === 32) v = buf.readFloatLE(p)
-        else v = (buf.readInt8(p) & 0xff - 128) / 128
+        else if (bits === 8) v = (buf.readUInt8(p) - 128) / 128 // 注意 `&` 优先级低于 `-`：旧写法 readInt8(p) & 0xff - 128 实为 & 127，负半周被抹平
+        else if (bits === 32) v = buf.readInt32LE(p) / 2147483648 // 32bit *整型* PCM（旧代码按 float 读 → 得到垃圾值）
+        else v = 0
         sum += v * v
       }
       rms[f] = Math.sqrt(sum / frameN)
@@ -373,7 +383,7 @@ function applyInner(ctx: AppContext, config: Config) {
   let batchTurn = -1
   let batchText = ''
   let batchTimer: ReturnType<typeof setTimeout> | null = null
-  const BATCH_MAX = 150
+  const BATCH_MAX = 500 // 流式攒批上限：调大后超长文本改写请求更少（实时性略降，换来话少/请求少）
   const BATCH_IDLE_MS = 1200
 
   function flushBatch(): void {
@@ -398,6 +408,39 @@ function applyInner(ctx: AppContext, config: Config) {
       if (batchTimer) clearTimeout(batchTimer)
       batchTimer = setTimeout(flushBatch, BATCH_IDLE_MS)
     }
+  }
+
+  // 无句失声超时：流式输出停顿且迟迟不出标点（长 URL/代码/省略标点的段落）时，
+  // 2s 后把已攒残留"截断并输出"，避免一直静默等待到 turn/end。持续有增量则每块重置计时。
+  // ⚠ 碎片保护：agent 流式输出停顿（思考/工具间隙）常产生 <40 字的碎句（"包装""器："），
+  //   不足门槛的残留不独立广播——滞留 pending，turn/end 整段拼接后再改写，避免给碎片"配音"。
+  const REST_FLUSH_MS = 2000
+  const REST_FLUSH_MIN = 40
+  // eslint 无关：node/dom 双 types 下 setTimeout 返回类型不一致，统一放宽为 any
+  const restFlushTimers = new Map<string, any>()
+  function armRestFlush(sid: string, turn: number, key: string): void {
+    const old = restFlushTimers.get(key)
+    if (old) clearTimeout(old)
+    restFlushTimers.set(key, setTimeout(() => {
+      restFlushTimers.delete(key)
+      const r = pending.get(key)
+      if (!r) return
+      const trimmed = r.trim()
+      if (!trimmed || trimmed.length < REST_FLUSH_MIN) return // 碎片滞留 pending，等 turn/end collectTurnText 拼接
+      pending.delete(key)
+      if (config.reframe) {
+        const out = trimmed.length > config.maxSentence * 2 ? trimmed.slice(0, config.maxSentence * 2) + '……' : trimmed
+        addToBatch(sid, turn, out) // 进改写批，正常链路广播
+      } else {
+        const out = trimmed.length > config.maxSentence * 2 ? trimmed.slice(0, softCut(trimmed, config.maxSentence)) + '…' : trimmed
+        statAssistant += 1
+        lastAssistant = out.slice(0, 60)
+        broadcast({ type: 'assistant', session: sid, text: out, turn })
+      }
+    }, REST_FLUSH_MS) as unknown as number)
+  }
+  function clearRestFlush(prefix: string): void {
+    for (const [k, t] of [...restFlushTimers]) if (k.startsWith(prefix)) { clearTimeout(t); restFlushTimers.delete(k) }
   }
 
   function pushChunk(sid: string, turn: number, step: number, delta: string): void {
@@ -431,9 +474,13 @@ function applyInner(ctx: AppContext, config: Config) {
         if (sentence) addToBatch(sid, turn, sentence)
         rest = rest.slice(idx)
       }
-      if (rest.length > config.maxSentence * 6) rest = rest.slice(-config.maxSentence * 6)
-      if (rest) pending.set(key, rest)
-      else pending.delete(key)
+      if (rest.length > config.maxSentence * 6) {
+        // 正常不可达（上面 softCut 总会切出一段），可达即意味着丢失开头 → 至少留下痕迹
+        appendErr('[nori-pet] pending overflow: dropped head ' + (rest.length - config.maxSentence * 6) + ' chars (sid=' + sid + ' turn=' + turn + ')')
+        rest = rest.slice(-config.maxSentence * 6)
+      }
+      if (rest) { pending.set(key, rest); armRestFlush(sid, turn, key) }
+      else { pending.delete(key); if (restFlushTimers.has(key)) { const t = restFlushTimers.get(key)!; clearTimeout(t); restFlushTimers.delete(key) } }
       return
     }
     let buf = (pending.get(key) ?? '') + delta
@@ -454,11 +501,15 @@ function applyInner(ctx: AppContext, config: Config) {
     }
     // 超长兜底：防止单 step 无限累积
     if (buf.length > config.maxSentence * 3) {
-      const head = buf.slice(0, softCut(buf, config.maxSentence)).trim()
-      if (head) broadcast({ type: 'assistant', session: sid, text: head + '…', turn })
-      buf = ''
+      const cut = softCut(buf, config.maxSentence)
+      const head = buf.slice(0, cut).trim()
+      if (head) { statAssistant += 1; lastAssistant = head.slice(0, 60); broadcast({ type: 'assistant', session: sid, text: head + '…', turn }) }
+      // 注意：必须保留切点之后的尾巴——旧代码 buf = '' 会把 softCut 之后的文本整段丢掉
+      // （既不广播也不留 pending，长 URL / 无标点长段直接失声且无日志）
+      buf = buf.slice(cut)
     }
-    if (buf) pending.set(key, buf)
+    if (buf) { pending.set(key, buf); armRestFlush(sid, turn, key) }
+    else { pending.delete(key); if (restFlushTimers.has(key)) { const t = restFlushTimers.get(key)!; clearTimeout(t); restFlushTimers.delete(key) } }
   }
 
   // ─── Nori 人设改写层 ───────────────────────────────────────────
@@ -473,43 +524,66 @@ function applyInner(ctx: AppContext, config: Config) {
     const input = text.length > config.reframeMaxInput ? text.slice(0, config.reframeMaxInput) + '……' : text
     const userContent = input
     const system = persona.prompt + '\n\n' + persona.reframe
-    const ctrl = new AbortController()
-    const timer = setTimeout(() => ctrl.abort(), config.reframeTimeoutMs)
+
+    // 运行时直读 nori.config.json reframe 段（明文，可随时改无需重装）：
+    // apiKey / reframeBaseUrl / reframeModel / reframeMaxTokens / reframeTimeoutMs 五件套
+    let dedicatedKey = ''
+    let dedicatedBase = config.reframeBaseUrl
+    let dedicatedModel = config.reframeModel
+    let dedicatedMaxTokens = config.reframeMaxTokens
+    let dedicatedTimeoutMs = config.reframeTimeoutMs
     try {
-      // 路径 1：专用 key 直连官方 API
-      let dedicatedKey = ''
-      try {
-        const creds: any = (ctx as any).credentials
-        if (creds?.resolve && config.reframeApiKeyRef) {
-          const hit = await creds.resolve(config.reframeApiKeyRef)
-          if (hit && typeof hit.value === 'string' && hit.value.length > 10) dedicatedKey = hit.value
-        }
-      } catch { /* 解析失败则回退 */ }
+      const nc = JSON.parse(readFileSync(join(dirname(HOST_DIR), 'nori.config.json'), 'utf8'))
+      const rf = nc?.reframe ?? {}
+      if (typeof rf.apiKey === 'string' && rf.apiKey.trim().length > 10) dedicatedKey = rf.apiKey.trim()
+      if (typeof rf.reframeBaseUrl === 'string' && rf.reframeBaseUrl.trim()) dedicatedBase = rf.reframeBaseUrl.trim()
+      if (typeof rf.reframeModel === 'string' && rf.reframeModel.trim()) dedicatedModel = rf.reframeModel.trim()
+      if (typeof rf.reframeMaxTokens === 'number' && rf.reframeMaxTokens > 0) dedicatedMaxTokens = rf.reframeMaxTokens
+      if (typeof rf.reframeTimeoutMs === 'number' && rf.reframeTimeoutMs > 0) dedicatedTimeoutMs = rf.reframeTimeoutMs
+    } catch { /* 无配置文件 → 用 dsh 配置层默认 */ }
+
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), dedicatedTimeoutMs)
+    try {
+      // 路径 1：专用 key 直连官方 API（独立计量，绝不碰主 key）
+      // ② dsh 凭据引用（reframeApiKeyRef，默认 DEEPSEEK_NORI_API_KEY；由 install.ps1 写入）
+      if (!dedicatedKey) {
+        try {
+          const creds: any = (ctx as any).credentials
+          if (creds?.resolve && config.reframeApiKeyRef) {
+            const hit = await creds.resolve(config.reframeApiKeyRef)
+            if (hit && typeof hit.value === 'string' && hit.value.length > 10) dedicatedKey = hit.value
+          }
+        } catch { /* 解析失败则回退 */ }
+      }
       if (dedicatedKey) {
-        const res = await fetch(config.reframeBaseUrl.replace(/\/+$/, '') + '/chat/completions', {
+        const baseUrl = dedicatedBase.replace(/\/+$/, '')
+        // 兼容通用 OpenAI 格式端点：baseUrl 已含 /chat/completions 则直接用，否则补全
+        const url = /\/chat\/completions$/i.test(baseUrl) ? baseUrl : baseUrl + '/chat/completions'
+        const res = await fetch(url, {
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: 'Bearer ' + dedicatedKey },
           body: JSON.stringify({
-            model: config.reframeModel,
+            model: dedicatedModel,
             messages: [
               { role: 'system', content: system },
               { role: 'user', content: userContent },
             ],
             temperature: 0.8,
-            max_tokens: 512,
+            max_tokens: dedicatedMaxTokens,
             stream: false,
           }),
           signal: ctrl.signal,
         })
         if (!res.ok) {
           const errBody = await res.text().catch(() => '')
-          appendErr('reframe direct API HTTP ' + res.status + ': ' + errBody.slice(0, 200))
+          appendErr('reframe direct API HTTP ' + res.status + ' url=' + url + ' model=' + dedicatedModel + ': ' + errBody.slice(0, 200))
           return null
         }
         const data: any = await res.json().catch(() => null)
         const out = (data?.choices?.[0]?.message?.content as string) ?? ''
         const trimmed = out.trim()
-        if (!trimmed) appendErr('reframe direct API EMPTY output; model=' + config.reframeModel)
+        if (!trimmed) appendErr('reframe direct API EMPTY output; model=' + dedicatedModel + ' (推理模型思考链占满 max_tokens? 可调大 reframeMaxTokens)')
         traceReframe(input, trimmed, Date.now() - t0)
         return trimmed || null
       }
@@ -523,13 +597,13 @@ function applyInner(ctx: AppContext, config: Config) {
         messages: [{ role: 'user', content: [{ type: 'text', text: userContent }] }],
         system,
         temperature: 0.8,
-        maxTokens: 512,
+        maxTokens: config.reframeMaxTokens,
         signal: ctrl.signal,
       })) {
         if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') out += chunk.text
       }
       const trimmed = out.trim()
-      if (!trimmed) appendErr('reframe llm EMPTY output; provider=' + config.reframeProvider + ' model=' + config.reframeModel)
+      if (!trimmed) appendErr('reframe llm EMPTY output; provider=' + config.reframeProvider + ' model=' + config.reframeModel + ' (推理模型思考链占满 max_tokens? 可调大 reframeMaxTokens)')
       traceReframe(input, trimmed, Date.now() - t0)
       return trimmed || null
     } catch (e) {
@@ -619,6 +693,7 @@ function applyInner(ctx: AppContext, config: Config) {
         traceSlot.n = (traceSlot.n + 1) % TRACE_SLOTS
         writeSlotMarker()
         try { writeFileSync(join(logDir(), tracePath(traceSlot.n)), '', 'utf8') } catch { /* ignore */ }
+        traceCount.n = 0 // 新文件是空的：计数必须归零，否则再写 200 条就提前轮转（每文件只存 200 条）
       }
     } catch { /* ignore */ }
   }
@@ -640,8 +715,8 @@ function applyInner(ctx: AppContext, config: Config) {
   function splitBlocks(text: string): string[] {
     const raw = text.trim()
     if (!raw) return []
-    const MIN = 120
-    const MAX = 360
+    const MIN = 300
+    const MAX = 1000 // 块上限调大：超长文本请求次数更少、Nori 输出更精炼（话少）
     // 先按换行段拆
     const paras = raw.split(/\n+/).map((p) => p.trim()).filter((p) => p.length > 0)
     const blocks: string[] = []
@@ -718,7 +793,10 @@ function applyInner(ctx: AppContext, config: Config) {
   const REFRAME_QUEUE_MAX = 30
 
   function enqueueReframe(sid: string, turn: number, text: string): void {
-    if (reframeQueue.length >= REFRAME_QUEUE_MAX) reframeQueue.shift() // 防积压：丢最旧保最新
+    if (reframeQueue.length >= REFRAME_QUEUE_MAX) {
+      const dropped = reframeQueue.shift() // 防积压：丢最旧保最新
+      if (dropped) appendErr('[nori-pet] reframe queue overflow: dropped ' + dropped.text.slice(0, 40) + '…')
+    }
     reframeQueue.push({ sid, turn, text })
     void pumpReframe()
   }
@@ -740,6 +818,10 @@ function applyInner(ctx: AppContext, config: Config) {
   async function reframeBlocks(sid: string, turn: number, blocks: string[]): Promise<void> {
     const MAX_BLOCKS = 10
     const list = blocks.slice(0, MAX_BLOCKS)
+    if (blocks.length > MAX_BLOCKS) {
+      // 旧版静默丢弃第 11 块起的内容（长报告会被念掉大半且无任何痕迹）
+      appendErr('[nori-pet] reframe dropped ' + (blocks.length - MAX_BLOCKS) + ' blocks (turn=' + turn + ', over MAX_BLOCKS=' + MAX_BLOCKS + ')')
+    }
     for (const block of list) {
       enqueueReframe(sid, turn, block)
     }
@@ -747,6 +829,32 @@ function applyInner(ctx: AppContext, config: Config) {
 
   // ─── 会话事件观察（延迟订阅错过回放 + 水位 + 序号回退三重防回放） ──
   const maxSeq = new Map<string, number>()
+  const toolCallNames = new Map<string, string>() // callId → 工具名（tool/call 才有名字）
+  // ── 逐字实时流：session format v2 起 `assistant/chunk` 事件已被移除（delta 改为内嵌在
+  //    assistant/message.stream），实时逐字流改由 agent 作用域的 `agent/assistant-stream`
+  //    发布（进程本地、非持久）：start 帧带 turn/step，chunk 帧带 frame.chunk（StreamChunk）。
+  //    只认 session/event 的旧代码因此永不触发 → chunk 分批改写/中途播放全部失效。──
+  const attemptTurn = new Map<string, { turn: number; step: number }>()
+  ;(ctx as any).on('agent/assistant-stream', (payload: any) => {
+    const frame = payload?.frame
+    if (!frame) return
+    const sid = String(payload?.agent?.session?.id ?? '')
+    if (!sid) return
+    if (frame.type === 'start') {
+      attemptTurn.set(String(frame.attemptId), { turn: Number(frame.turn ?? 0), step: Number(frame.step ?? 0) })
+      if (attemptTurn.size > 64) { // 防无界增长（异常结束的 attempt 会残留）
+        const first = attemptTurn.keys().next().value
+        if (first !== undefined) attemptTurn.delete(first)
+      }
+      return
+    }
+    if (frame.type === 'end') { attemptTurn.delete(String(frame.attemptId)); return }
+    if (frame.type !== 'chunk') return
+    const c = frame.chunk
+    if (!c || c.type !== 'text-delta' || typeof c.text !== 'string' || !c.text) return
+    const ts = attemptTurn.get(String(frame.attemptId))
+    pushChunk(sid, ts?.turn ?? 0, ts?.step ?? 0, c.text)
+  })
   const delayedSub = setTimeout(() => {
     ;(ctx as any).on('session/event', (session: any, event: any) => {
       eventCount += 1
@@ -765,6 +873,8 @@ function applyInner(ctx: AppContext, config: Config) {
     if (!data) return
     switch (event.type) {
       case 'assistant/chunk': {
+        // 遗留分支：v0/v1 会话格式的顶层 chunk 事件，当前 dsh（format v4）不再产生。
+        // 实时流已改由上方 `agent/assistant-stream` 承接；此处保留只为兼容旧会话回放。
         const chunk = data.chunk
         if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') {
           pushChunk(sid, data.turn, data.step, chunk.text)
@@ -794,6 +904,11 @@ function applyInner(ctx: AppContext, config: Config) {
       case 'turn/end': {
         statTurnEnd += 1
         const cooling = Date.now() - startTime < 1000
+        // 清理该 turn 的流式标记与失声超时器，防无限增长（两个分支共用，旧版 reframe 分支
+        // 关闭时不清 chunkedSteps → 该 Set 只增不减，且 turn/step 复用会误跳过 message 兜底）
+        const prefix = `${sid}/${data.turn}/`
+        for (const k of [...chunkedSteps]) if (k.startsWith(prefix)) chunkedSteps.delete(k)
+        clearRestFlush(prefix)
         if (config.reframe) {
           // 收尾批次（低延迟流式改写的剩余句子），再 collect 未断句残留（冷却期只清残留）
           flushBatch()
@@ -803,13 +918,9 @@ function applyInner(ctx: AppContext, config: Config) {
             void reframeBlocks(sid, data.turn, blocks)
           }
           broadcast({ type: 'turn-end', session: sid, turn: data.turn, reason: data.reason?.kind })
-          // 清理该 turn 的流式标记，防无限增长
-          const prefix = `${sid}/${data.turn}/`
-          for (const k of [...chunkedSteps]) if (k.startsWith(prefix)) chunkedSteps.delete(k)
           break
         }
         // 清掉该 turn 的所有残留（reframe 关闭时的兜底；冷却期只清不广播）
-        const prefix = `${sid}/${data.turn}/`
         for (const [k, v] of [...pending]) {
           if (k.startsWith(prefix)) { pending.delete(k); if (!cooling && v && v.trim()) { statAssistant += 1; lastAssistant = v.trim().slice(0, 60); broadcast({ type: 'assistant', session: sid, text: v.trim(), turn: data.turn }) } }
         }
@@ -821,11 +932,26 @@ function applyInner(ctx: AppContext, config: Config) {
         if (t) broadcast({ type: 'user', session: sid, text: t.slice(0, 300) })
         break
       }
-      case 'tool/result': {
-        const name = data.message?.name ?? data.message?.callId ?? ''
-        broadcast({ type: 'tool', session: sid, name: String(name) })
+      case 'tool/call': {
+        // 工具名只在这里：tool/result 的 ToolResultMessage 只有 { role, source{kind,callId},
+        // toolCallId, content, isError }，既无 name 也无顶层 callId（旧代码取 message.name
+        // ?? message.callId 恒得空串，广播出来是 name:""）
+        if (data.callId) toolCallNames.set(String(data.callId), String(data.name ?? ''))
+        if (toolCallNames.size > 200) { // 防无界增长：会话异常结束时会残留
+          const first = toolCallNames.keys().next().value
+          if (first !== undefined) toolCallNames.delete(first)
+        }
         break
       }
+      case 'tool/result': {
+        const callId = String(data.message?.toolCallId ?? data.message?.source?.callId ?? '')
+        const name = toolCallNames.get(callId) ?? ''
+        toolCallNames.delete(callId)
+        broadcast({ type: 'tool', session: sid, name })
+        break
+      }
+      default:
+        break
     }
     })
   }, 1500)
@@ -843,9 +969,16 @@ function applyInner(ctx: AppContext, config: Config) {
     const MAX_BODY = 16 * 1024
     let body = ''
     let size = 0
-    for await (const chunk of req) {
-      size += chunk.length
-      if (size <= MAX_BODY) body += chunk
+    try {
+      for await (const chunk of req) {
+        size += chunk.length
+        if (size <= MAX_BODY) body += chunk
+      }
+    } catch {
+      // 客户端中断（ECONNRESET/aborted）：迭代器会 reject，吞掉并结束该请求
+      res.writeHead(400, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: 'request aborted' }))
+      return
     }
     if (size > MAX_BODY) {
       res.writeHead(413, { 'content-type': 'application/json' })
@@ -878,7 +1011,17 @@ function applyInner(ctx: AppContext, config: Config) {
     if (typeof fileCfg.ttsSpeedFactor === 'number') tts.ttsSpeedFactor = fileCfg.ttsSpeedFactor
     if (typeof fileCfg.refAudio === 'string' && fileCfg.refAudio) tts.refAudio = fileCfg.refAudio
     if (typeof fileCfg.refPrompt === 'string' && fileCfg.refPrompt) tts.refPrompt = fileCfg.refPrompt
-    const url = new URL(tts.ttsUrl)
+    // ttsUrl 来自配置/注入 patch，缺协议头（`127.0.0.1:9880/tts`）时 new URL 会抛 TypeError；
+    // 这个 async 函数曾经没有兜底 → unhandledRejection → fail-loud 打死整台 dsh。
+    let url: URL
+    try {
+      url = new URL(tts.ttsUrl)
+    } catch {
+      appendErr('[nori-pet] ttsUrl 非法（需形如 http://127.0.0.1:9880/tts）：' + String(tts.ttsUrl))
+      res.writeHead(503, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: 'tts url invalid', ttsUrl: String(tts.ttsUrl) }))
+      return
+    }
     url.searchParams.set('text', normalizeSpeakText(text))
     url.searchParams.set('text_lang', 'zh')
     url.searchParams.set('prompt_lang', 'zh')
@@ -902,19 +1045,31 @@ function applyInner(ctx: AppContext, config: Config) {
         let tts: Response
         try {
           tts = await fetch(url, { signal: ctrl.signal })
-        } finally { clearTimeout(timer) }
+        } catch (e) {
+          clearTimeout(timer)
+          throw e
+        }
         lastStatus = tts.status
         if (tts.ok) {
-          buf = Buffer.from(await tts.arrayBuffer())
+          // 超时定时器必须覆盖到响应体读完：上游"先回头再卡住流"时 await arrayBuffer 会永不返回，
+          // 面板 pumping 永久占用 → 之后所有朗读排队卡死（用户观感"桌宠哑了"）。
+          buf = Buffer.from(await Promise.race([
+            tts.arrayBuffer(),
+            new Promise<never>((_, rej) => setTimeout(() => { try { ctrl.abort() } catch { /* ignore */ } ; rej(new Error('tts response body timeout')) }, 30000)),
+          ]))
+          clearTimeout(timer)
           ct = tts.headers.get('content-type') || 'audio/wav'
           break
         }
+        clearTimeout(timer)
         upBody = (await tts.text()).slice(0, 200)
         if (attempt === 0) await new Promise((r) => setTimeout(r, 800))
       }
       if (!buf) {
+        // TTS 失败此前只回前端气泡、不落任何日志 → 线上"没声音"完全不可观测
+        appendErr('[nori-pet] tts http ' + lastStatus + ' ref=' + refPath + ' upstream=' + upBody.slice(0, 120))
         res.writeHead(502, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ error: 'tts http ' + lastStatus, ref: !!config.refAudio, upstream: upBody }))
+        res.end(JSON.stringify({ error: 'tts http ' + lastStatus, ref: !!tts.refAudio, refPath, upstream: upBody }))
         return
       }
       // 安全网：最长连续语音 >3.5s 判定为 AR 采样循环拖长（"嗯/唔"等鼻音叹词偶发），
@@ -931,9 +1086,10 @@ function applyInner(ctx: AppContext, config: Config) {
           const w = await fetch(warm, { signal: ctrl.signal })
           if (w.ok) {
             const nb = Buffer.from(await w.arrayBuffer())
+            clearTimeout(timer)
             if (maxContiguousSpeech(nb) <= maxContiguousSpeech(buf)) buf = nb
             else break
-          } else break
+          } else { clearTimeout(timer); break }
         } catch {
           break
         } finally {
@@ -999,15 +1155,27 @@ function applyInner(ctx: AppContext, config: Config) {
       file = resolveCoreFile()
       mime = 'text/javascript'
     } else if (norm.startsWith('assets/')) {
-      file = join(resolveAssetsDir(), norm.slice('assets/'.length))
+      const dir = resolveAssetsDir()
+      // 资产目录缺失必须直接 404：join('', sub) 会落成"相对 CWD"的路径，
+      // 于是 /assets/package.json 之类会以宿主工作目录为根被找到并当资产返回（越界读取）。
+      if (!dir) { res.writeHead(404); res.end('not found'); return }
+      file = join(dir, norm.slice('assets/'.length))
     } else {
       res.writeHead(404); res.end('not found'); return
     }
+    if (!file) { res.writeHead(404); res.end('not found'); return } // coreFile 未配置/未找到
     try {
       const st = await stat(file)
       if (!st.isFile()) { res.writeHead(404); res.end('not found'); return }
+      // stat→open 之间文件被删/权限变化会让流异步 emit 'error'；无监听者 → uncaughtException 打死宿主
+      const rs = createReadStream(file)
+      rs.on('error', (e: any) => {
+        appendErr('[nori-pet] assets read error ' + file + ': ' + String(e?.message ?? e))
+        if (!res.headersSent) { try { res.writeHead(404); res.end('not found') } catch { /* ignore */ } }
+        else try { res.destroy() } catch { /* ignore */ }
+      })
       res.writeHead(200, { 'content-type': mime, 'content-length': st.size, 'cache-control': 'no-cache' })
-      createReadStream(file).pipe(res)
+      rs.pipe(res)
     } catch {
       res.writeHead(404); res.end('not found')
     }
@@ -1142,6 +1310,14 @@ function applyInner(ctx: AppContext, config: Config) {
   const WIDGET_TAG = '<script defer src="' + PREFIX + '/widget.js"></script>'
 
   // ─── api_v2 守护：定时探测 9880，掉了自动拉起（tts_infer.yaml 已指向新权重，重启即新声线） ──
+  // 判活原则：只要能拿到 HTTP 响应（含 4xx/5xx）就说明服务活着——api_v2 缺 ref_audio_path 时
+  // 稳定返回 500，旧逻辑用 `status < 500` 判活会把"活着的服务"判成掉线，于是每个周期都重新
+  // 生成 runtime 配置并拉起一个秒退的重型进程（实测 mtime 每 10~46s 被重写）。
+  // 另加两道闩：in-flight（探测自身不重入）+ spawn 宽限（冷启动要几十秒，给足时间再判死）。
+  const SPAWN_GRACE_MS = 120000
+  let ttsProbeInFlight = false
+  let nextSpawnAllowedAt = 0
+  const spawnWaitUntil = new Map<{ pid?: number }, number>()
   let ttsWatchTimer: ReturnType<typeof setInterval> | null = null
   if (config.ttsWatch) {
     // GPT-SoVITS 位置：显式配置 gsvBase（相对仓库根或绝对）→ 否则探测仓库内 GPT-SoVITS
@@ -1155,66 +1331,123 @@ function applyInner(ctx: AppContext, config: Config) {
       const v = join(GSV_BASE, '.venv', 'Scripts', 'python.exe')
       if (existsSync(v)) VENV_PY = v
     }
+    if (GSV_BASE && !existsSync(join(GSV_BASE, 'api_v2.py'))) {
+      log('[dsh-nori-pet] api_v2 watchdog: gsvBase 下没有 api_v2.py，禁用拉起：' + GSV_BASE)
+      GSV_BASE = ''
+    }
+    if (VENV_PY && !existsSync(VENV_PY)) {
+      log('[dsh-nori-pet] api_v2 watchdog: venvPy 不存在，禁用拉起：' + VENV_PY)
+      VENV_PY = ''
+    }
     if (GSV_BASE && VENV_PY) log('[dsh-nori-pet] api_v2 watchdog ready: ' + GSV_BASE)
     else log('[dsh-nori-pet] api_v2 watchdog: GPT-SoVITS not found (set gsvBase/venvPy or place in repo); respawn disabled')
+    // 探测地址跟随 ttsUrl（旧版硬编码 9880，自定义端口会对着错误端口探测/拉起）
+    let probeUrl = 'http://127.0.0.1:9880/tts?text=%E6%B5%8B&media_type=wav'
+    try {
+      const pu = new URL(config.ttsUrl)
+      pu.searchParams.set('text', '测')
+      pu.searchParams.set('media_type', 'wav')
+      probeUrl = pu.toString()
+    } catch { log('[dsh-nori-pet] ttsUrl 非法，watchdog 探测退回默认 9880：' + config.ttsUrl) }
     // numba 缓存与 ffmpeg：仓库内（audio/、ffmpeg/）或环境变量，避免写死机器路径
     const numbaCache = process.env.NUMBA_CACHE_DIR || join(dirname(HOST_DIR), 'audio', 'numba_cache')
     const ffmpegBin = process.env.FFMPEG_BIN_DIR || (existsSync(join(dirname(HOST_DIR), 'ffmpeg', 'bin')) ? join(dirname(HOST_DIR), 'ffmpeg', 'bin') : '')
     ttsWatchTimer = setInterval(async () => {
+      if (ttsProbeInFlight) return // 上一轮探测未回（或正在拉起），本轮跳过，防重入叠加
+      ttsProbeInFlight = true
       try {
-        const probe = await fetch('http://127.0.0.1:9880/tts?text=%E6%B5%8B&media_type=wav', { signal: AbortSignal.timeout(3000) })
-        if (probe.status < 500) return // 200/404/400 都算活着（500=缺 ref 参数也算活着）
-      } catch { /* 探测失败 → 需要拉起 */ }
-      if (!GSV_BASE || !VENV_PY) return
-      // 用户通过 nori.config.json sovits 段指定推理权重（t2sWeights/vitsWeights）→ 生成运行时
-      // custom 配置，不覆盖原 tts_infer.yaml（custom 块永远保留）；未配置权重则用原配置
-      let ttsCfgArg = 'GPT_SoVITS/configs/tts_infer.yaml'
-      try {
-        const nc = JSON.parse(readFileSync(join(dirname(HOST_DIR), 'nori.config.json'), 'utf8'))
-        const sovits = (nc as any)?.sovits ?? {}
-        const t2s = String(sovits.t2sWeights ?? '').trim()
-        const vits = String(sovits.vitsWeights ?? '').trim()
-        if (t2s || vits) {
-          const srcYaml = join(GSV_BASE, 'GPT_SoVITS', 'configs', 'tts_infer.yaml')
-          if (existsSync(srcYaml)) {
-            const { out, result } = buildRuntimeTtsConfig(readFileSync(srcYaml, 'utf8'), {
-              t2sWeights: t2s ? resolveConfigPath(t2s) : '',
-              vitsWeights: vits ? resolveConfigPath(vits) : '',
-            })
-            if (result.ok && result.changed && out) {
-              const rt = join(GSV_BASE, 'GPT_SoVITS', 'configs', 'tts_infer.runtime.yaml')
-              writeFileSync(rt, out, 'utf8')
-              ttsCfgArg = rt
-              log('[dsh-nori-pet] tts model preset: ' + result.message + ' -> ' + rt)
-            } else if (!result.ok) log('[dsh-nori-pet] tts model preset: ' + result.message)
+        let alive = false
+        try {
+          const probe = await fetch(probeUrl, { signal: AbortSignal.timeout(10000) })
+          alive = true // 拿到任何 HTTP 响应（含 4xx/5xx）= 服务在跑
+          try { await probe.body?.cancel() } catch { /* 探测响应体不消费：主动取消，避免连接滞留 */ }
+        } catch { /* 网络错误/超时 → 判定需要拉起 */ }
+        if (alive) { nextSpawnAllowedAt = 0; return }
+        if (!GSV_BASE || !VENV_PY) return
+        // 刚拉起的进程仍在冷启动（模型加载要几十秒）→ 不要重复拉起
+        const now = Date.now()
+        for (const [child, until] of spawnWaitUntil) if (until <= now) spawnWaitUntil.delete(child)
+        if (spawnWaitUntil.size > 0) return
+        if (now < nextSpawnAllowedAt) return
+        // 用户通过 nori.config.json sovits 段指定推理权重（t2sWeights/vitsWeights）→ 生成运行时
+        // custom 配置，不覆盖原 tts_infer.yaml（custom 块永远保留）；未配置权重则用原配置
+        let ttsCfgArg = 'GPT_SoVITS/configs/tts_infer.yaml'
+        try {
+          const nc = JSON.parse(readFileSync(join(dirname(HOST_DIR), 'nori.config.json'), 'utf8'))
+          const sovits = (nc as any)?.sovits ?? {}
+          const t2s = String(sovits.t2sWeights ?? '').trim()
+          const vits = String(sovits.vitsWeights ?? '').trim()
+          if (t2s || vits) {
+            const srcYaml = join(GSV_BASE, 'GPT_SoVITS', 'configs', 'tts_infer.yaml')
+            if (existsSync(srcYaml)) {
+              const { out, result } = buildRuntimeTtsConfig(readFileSync(srcYaml, 'utf8'), {
+                t2sWeights: t2s ? resolveConfigPath(t2s) : '',
+                vitsWeights: vits ? resolveConfigPath(vits) : '',
+              })
+              if (result.ok && result.changed && out) {
+                const rt = join(GSV_BASE, 'GPT_SoVITS', 'configs', 'tts_infer.runtime.yaml')
+                writeFileSync(rt, out, 'utf8')
+                ttsCfgArg = rt
+                log('[dsh-nori-pet] tts model preset: ' + result.message + ' -> ' + rt)
+              } else if (!result.ok) log('[dsh-nori-pet] tts model preset: ' + result.message)
+            }
           }
+        } catch (e) { log('[dsh-nori-pet] tts model preset 读取配置失败: ' + String((e as Error)?.message ?? e)) }
+        try {
+          const { spawn } = await import('node:child_process')
+          const child = spawn(VENV_PY, ['api_v2.py', '-a', '127.0.0.1', '-p', '9880', '-c', ttsCfgArg], {
+            cwd: GSV_BASE,
+            stdio: 'ignore',
+            detached: false,
+            env: {
+              ...process.env,
+              PYTHONUTF8: '1',
+              PYTHONIOENCODING: 'utf-8',
+              NUMBA_CACHE_DIR: numbaCache,
+              PATH: (ffmpegBin ? ffmpegBin + ';' : '') + (process.env.PATH ?? ''),
+            },
+          })
+          // spawn 对不存在/不可执行的路径不会同步抛错，而是异步 emit 'error'（ENOENT 等）；
+          // 无监听者 → uncaughtException → fail-loud 打死宿主。故 error/exit 必须监听。
+          spawnWaitUntil.set(child, Date.now() + SPAWN_GRACE_MS)
+          child.on('error', (e: any) => {
+            spawnWaitUntil.delete(child)
+            log('[dsh-nori-pet] api_v2 spawn error: ' + String(e?.message ?? e) + '（路径或权限有问题：VENV_PY=' + VENV_PY + '）')
+          })
+          child.on('exit', (code) => {
+            spawnWaitUntil.delete(child)
+            if (code !== 0) log('[dsh-nori-pet] api_v2 exited code=' + code + '（若端口被占用或权重缺失会秒退，下次探测才会重试）')
+          })
+          log('[dsh-nori-pet] api_v2 watchdog: spawning pid=' + (child.pid ?? '?') + ' (9880 was down)')
+          nextSpawnAllowedAt = Date.now() + SPAWN_GRACE_MS
+        } catch (e) {
+          log('[dsh-nori-pet] api_v2 watchdog spawn failed: ' + String(e))
         }
-      } catch (e) { log('[dsh-nori-pet] tts model preset 读取配置失败: ' + String((e as Error)?.message ?? e)) }
-      try {
-        const { spawn } = await import('node:child_process')
-        const child = spawn(VENV_PY, ['api_v2.py', '-a', '127.0.0.1', '-p', '9880', '-c', ttsCfgArg], {
-          cwd: GSV_BASE,
-          stdio: 'ignore',
-          detached: false,
-          env: {
-            ...process.env,
-            PYTHONUTF8: '1',
-            PYTHONIOENCODING: 'utf-8',
-            NUMBA_CACHE_DIR: numbaCache,
-            PATH: (ffmpegBin ? ffmpegBin + ';' : '') + (process.env.PATH ?? ''),
-          },
-        })
-        log('[dsh-nori-pet] api_v2 watchdog: spawning pid=' + (child.pid ?? '?') + ' (9880 was down)')
-      } catch (e) {
-        log('[dsh-nori-pet] api_v2 watchdog spawn failed: ' + String(e))
+        } finally {
+        ttsProbeInFlight = false // 探测/拉起整段结束才允许下一轮
       }
     }, config.ttsWatchIntervalMs)
   }
 
   // ─── 注册（webServer 服务） ─────────────────────────────────────
   // prefix /api 同时覆盖 /api 与 /api/*（exact + prefix 同路径会碰撞）
-  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX + '/api', handler: (req, res) => void handleApi(req, res) }), 'nori-pet-api')
-  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX + '/assets', handler: (req, res) => void handleAssets(req, res) }), 'nori-pet-assets')
+  // 宿主是 fail-loud：handler 返回的 Promise 一旦 reject，unhandledRejection 会 process.exit(1)
+  // 打死整台 dsh。故所有 async handler 必须在此兜底（配置写错、客户端中断都不许冒泡到进程级）。
+  function safeHandler(fn: (req: IncomingMessage, res: ServerResponse) => Promise<void>, tag: string) {
+    return (req: IncomingMessage, res: ServerResponse): void => {
+      void fn(req, res).catch((e: any) => {
+        const where = req.method + ' ' + req.url
+        appendErr('[nori-pet] ' + tag + ' handler error @ ' + where + ': ' + String(e?.stack ?? e).slice(0, 400))
+        log('[dsh-nori-pet] ' + tag + ' handler error @ ' + where + ': ' + String(e?.message ?? e))
+        try {
+          if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: 'internal error' }))
+        } catch { /* 响应已关闭：忽略 */ }
+      })
+    }
+  }
+  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX + '/api', handler: safeHandler(handleApi, 'api') }), 'nori-pet-api')
+  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: PREFIX + '/assets', handler: safeHandler(handleAssets, 'assets') }), 'nori-pet-assets')
   ctx.effect(() => ctx.webServer.registerUpgrade({ path: PREFIX + '/ws', handler: handleUpgrade }), 'nori-pet-ws')
   ctx.effect(() => () => { for (const c of clients) { try { c.close() } catch { /* ignore */ } } clients.clear() }, 'nori-pet-ws-cleanup')
   ctx.effect(() => () => { if (ttsWatchTimer) { try { clearInterval(ttsWatchTimer) } catch { /* ignore */ } ttsWatchTimer = null } }, 'nori-pet-tts-watch')
