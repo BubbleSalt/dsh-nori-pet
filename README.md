@@ -101,8 +101,36 @@ git clone <仓库地址>
 | `sovits.t2sWeights` / `sovits.vitsWeights` | 空 / 空 | 推理权重路径（GPT 模型 s1 / SoVITS 模型 s2；见[GPT-SoVITS 章节](#gpt-sovits可选)） |
 | `personaPrompt` / `personaReframe` | 空（探测 `persona/`） | 人设文件路径覆盖 |
 | `maxSentence` / `ttsTemperature` / `ttsTopK` / `ttsSpeedFactor` | 140 / 0.9 / 12 / 1.0 | 断句与合成参数，多数无需改动（0.9/12 为防 AR 循环卡顿的推荐值，勿降回低温低 top_k） |
+| `detailMaxChars` / `summaryEnabled` / `summaryWaitMs` | 400 / true / 8000 | **超长内容概括**（见[朗读策略](#朗读策略超长内容怎么处理)）：一段连续输出超过 `detailMaxChars` 字就不再逐句念，改为整轮播一次概括 |
 | `ttsWatch` / `ttsWatchIntervalMs` | true / 30000 | 9880 掉线守护：探测到服务不可达才自动拉起 api_v2（探测间隔下限 5000ms；判断依据是"能否拿到 HTTP 响应"，4xx/5xx 均视为存活） |
 | `allowedOrigins` | 空数组 | 非本机来源访问 WS/API 时的放行主机名（见[安全边界](#安全边界本地服务)） |
+
+<a id="朗读策略超长内容怎么处理"></a>
+### 朗读策略：超长内容怎么处理
+
+dsh 输出很快（约 300 token/s ≈ 450 字/秒），而中文朗读只有约 5 字/秒——**产出比朗读快 90 倍**。
+所以一轮长输出如果逐句念，会被念上好几分钟。策略是**详读与概括二选一，绝不混用**：
+
+| 情形 | 行为 |
+|---|---|
+| 一段连续输出 ≤ `detailMaxChars`（默认 400 字） | **全文逐句详读**（含"文本 → 工具 → 思考 → 再文本"的短段冲刺，反馈即时） |
+| 一段连续输出 > `detailMaxChars` | **这一段的正文一个字都不念**，整轮结束后播一次概括（≤4 句 / ≤150 字） |
+
+为什么必须整段判断：逐句判断会出现"前半念得详细、后半突然快进"的口径断层。400 字在 450 字/秒下约
+0.9 秒即可判定，所以长内容几乎没有判定等待。
+
+概括的硬约束（写在概括提示词里）：保留文件名/路径、数字、命令、结论、阻塞原因、待你确认的事；
+丢掉中间过程与重复叙述；不复述已读过的开头；严禁编造，不确定就说"细节在屏幕上"。
+
+另外，**代码块 / JSON / 日志 / 表格 / 文件清单 / diff 不逐字念**，只说类别：
+"贴了一段代码""拿到结果了""列了一堆文件"。这层是纯规则（`src/speakable.ts`，9 例单测），
+零额外成本，也让 400 字预算更耐用。
+
+观测方式：
+
+- `~/.dsh/logs/nori-pet/nori-pet-summary.log`：每轮概括的**压缩比**（原文 N 字 → 概括 M 字）
+- `~/.dsh/logs/nori-pet/nori-pet-error.log`：概括失败/等待超时的兜底记录
+- 关掉 `summaryEnabled` 即完全恢复"逐句详读"的旧行为
 
 <a id="参考音频须知refaudio--refprompt"></a>
 ### 参考音频须知（`refAudio` / `refPrompt`）

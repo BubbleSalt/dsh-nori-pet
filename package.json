@@ -46,8 +46,11 @@
     "typecheck:host": "tsc -p tsconfig.json --noEmit",
     "typecheck:client": "tsc -p tsconfig.widget.json --noEmit",
     "build:client": "tsdown",
-    "test": "npm run test:preset && npm run test:smoke",
+    "test": "npm run test:preset && npm run test:segmentation && npm run test:speakable && npm run test:smoke",
     "test:preset": "node scripts/test-model-preset.mjs",
+    "test:segmentation": "node scripts/test-segmentation.mjs",
+    "test:speakable": "node scripts/test-speakable.mjs",
+    "test:guard": "node scripts/guard-release.mjs",
     "test:smoke": "node scripts/smoke-test.mjs",
     "guard": "node scripts/guard-release.mjs",
     "guard:staged": "node scripts/guard-release.mjs --staged"
