@@ -87,8 +87,15 @@ export const Config = z.object({
   reframeApiKeyRef: z.string().default('DEEPSEEK_NORI_API_KEY'),
   /** 专用 key 直连的 API 地址（OpenAI 兼容 /chat/completions） */
   reframeBaseUrl: z.string().default('https://api.deepseek.com/v1'),
-  /** 改写层输入/输出追踪日志（定位"Nori 何时开始讲什么"排障用；写入 nori-pet-trace.log） */
-  reframeTrace: z.boolean().default(true),
+  /**
+   * 改写层输入/输出追踪日志（排障用，**默认关闭**）。
+   *
+   * 为什么默认关：它会把每轮对话的原文与改写结果各截 500 字写进
+   * `~/.dsh/logs/nori-pet/nori-pet-trace*.log`——也就是把说过的话落到磁盘明文里。
+   * 排障时很好用，但不该在用户不知道的情况下长期开着。
+   * 打开方式：nori.config.json 里 `reframe.trace = true`（或 reframeTrace）。
+   */
+  reframeTrace: z.boolean().default(false),
   /** api_v2 守护：定时探测 9880，掉了自动拉起（桌面朗读保底） */
   ttsWatch: z.boolean().default(true),
   /** 守护探测间隔（毫秒）。下限 5s：填 0 会让 setInterval 退化成定时器风暴 + 反复 spawn */
@@ -677,12 +684,13 @@ function applyInner(ctx: AppContext, config: Config) {
     const system = persona.prompt + '\n\n' + persona.reframe + (mode === 'summary' ? '\n\n' + SUMMARY_RULES : '')
 
     // 运行时直读 nori.config.json reframe 段（明文，可随时改无需重装）：
-    // apiKey / reframeBaseUrl / reframeModel / reframeMaxTokens / reframeTimeoutMs 五件套
+    // apiKey / reframeBaseUrl / reframeModel / reframeMaxTokens / reframeTimeoutMs / reframeTrace
     let dedicatedKey = ''
     let dedicatedBase = config.reframeBaseUrl
     let dedicatedModel = config.reframeModel
     let dedicatedMaxTokens = config.reframeMaxTokens
     let dedicatedTimeoutMs = config.reframeTimeoutMs
+    let traceOn = config.reframeTrace
     try {
       const nc = JSON.parse(readFileSync(join(dirname(HOST_DIR), 'nori.config.json'), 'utf8'))
       const rf = nc?.reframe ?? {}
@@ -691,7 +699,10 @@ function applyInner(ctx: AppContext, config: Config) {
       if (typeof rf.reframeModel === 'string' && rf.reframeModel.trim()) dedicatedModel = rf.reframeModel.trim()
       if (typeof rf.reframeMaxTokens === 'number' && rf.reframeMaxTokens > 0) dedicatedMaxTokens = rf.reframeMaxTokens
       if (typeof rf.reframeTimeoutMs === 'number' && rf.reframeTimeoutMs > 0) dedicatedTimeoutMs = rf.reframeTimeoutMs
+      // 追踪日志含对话原文，默认为关；这里支持在 nori.config.json 里随时开关
+      if (typeof rf.reframeTrace === 'boolean') traceOn = rf.reframeTrace
     } catch { /* 无配置文件 → 用 dsh 配置层默认 */ }
+    lastTraceOn = traceOn
 
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), dedicatedTimeoutMs)
@@ -742,7 +753,7 @@ function applyInner(ctx: AppContext, config: Config) {
             if (retry && retry.ok) {
               const d2: any = await retry.json().catch(() => null)
               const t2 = ((d2?.choices?.[0]?.message?.content as string) ?? '').trim()
-              if (t2) { traceReframe(input, t2, Date.now() - t0, mode); return t2 }
+              if (t2) { traceReframe(input, t2, Date.now() - t0, traceOn, mode); return t2 }
             }
             appendErr('reframe direct API retry failed; status=' + (retry ? retry.status : 'network'))
           }
@@ -752,7 +763,7 @@ function applyInner(ctx: AppContext, config: Config) {
         const out = (data?.choices?.[0]?.message?.content as string) ?? ''
         const trimmed = out.trim()
         if (!trimmed) appendErr('reframe direct API EMPTY output; model=' + dedicatedModel + ' (推理模型思考链占满 max_tokens? 可调大 reframeMaxTokens)')
-        traceReframe(input, trimmed, Date.now() - t0, mode)
+        traceReframe(input, trimmed, Date.now() - t0, traceOn, mode)
         return trimmed || null
       }
       // 路径 2：dsh 内置 llm 服务
@@ -772,7 +783,7 @@ function applyInner(ctx: AppContext, config: Config) {
       }
       const trimmed = out.trim()
       if (!trimmed) appendErr('reframe llm EMPTY output; provider=' + config.reframeProvider + ' model=' + config.reframeModel + ' (推理模型思考链占满 max_tokens? 可调大 reframeMaxTokens)')
-      traceReframe(input, trimmed, Date.now() - t0, mode)
+      traceReframe(input, trimmed, Date.now() - t0, traceOn, mode)
       return trimmed || null
     } catch (e) {
       log('[dsh-nori-pet] reframe failed: ' + String(e))
@@ -790,6 +801,9 @@ function applyInner(ctx: AppContext, config: Config) {
   // 日志条数内存计数（文件裁剪阈值 100 → 保留 50）；trace 为 5 文件轮转 + 满 1000 删最早 200
   const errCount = { n: 0 }
   const traceCount = { n: 0 }
+  /** 最近一次 reframeText 读到的 trace 开关（nori.config.json 可热改）：
+   * traceSummary 在 reframeText 之后调用，用它跟主开关保持一致 */
+  let lastTraceOn = config.reframeTrace
 
   // ── trace 日志轮转：nori-pet-trace.log（slot0）~ nori-pet-trace.4.log（slot4）──
   // 写入当前 slot 文件；满 TRACE_MAX 条 → 文件内裁剪保留 TRACE_KEEP（= 删最早 TRACE_MAX-TRACE_KEEP 条）
@@ -841,12 +855,16 @@ function applyInner(ctx: AppContext, config: Config) {
     pruneLogFile(join(logDir(), 'nori-pet-error.log'), errCount)
   }
 
-  /** 改写层输入/输出追踪（reframeTrace 开启时写入 nori-pet-trace*.log）：材料→改写结果，
-   * 两列记录：IN=当前块材料本体、OUT=改写输出。存储：5 文件轮转（slot0~4）；当前文件满
-   * 1000 条 → 删最早 200（保留 800）→ 轮换下一文件。 */
-  function traceReframe(input: string, output: string, ms: number, src = ''): void {
+  /**
+   * 改写层输入/输出追踪：材料→改写结果，两列记录（IN=当前块材料本体、OUT=改写输出）。
+   * 存储：5 文件轮转（slot0~4）；当前文件满 1000 条 → 删最早 200（保留 800）→ 轮换下一文件。
+   *
+   * ⚠ 隐私：这里写的是**对话原文**（各截 500 字），所以默认关闭。开启方式见 reframeTrace 注释。
+   * 开关在每次调用时从 reframeText 里传进来（`on`），以便 nori.config.json 改动立即生效。
+   */
+  function traceReframe(input: string, output: string, ms: number, on: boolean, src = ''): void {
     try {
-      if (!config.reframeTrace) return
+      if (!on) return
       const p = join(logDir(), tracePath(traceSlot.n))
       // 记录来源与长度：出现"同一段被改写两次"时，靠 src/len 一眼判断是投递重复还是模型重复
       const tag = src ? ` src=${src} len=${input.length}` : ` len=${input.length}`
@@ -869,14 +887,19 @@ function applyInner(ctx: AppContext, config: Config) {
     } catch { /* ignore */ }
   }
 
-  /** 概括层追踪：原文→概括输出，用"压缩比"验证是否真的省了朗读时间 */
-  function traceSummary(raw: string, out: string, ms: number): void {
+  /** 概括层追踪：原文→概括输出，用"压缩比"验证是否真的省了朗读时间。
+   * 与 traceReframe 同开关（traceOn）：这里同样会写原文片段，属隐私面，默认关。
+   * 计数用独立对象：原先与 trace 共用一个计数器，会把 trace 的行数当成 summary 的条数，
+   * 于是 summary 日志几乎每次都被判定"超上限"而裁剪，日志被反复重写。 */
+  const summaryCount = { n: 0 }
+  function traceSummary(raw: string, out: string, ms: number, on: boolean): void {
     try {
+      if (!on) return
       const ratio = raw.length ? Math.round((out.length / raw.length) * 100) : 0
       const p = join(logDir(), 'nori-pet-summary.log')
       appendFileSync(p, `[${new Date().toISOString()}] (${ms}ms) 原文${raw.length}字 → 概括${out.length}字（压缩到 ${ratio}%）\nRAW: ${raw.slice(0, 300)}\nSUM: ${out.slice(0, 300)}\n────\n`)
-      traceCount.n += 1
-      pruneLogFile(p, traceCount)
+      summaryCount.n += 1
+      pruneLogFile(p, summaryCount)
     } catch { /* ignore */ }
   }
 
@@ -1045,7 +1068,7 @@ function applyInner(ctx: AppContext, config: Config) {
     statAssistant += 1
     lastAssistant = out.slice(0, 60)
     broadcast({ type: 'assistant', session: sid, text: out, turn: `${turn}-sum` })
-    traceSummary(text, out, ms)
+    traceSummary(text, out, ms, lastTraceOn)
     log(`[dsh-nori-pet] summary: turn=${turn} 原文${text.length}字 → 播报${out.length}字 (${ms}ms)`)
   }
 
