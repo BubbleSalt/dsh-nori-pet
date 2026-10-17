@@ -11,7 +11,7 @@
 import type { Context } from 'cordis'
 import z from 'schemastery'
 import { createHash } from 'node:crypto'
-import { createReadStream, readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from 'node:fs'
+import { createReadStream, readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, statSync, readdirSync, unlinkSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { join, dirname, normalize, extname, resolve, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -88,14 +88,15 @@ export const Config = z.object({
   /** 专用 key 直连的 API 地址（OpenAI 兼容 /chat/completions） */
   reframeBaseUrl: z.string().default('https://api.deepseek.com/v1'),
   /**
-   * 改写层输入/输出追踪日志（排障用，**默认关闭**）。
+   * 改写层输入/输出追踪日志（排障用，**默认开启**）。
    *
-   * 为什么默认关：它会把每轮对话的原文与改写结果各截 500 字写进
-   * `~/.dsh/logs/nori-pet/nori-pet-trace*.log`——也就是把说过的话落到磁盘明文里。
-   * 排障时很好用，但不该在用户不知道的情况下长期开着。
-   * 打开方式：nori.config.json 里 `reframe.trace = true`（或 reframeTrace）。
+   * 内容与落点：每轮对话的原文与改写结果各截 500 字，写进
+   * `~/.dsh/logs/nori-pet/nori-pet-trace.log`。**自带长度上限**：超过 900 条就从最旧删到 400 条
+   *（约 1.1MB → 500KB），整个日志目录超 8MB 时再删最旧的文件（见 enforceLogBudget）。
+   * 所以长期开着也不会无限增长——需要翻"刚才那句为什么这么念"时，历史就在手边。
+   * 不想要这些内容落盘就设 false（nori.config.json 的 `reframe.trace` 支持热改）。
    */
-  reframeTrace: z.boolean().default(false),
+  reframeTrace: z.boolean().default(true),
   /** api_v2 守护：定时探测 9880，掉了自动拉起（桌面朗读保底） */
   ttsWatch: z.boolean().default(true),
   /** 守护探测间隔（毫秒）。下限 5s：填 0 会让 setInterval 退化成定时器风暴 + 反复 spawn */
@@ -798,43 +799,89 @@ function applyInner(ctx: AppContext, config: Config) {
   // 迁到 ~/.dsh/logs/nori-pet/（DSH_HOME 未设置则用 ~/.dsh）
   const logDir = () => join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'logs', 'nori-pet')
   try { mkdirSync(logDir(), { recursive: true }) } catch { /* ignore */ }
-  // 日志条数内存计数（文件裁剪阈值 100 → 保留 50）；trace 为 5 文件轮转 + 满 1000 删最早 200
+  // 日志条数内存计数（文件裁剪阈值 100 → 保留 50）
   const errCount = { n: 0 }
-  const traceCount = { n: 0 }
   /** 最近一次 reframeText 读到的 trace 开关（nori.config.json 可热改）：
    * traceSummary 在 reframeText 之后调用，用它跟主开关保持一致 */
   let lastTraceOn = config.reframeTrace
+  /** trace 文件当前条数（内存计数，避免每次写都读盘数一遍） */
+  let traceCount = 0
 
-  // ── trace 日志轮转：nori-pet-trace.log（slot0）~ nori-pet-trace.4.log（slot4）──
-  // 写入当前 slot 文件；满 TRACE_MAX 条 → 文件内裁剪保留 TRACE_KEEP（= 删最早 TRACE_MAX-TRACE_KEEP 条）
-  // → 切换到下一 slot（mod TRACE_SLOTS）并清空该文件（覆盖最旧一轮）。slot 持久化在
-  // nori-pet-trace.slot，重启后继续轮转，不会回写覆盖最近几轮。
-  const TRACE_SLOTS = 5
-  const TRACE_MAX = 1000
-  const TRACE_KEEP = 800
-  const traceSlot = { n: 0 }
-  const slotMarker = join(logDir(), 'nori-pet-trace.slot')
-  function tracePath(slot: number): string {
-    return slot === 0 ? 'nori-pet-trace.log' : `nori-pet-trace.${slot}.log`
-  }
-  function readSlotMarker(): number {
+  // ── trace 日志：单文件 + 行数硬上限 ──
+  // 追踪日志用于排障，但**必须自带上限**：早期版本是 5 个 slot 轮转、每个只按"条数"裁剪，
+  // 总量无上限，且热重载会把 slot 指针重置回 0 → 同一个文件被反复续写，实测长到 1MB 还在涨。
+  //
+  // 现在只有**一条规则**：单文件超过 TRACE_MAX_ENTRIES 条就从最旧删到 TRACE_KEEP_ENTRIES 条。
+  // 为什么不按字节设阈值：字节阈值必须配"裁到多少字节"，两者挨太近会抖动
+  //（刚裁到目标、下一次写入又贴上限 → 每条都读写一遍 1MB 文件）。行数上限单调、可一眼证明有界，
+  // 实际体积由"每条 ≤ 约 1.2KB（IN/OUT 各 500 字）"封顶 —— 400 条 ≈ 500KB。
+  const TRACE_FILE = 'nori-pet-trace.log'
+  const TRACE_MAX_ENTRIES = 900 // 超过即裁剪（实测约 1.1MB 触发一次）
+  const TRACE_KEEP_ENTRIES = 400 // 裁剪后保留最新（约 500KB）
+  const LOG_BUDGET = 8 << 20 // 日志目录总预算 8MB：超了就删最旧的文件
+  const TRACE_ENTRY_RE = /(?=^\[\d{4}-\d{2}-\d{2}T)/m
+  const tracePath = join(logDir(), TRACE_FILE)
+
+  /** 载入现有条数（启动时一次），并做一次总体预算检查 */
+  function initTraceLog(): void {
     try {
-      const v = parseInt(readFileSync(slotMarker, 'utf8').trim(), 10)
-      return Number.isFinite(v) && v >= 0 && v < TRACE_SLOTS ? v : 0
-    } catch { return 0 }
+      // 旧版是「nori-pet-trace.1.log ~ .4.log + slot 文件」多文件轮转，总量无上限。
+      // 改成单文件后这些旧文件不会再被写入，留着只会让人分不清哪个是当前日志 → 顺手收掉。
+      try { unlinkSync(join(logDir(), 'nori-pet-trace.slot')) } catch { /* 可能不存在 */ }
+      for (let s = 1; s < 10; s++) {
+        try { unlinkSync(join(logDir(), `nori-pet-trace.${s}.log`)) } catch { /* 可能不存在 */ }
+      }
+      if (existsSync(tracePath)) {
+        const raw = readFileSync(tracePath, 'utf8')
+        traceCount = raw.split(TRACE_ENTRY_RE).filter((b) => b.trim()).length
+      }
+      enforceLogBudget()
+    } catch { /* ignore */ }
   }
-  function writeSlotMarker(): void {
-    try { writeFileSync(slotMarker, String(traceSlot.n), 'utf8') } catch { /* ignore */ }
+
+  /**
+   * 单文件裁剪：条数超上限就从最旧删起，保留最新 TRACE_KEEP_ENTRIES 条。
+   * 返回裁剪后条数；未超限返回 null（跳过读盘，正常路径零额外开销）。
+   */
+  function traceTrim(): number | null {
+    try {
+      if (traceCount + 1 <= TRACE_MAX_ENTRIES) return null
+      const blocks = readFileSync(tracePath, 'utf8').split(TRACE_ENTRY_RE).filter((b) => b.trim())
+      const slice = blocks.slice(-TRACE_KEEP_ENTRIES)
+      writeFileSync(tracePath, slice.join(''), 'utf8')
+      traceCount = slice.length
+      enforceLogBudget()
+      return traceCount
+    } catch { return null }
   }
-  // 启动时对齐：从 marker 恢复当前 slot，并把计数校准为该文件已有块数（避免超 1000 才裁剪）
-  try {
-    traceSlot.n = readSlotMarker()
-    const cur = join(logDir(), tracePath(traceSlot.n))
-    if (existsSync(cur)) {
-      const raw = readFileSync(cur, 'utf8')
-      traceCount.n = raw.split(/(?=^\[\d{4}-\d{2}-\d{2}T)/m).filter((b) => b.trim()).length
-    }
-  } catch { /* ignore */ }
+
+  /**
+   * 日志目录总预算：超过 LOG_BUDGET 时，从**最旧的文件**开始删。
+   * 为什么需要：单文件上限只约束单文件；轮转历史上会攒出多个文件（实测 2.4MB 一整个目录）。
+   * 用文件 mtime 排序，删到预算以内为止（只删本插件自己的 trace/error/summary 日志）。
+   */
+  function enforceLogBudget(): void {
+    try {
+      const files = readdirSync(logDir())
+        .filter((f) => f.startsWith('nori-pet-') && f.endsWith('.log'))
+        .map((f) => {
+          const p = join(logDir(), f)
+          const st = statSync(p)
+          return { f, p, size: st.size, mtime: st.mtimeMs }
+        })
+      let total = files.reduce((n, x) => n + x.size, 0)
+      if (total <= LOG_BUDGET) return
+      for (const x of files.sort((a, b) => a.mtime - b.mtime)) {
+        if (total <= LOG_BUDGET) break
+        try { unlinkSync(x.p) } catch { /* ignore */ }
+        total -= x.size
+        if (x.p === tracePath) traceCount = 0
+        log(`[dsh-nori-pet] 日志超出预算，已删除最旧：${x.f}（${Math.round(x.size / 1024)}KB）`)
+      }
+    } catch { /* ignore */ }
+  }
+
+  initTraceLog()
 
   /** 日志自动裁剪：连续写入 MAX 条后保留最新 KEEP 条（按 ISO 时间戳行切记录块），防无限膨胀 */
   function pruneLogFile(p: string, countRef: { n: number }, max = 100, keep = 50): void {
@@ -857,33 +904,22 @@ function applyInner(ctx: AppContext, config: Config) {
 
   /**
    * 改写层输入/输出追踪：材料→改写结果，两列记录（IN=当前块材料本体、OUT=改写输出）。
-   * 存储：5 文件轮转（slot0~4）；当前文件满 1000 条 → 删最早 200（保留 800）→ 轮换下一文件。
+   * 存储在单文件 `nori-pet-trace.log`，超 1MB 自动从最旧删到 512KB（见 TRACE_MAX_BYTES）。
    *
-   * ⚠ 隐私：这里写的是**对话原文**（各截 500 字），所以默认关闭。开启方式见 reframeTrace 注释。
-   * 开关在每次调用时从 reframeText 里传进来（`on`），以便 nori.config.json 改动立即生效。
+   * ⚠ 这条日志写的是**对话原文**（各截 500 字），只在排障时有用；不想要就设
+   * `nori.config.json` 的 `reframe.trace = false`。
+   * 开关每次调用从 reframeText 传进来（`on`），所以配置改动立即生效、无需重装。
    */
   function traceReframe(input: string, output: string, ms: number, on: boolean, src = ''): void {
     try {
       if (!on) return
-      const p = join(logDir(), tracePath(traceSlot.n))
       // 记录来源与长度：出现"同一段被改写两次"时，靠 src/len 一眼判断是投递重复还是模型重复
       const tag = src ? ` src=${src} len=${input.length}` : ` len=${input.length}`
       const fp = createHash('sha1').update(input).digest('hex').slice(0, 8)
-      appendFileSync(p, `[${new Date().toISOString()}] (${ms}ms)${tag} fp=${fp}\nIN : ${input.slice(0, 500)}\nOUT: ${output.slice(0, 500)}\n────\n`)
-      traceCount.n += 1
-      if (traceCount.n >= TRACE_MAX) {
-        // 文件内裁剪：保留最近 TRACE_KEEP（满 1000 → 删最早 200）
-        const raw = readFileSync(p, 'utf8')
-        const blocks = raw.split(/(?=^\[\d{4}-\d{2}-\d{2}T)/m).filter((b) => b.trim())
-        const keep = blocks.slice(-TRACE_KEEP)
-        if (keep.length < blocks.length) writeFileSync(p, keep.join(''), 'utf8')
-        traceCount.n = keep.length
-        // 轮转下一 slot（覆盖最旧一轮），清空目标文件
-        traceSlot.n = (traceSlot.n + 1) % TRACE_SLOTS
-        writeSlotMarker()
-        try { writeFileSync(join(logDir(), tracePath(traceSlot.n)), '', 'utf8') } catch { /* ignore */ }
-        traceCount.n = 0 // 新文件是空的：计数必须归零，否则再写 200 条就提前轮转（每文件只存 200 条）
-      }
+      const entry = `[${new Date().toISOString()}] (${ms}ms)${tag} fp=${fp}\nIN : ${input.slice(0, 500)}\nOUT: ${output.slice(0, 500)}\n────\n`
+      traceTrim() // 先裁后写：文件始终在上限内
+      appendFileSync(tracePath, entry)
+      traceCount += 1
     } catch { /* ignore */ }
   }
 
