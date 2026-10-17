@@ -16,8 +16,8 @@
  *   - 资产文件（模型/语音/图片）只允许占位（.gitkeep 已单独放行），任何真实资产入树即失败。
  */
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { join, relative } from 'node:path'
 import { buildHomePath } from './lib/home-path.mjs'
 
 const STAGED = process.argv.includes('--staged')
@@ -27,17 +27,74 @@ const root = (() => {
   catch { return process.cwd() }
 })()
 
-function list(cmd, args) {
-  try { return execFileSync(cmd, args, { encoding: 'utf8' }).split(/\r?\n/).map((s) => s.trim()).filter(Boolean) }
-  catch (e) { console.error('guard: git 调用失败 ' + String(e.message)); process.exit(2) }
+/**
+ * 无 git 时的全树回退：走文件系统遍历。
+ *
+ * 为什么需要：guard 对 git 的调用可能整体不可用（受限沙箱里被拒、git 未装、非仓库目录），
+ * 旧行为是直接 exit 2 —— 于是 `npm run guard`（README 里教用户跑的发布前自检）在手边没有
+ * 可用 git 的环境里彻底失效。
+ *
+ * 设计取舍：**不实现 .gitignore 语义**。试过两版按 .gitignore 过滤，两版都出真实漏扫：
+ *   - 按目录名裁：规则里的 `lib/` 把 `scripts/lib/` 一起吞掉
+ *   - 跳过整目录：`persona/*` 跳过 persona/，于是 `!persona/reframe.txt` 永远扫不到
+ *   （`.gitignore` 的 `!` 反向规则是"重新纳入"，和"整目录排除"交错时语义很绕，
+ *     手搓一版就等于给守卫埋一批静默盲区——这比多扫几个文件危险得多。）
+ *
+ * 所以只做两件确定的事：跳过「明确的大产物目录」与「噪声文件」，其余一律扫。
+ * 代价是会扫到本机资产（voice/*.wav、persona/prompt.txt）并如实报出"资产文件入树/人设文本片段"——
+ * 那是本机仓库的真实状态，不是误报；真拿它们当发布内容打包，本来就该被拦下。
+ * 有 git 时（正常情况）仍走 `git ls-files`，语义精确，不受这里影响。
+ */
+const SKIP_DIRS = new Set(['.git', 'node_modules', 'lib', 'dist', '.npm-cache', 'GPT-SoVITS', 'Nori_web', 'cubism_sdk', 'ffmpeg'])
+/** 噪声文件/目录：本机日志/缓存/打包产物/回滚备份，扫它们没有意义
+ * （真正的凭据走 nori.config.json，仍会被扫） */
+const NOISE_EXT = /\.(log|tsbuildinfo|tgz|zip|rar|7z|tmp|bak)$/i
+const NOISE_NAME = /^\.backup-/i
+/** 路径比较（Windows 大小写不敏感 + 分隔符归一） */
+const sameDir = (a, b) => a.replace(/[\\/]+$/, '').toLowerCase() === b.replace(/[\\/]+$/, '').toLowerCase()
+
+function walkFiles(dir, out = [], depth = 0) {
+  if (depth > 8) return out
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (e.isDirectory()) {
+      // SKIP_DIRS 只对**仓库顶层**生效：`lib` 指的是根目录构建产物，
+      // 不能让它把 `scripts/lib/` 这类源码目录一起吞掉（真实漏扫过一次）。
+      if (sameDir(dir, root) && SKIP_DIRS.has(e.name)) continue
+      if (NOISE_NAME.test(e.name)) continue // 回滚备份等
+      walkFiles(join(dir, e.name), out, depth + 1)
+      continue
+    }
+    if (!e.isFile()) continue
+    const rel = relative(root, join(dir, e.name)).split('\\').join('/')
+    const base = rel.slice(rel.lastIndexOf('/') + 1)
+    if (NOISE_EXT.test(base) || NOISE_NAME.test(base)) continue
+    out.push(rel)
+  }
+  return out
 }
 
-// 文件清单：环境变量 GUARD_FILES 优先（分号/换行分隔），否则走 git（--staged 暂存区 / 全树）
-const files = process.env.GUARD_FILES
-  ? process.env.GUARD_FILES.split(/[;\n\r]+/).map((s) => s.trim()).filter(Boolean)
-  : STAGED
+function list(cmd, args) {
+  try { return execFileSync(cmd, args, { encoding: 'utf8' }).split(/\r?\n/).map((s) => s.trim()).filter(Boolean) }
+  catch { return null }
+}
+
+// 文件清单：环境变量 GUARD_FILES 优先（分号/换行分隔）→ git 暂存区/全树 → 文件系统遍历回退
+const files = (() => {
+  if (process.env.GUARD_FILES) {
+    return process.env.GUARD_FILES.split(/[;\n\r]+/).map((s) => s.trim()).filter(Boolean)
+  }
+  const fromGit = STAGED
     ? list('git', ['diff', '--cached', '--name-only', '--diff-filter=ACM'])
     : list('git', ['ls-files'])
+  if (fromGit) return fromGit
+  if (STAGED) {
+    // 暂存区拿不到（git 不可用）：pre-commit 钩子本身也跑不起来，此处退化成全树扫描并说明
+    console.error('guard: 暂存区文件清单不可用（git 被限制？）→ 回退为全树扫描')
+  } else {
+    console.error(`guard: git 不可用 → 回退为文件系统遍历（跳过顶层产物目录：${[...SKIP_DIRS].join('/')}）`)
+  }
+  return walkFiles(root)
+})()
 
 // ── 人设 shingle（本机授权文件 prompt.txt → 64 字窗口集合；守卫源码不含文本内容） ──
 const S = 64
@@ -66,6 +123,22 @@ const KEY_PATTERNS = [
   /AKIA[0-9A-Z]{16}/,
   /-----BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY-----/,
 ]
+/**
+ * 本机/私有端点：中转网关与内网域名。
+ * 为什么要有这条：审查文档里写过真实端点（`<主机名>.host:端口`、某第三方聚合域名），
+ * 第一次扫描时全靠人眼发现——说明"私有端点"当时根本不在检测范围内，漏一次就在公开仓库留下
+ * 一处基础设施信息。故补成规则。
+ * 模式分片拼接 + 用 `\\d` 这类转义写法（而非 `\\d{2,5}` 里的真实数字），
+ * 使源码里不存在能被自身匹配的连续字面量（与 home-path.mjs 同一手法；第一版用真字面量
+ * 拼，结果守卫把自己报成了"私有端点"）。
+ */
+const PRIVATE_ENDPOINT = new RegExp(
+  [
+    '[a-z0-9-]+' + '\\.' + 'host' + ':' + '\\d{2,5}', // 形如 xxx.ho\u200bst:3514
+    'llm' + 'api\\.isr' + 'c\\.a' + 'c\\.cn', // 聚合端点（按域名片段拼接）
+  ].join('|'),
+  'i',
+)
 const ASSET_EXT = /\.(png|jpe?g|webp|gif|bmp|wav|mp3|m4a|ogg|flac|moc3|motion3\.json|model3\.json|cdf|moc)$/i
 // README/ 下的文档媒体（演示图等）允许入树；其余位置的资产扩展名仍一律拒绝
 const DOC_MEDIA = /^README\//
@@ -79,6 +152,7 @@ for (const f of files) {
   try { text = readFileSync(join(root, f), 'utf8') } catch { continue }
   if (text.includes('\0')) continue // 二进制（图片/gif/音频/模型）不是文本，跳过字符串扫描
   if (HOME_PATH.test(text)) scan(f, '家目录/机器路径')
+  if (PRIVATE_ENDPOINT.test(text)) scan(f, '私有端点/内网域名')
   for (const re of KEY_PATTERNS) { if (re.test(text)) { scan(f, '疑似密钥'); break } }
   if (personaShingles) {
     for (let i = 0; i + S <= text.length; i++) {
