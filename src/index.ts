@@ -16,7 +16,6 @@ import { join, dirname, normalize, extname, resolve, isAbsolute } from 'node:pat
 import { fileURLToPath } from 'node:url'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { softCut, spokenUnits } from './segmentation.js'
-import { extractSpeakable } from './speakable.js'
 import type { Socket } from 'node:net'
 import { homedir } from 'node:os'
 import { loadPersona } from './prompt.js'
@@ -43,16 +42,6 @@ export const Config = z.object({
   refPrompt: z.string().default('你好,初次见面,我的名字是Nori'),
   /** 单句推送的最大长度（超出强制截断） */
   maxSentence: z.number().min(1).default(140),
-  /**
-   * 超长内容的"详读预算"（字）。一段连续输出 ≤ 此字数 → 全文逐句详读（保持原有即时反馈）；
-   * 超过 → 这一段一个字都不详读，整轮只播一次概括 —— 两者互斥，避免"前半详细、中间快进"的口径不一。
-   * 输出速度约 300 token/s 时，400 字约 0.9 秒即可判定，所以长内容判定几乎不产生等待。
-   */
-  detailMaxChars: z.number().min(20).default(400),
-  /** 超长内容概括总开关（关闭 = 完全保持逐句详读的旧行为） */
-  summaryEnabled: z.boolean().default(true),
-  /** 概括等待上限（毫秒）：超过则先播一句提示，避免长静默（LLM 慢/超时兜底） */
-  summaryWaitMs: z.number().min(1000).default(8000),
   /**
    * TTS 推理参数。低温度更稳更收敛（避免采样噪声导致电音感），但温度过低 + top_k 过小
    * 会让 AR 模型在"嗯/唔"等鼻音叹词上进入采样循环：某个字无限拖长、随后吞掉句尾一小段。
@@ -114,9 +103,6 @@ export interface Config {
   refAudio: string
   refPrompt: string
   maxSentence: number
-  detailMaxChars: number
-  summaryEnabled: boolean
-  summaryWaitMs: number
   ttsTemperature: number
   ttsTopK: number
   ttsSpeedFactor: number
@@ -142,25 +128,6 @@ const PREFIX = '/@bubblesalt/dsh-nori-pet'
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 /** 断句符（中英标点 + 换行） */
 const BOUNDARY = new Set(['。', '！', '？', '!', '?', '；', ';', '…', '\n'])
-
-/**
- * 概括模式追加规则（接在 persona 之后）。设计约束来自实测需求：
- *  - 长度自适应：短内容 1 句，长内容最多 4 句 / 150 字（一次说到位，不啰嗦）
- *  - 事实优先：文件名/路径/数字/命令/结论/待确认项必须保留；中间过程与重复叙述可以丢
- *  - 不复述开头：超长内容的前段可能已经逐句播过，概括若复述开头会让人听两遍
- *  - 严禁编造：不确定就说"细节在屏幕上"，绝不把猜测说成事实
- */
-const SUMMARY_RULES = [
-  '【本次任务：概括】上面是 dsh 一轮输出的全文。请把它概括成我会朗读的一段话。',
-  '规则：',
-  '1. 长度自适应：内容短就说 1 句；内容长最多 4 句、总计不超过 150 字。宁短勿长。',
-  '2. 必须保留的事实：文件名/路径、数字（端口、行号、耗时、数量）、命令、结论（成功/失败/待办）、',
-  '   阻塞原因、需要用户确认或授权的事。',
-  '3. 可以丢的内容：中间过程、重复叙述、"我接下来要……"这类预告、无信息量的过渡句。',
-  '4. 不要复述开头：开头几句可能已经逐句读过了，直接讲"结论 + 要你做的事"，不要重复。',
-  '5. 严禁编造。不确定的部分就说"细节在屏幕上"。',
-  '6. 只输出要朗读的话，不要加任何前缀、编号、标题、markdown 标记。',
-].join('\n')
 
 /** 朗读文本规整：
  *  1) 保证句尾有断句标点（便于 GPT-SoVITS cut5 分句）；
@@ -477,82 +444,12 @@ function applyInner(ctx: AppContext, config: Config) {
     for (const [k, t] of [...restFlushTimers]) if (k.startsWith(prefix)) { clearTimeout(t); restFlushTimers.delete(k) }
   }
 
-  // ── 详读 / 概括 二选一（口径统一，不混用）──
-  // 一段连续输出（= 一个 step）≤ detailMaxChars → 全文逐句详读；
-  // 超过 → 该段一个字都不详读，整轮只播一次概括。
-  // 为什么必须"整段"而非"逐句"判断：逐句判断会出现"前半念得详细、后半突然快进"的口径断层。
-  // 输出速度约 300 token/s（≈450 字/秒），400 字约 0.9 秒即判定，长内容判定几乎无等待。
-  type Band = 'detail' | 'sum'
-  const stepBand = new Map<string, Band>() // key -> 该段轨道
-  const stepChars = new Map<string, number>() // key -> 该段累计字数
-  const turnBand = new Map<number, Band>() // turn -> 轨道（sum 优先）
-  const turnSummaryText = new Map<number, string>() // turn -> 被抑制的原文（供概括）
-  const summarizedTurns = new Set<number>() // 已发过概括的 turn（防重复播报）
-  const turnChars = new Map<number, number>() // turn -> 累计输出字数（判断整轮是否够长）
-
-  function noteTurnChar(turn: number, n: number): void {
-    const v = (turnChars.get(turn) ?? 0) + n
-    turnChars.set(turn, v)
-    if (turnChars.size > 32) { const f = turnChars.keys().next().value; if (f !== undefined && f !== turn) turnChars.delete(f) }
-  }
-
-  /** 锁定某段为"概括轨"：停止一切细粒度播报，丢弃该 turn 尚未播出的琐碎内容。
-   *  keepPending=true 时不丢 pending（turn/end 路径要用它收集本段尾巴）。 */
-  function lockSummaryBand(sid: string, turn: number, key: string, reason: string, keepPending = false): void {
-    if (turnBand.get(turn) === 'sum' && !keepPending) return
-    turnBand.set(turn, 'sum')
-    // 丢弃已排队的细粒度内容：概括会覆盖整段，避免"念一半 + 概括"重复
-    if (!keepPending) {
-      clearRestFlush(key)
-      const dropped = dropQueuedReframe(turn)
-      const prefix = `${sid}/${turn}/`
-      let droppedPending = 0
-      for (const [k, v] of [...pending]) {
-        if (k.startsWith(prefix)) { droppedPending += v.length; pending.delete(k) }
-      }
-      log(`[dsh-nori-pet] summary band lock: ${reason} turn=${turn} 丢弃改写${dropped}条/待断句${droppedPending}字`)
-    } else {
-      log(`[dsh-nori-pet] summary band lock(end): ${reason} turn=${turn}`)
-    }
-  }
-
-  /** 从改写队列中摘掉某 turn 尚未执行的任务，返回条数（概括接管后这些内容不再逐句播） */
-  function dropQueuedReframe(turn: number): number {
-    let n = 0
-    for (let i = reframeQueue.length - 1; i >= 0; i--) {
-      if (reframeQueue[i]!.turn === turn) { reframeQueue.splice(i, 1); n += 1 }
-    }
-    return n
-  }
-
   function pushChunk(sid: string, turn: number, step: number, delta: string): void {
     statChunks += 1
     statTextDelta += 1
     const key = `${sid}/${turn}/${step}`
     chunkedSteps.add(key) // 该 step 走过了流式（assistant/message 兜底应跳过）
     const cooling = Date.now() - startTime < 1000 // 冷启动回放窗口：只收集不广播
-
-    // ── 轨道判定（在播种内容之前）──
-    noteTurnChar(turn, delta.length)
-    let band: Band = stepBand.get(key) ?? 'detail'
-    if (band === 'detail') {
-      const acc = (stepChars.get(key) ?? 0) + delta.length
-      stepChars.set(key, acc)
-      if (stepChars.size > 64) { const f = stepChars.keys().next().value; if (f !== undefined && f !== key) stepChars.delete(f) }
-      if (config.summaryEnabled && !cooling && acc > config.detailMaxChars) {
-        stepBand.set(key, 'sum')
-        lockSummaryBand(sid, turn, key, `本段 ${acc} 字 > ${config.detailMaxChars}`)
-        band = 'sum'
-      }
-    }
-
-    if (band === 'sum') {
-      // 概括轨：只累积原文，不做断句/改写/广播（概括会一次覆盖整段）
-      turnSummaryText.set(turn, (turnSummaryText.get(turn) ?? '') + delta)
-      if (turnSummaryText.size > 8) { const f = turnSummaryText.keys().next().value; if (f !== undefined && f !== turn) turnSummaryText.delete(f) }
-      return
-    }
-
     if (config.reframe || cooling) {
       // 流式断句→分批改写（低延迟）：句子成句即入批，攒 ~150 字或 1.2s 无新句就 flush
       // 改写广播，长 turn 中途即开始播（避免"整轮结束才统一改写"的高延迟）。
@@ -633,12 +530,12 @@ function applyInner(ctx: AppContext, config: Config) {
    * key 路径：reframeApiKeyRef 配置了专用 key → 直连 DeepSeek 官方 API（独立计量）；
    * 否则走 dsh 内置 llm 服务（与主会话共用计量）。
    */
-  async function reframeText(text: string, mode: 'reframe' | 'summary' = 'reframe'): Promise<string | null> {
+  async function reframeText(text: string): Promise<string | null> {
     if (!persona) return text // 人设缺失：不改写，直接以原文朗读（保持链路通）
     const t0 = Date.now()
     const input = text.length > config.reframeMaxInput ? text.slice(0, config.reframeMaxInput) + '……' : text
     const userContent = input
-    const system = persona.prompt + '\n\n' + persona.reframe + (mode === 'summary' ? '\n\n' + SUMMARY_RULES : '')
+    const system = persona.prompt + '\n\n' + persona.reframe
 
     // 运行时直读 nori.config.json reframe 段（明文，可随时改无需重装）：
     // apiKey / reframeBaseUrl / reframeModel / reframeMaxTokens / reframeTimeoutMs 五件套
@@ -813,17 +710,6 @@ function applyInner(ctx: AppContext, config: Config) {
     } catch { /* ignore */ }
   }
 
-  /** 概括层追踪：原文→概括输出，用"压缩比"验证是否真的省了朗读时间 */
-  function traceSummary(raw: string, out: string, ms: number): void {
-    try {
-      const ratio = raw.length ? Math.round((out.length / raw.length) * 100) : 0
-      const p = join(logDir(), 'nori-pet-summary.log')
-      appendFileSync(p, `[${new Date().toISOString()}] (${ms}ms) 原文${raw.length}字 → 概括${out.length}字（压缩到 ${ratio}%）\nRAW: ${raw.slice(0, 300)}\nSUM: ${out.slice(0, 300)}\n────\n`)
-      traceCount.n += 1
-      pruneLogFile(p, traceCount)
-    } catch { /* ignore */ }
-  }
-
   /** 收集某 turn 的全部残留文本（reframe 模式的整轮文本） */
   function collectTurnText(sid: string, turn: number): string {
     const prefix = `${sid}/${turn}/`
@@ -898,16 +784,16 @@ function applyInner(ctx: AppContext, config: Config) {
   }
 
   // ── 改写串行队列：防止并发 LLM 调用风暴导致宿主 OOM（内存爆炸修复）──
-  const reframeQueue: Array<{ sid: string; turn: number; text: string; mode: 'reframe' | 'summary' }> = []
+  const reframeQueue: Array<{ sid: string; turn: number; text: string }> = []
   let reframeBusy = false
   const REFRAME_QUEUE_MAX = 30
 
-  function enqueueReframe(sid: string, turn: number, text: string, mode: 'reframe' | 'summary' = 'reframe'): void {
+  function enqueueReframe(sid: string, turn: number, text: string): void {
     if (reframeQueue.length >= REFRAME_QUEUE_MAX) {
       const dropped = reframeQueue.shift() // 防积压：丢最旧保最新
       if (dropped) appendErr('[nori-pet] reframe queue overflow: dropped ' + dropped.text.slice(0, 40) + '…')
     }
-    reframeQueue.push({ sid, turn, text, mode })
+    reframeQueue.push({ sid, turn, text })
     void pumpReframe()
   }
 
@@ -917,42 +803,12 @@ function applyInner(ctx: AppContext, config: Config) {
     try {
       while (reframeQueue.length) {
         const job = reframeQueue.shift()!
-        if (job.mode === 'summary') await summarizeAndBroadcast(job.sid, job.turn, job.text)
-        else await reframeAndBroadcast(job.sid, job.turn, job.text)
+        await reframeAndBroadcast(job.sid, job.turn, job.text)
       }
     } finally {
       reframeBusy = false
     }
   }
-
-  /**
-   * 概括并播报：整轮只有一次，播报时用 sentinel turn 触发 widget 侧 speakInterrupt，
-   * 替换掉队列里尚未播出的细粒度内容（保证听感只有一段统一概括）。
-   */
-  async function summarizeAndBroadcast(sid: string, turn: number, text: string): Promise<void> {
-    if (summarizedTurns.has(turn)) return
-    summarizedTurns.add(turn)
-    const t0 = Date.now()
-    let out = await reframeText(text, 'summary')
-    if (!out) out = extractSpeakable(text) // 概括失败 → 播精简后的原文（跳过代码/日志/清单），仍好过念全文
-    if (!out) return
-    const ms = Date.now() - t0
-    statAssistant += 1
-    lastAssistant = out.slice(0, 60)
-    broadcast({ type: 'assistant', session: sid, text: out, turn: `${turn}-sum` })
-    traceSummary(text, out, ms)
-    log(`[dsh-nori-pet] summary: turn=${turn} 原文${text.length}字 → 播报${out.length}字 (${ms}ms)`)
-  }
-
-  /** 概括播报的兜底提示：等待超时/概括失败时，至少让用户知道"内容多、别干等" */
-  function broadcastSummaryFallback(sid: string, turn: number, reason: string): void {
-    if (summarizedTurns.has(turn)) return
-    summarizedTurns.add(turn)
-    broadcast({ type: 'assistant', session: sid, text: '内容有点多，我先记下来，稍后说重点。', turn: `${turn}-sum` })
-    appendErr(`[nori-pet] summary fallback (${reason}) turn=${turn} chars=${(turnSummaryText.get(turn) ?? '').length}`)
-  }
-
-  // extractSpeakable 已抽到 src/speakable.ts（纯函数，便于单测）
 
   /** 逐块改写并广播：全部进串行队列（同 turn 块带 turn 供浏览器排队） */
   async function reframeBlocks(sid: string, turn: number, blocks: string[]): Promise<void> {
@@ -974,10 +830,6 @@ function applyInner(ctx: AppContext, config: Config) {
   //    assistant/message.stream），实时逐字流改由 agent 作用域的 `agent/assistant-stream`
   //    发布（进程本地、非持久）：start 帧带 turn/step，chunk 帧带 frame.chunk（StreamChunk）。
   //    只认 session/event 的旧代码因此永不触发 → chunk 分批改写/中途播放全部失效。──
-  //   ⚠ `agent/assistant-stream` 是 **scope-filtered** 事件（`this: Scoped<Agent>`）：
-  //     agent 作用域内的监听器只收自己那个 agent。插件在**外层作用域**注册，必须显式
-  //     `{ global: true }` 才能收到任何 agent 的帧——漏掉这个参数时监听器永不触发、
-  //     且不报错（旧版因此整条流式播报静默，是"长内容一口气读完"的根因之一）。
   const attemptTurn = new Map<string, { turn: number; step: number }>()
   ;(ctx as any).on('agent/assistant-stream', (payload: any) => {
     const frame = payload?.frame
@@ -995,18 +847,10 @@ function applyInner(ctx: AppContext, config: Config) {
     if (frame.type === 'end') { attemptTurn.delete(String(frame.attemptId)); return }
     if (frame.type !== 'chunk') return
     const c = frame.chunk
-    if (!c || typeof c.type !== 'string') return
+    if (!c || c.type !== 'text-delta' || typeof c.text !== 'string' || !c.text) return
     const ts = attemptTurn.get(String(frame.attemptId))
-    const feed = (text: string): void => { if (text) pushChunk(sid, ts?.turn ?? 0, ts?.step ?? 0, text) }
-    // 协议（实测当前 DSH）：文本不走 text-delta，而是 `block-end` 携带整块内容：
-    //   { type:'block-end', index, block:{ type:'text'|'reasoning'|'tool-call', text } }
-    // 旧的 `text-delta` 分支保留兼容（其他 provider/版本可能仍发增量）。
-    if (c.type === 'text-delta') { if (typeof c.text === 'string') feed(c.text); return }
-    if (c.type !== 'block-end') return
-    const block = c.block
-    if (!block || block.type !== 'text' || typeof block.text !== 'string') return // 只播正文：reasoning 规划与 tool-call 参数不朗读
-    feed(block.text)
-  }, { global: true })
+    pushChunk(sid, ts?.turn ?? 0, ts?.step ?? 0, c.text)
+  })
   const delayedSub = setTimeout(() => {
     ;(ctx as any).on('session/event', (session: any, event: any) => {
       eventCount += 1
@@ -1064,33 +908,11 @@ function applyInner(ctx: AppContext, config: Config) {
         if (config.reframe) {
           // 收尾批次（低延迟流式改写的剩余句子），再 collect 未断句残留（冷却期只清残留）
           flushBatch()
-          const tailText = collectTurnText(sid, data.turn).trim()
-          // 概括轨：本段正文不逐句播，整轮只播一次概括（见 lockSummaryBand 注释）
-          const band = turnBand.get(data.turn)
-          if (!cooling && (band === 'sum' || (tailText.length > 0 && (turnChars.get(data.turn) ?? 0) > config.detailMaxChars * 2))) {
-            if (band !== 'sum') lockSummaryBand(sid, data.turn, prefix, `整轮 ${turnChars.get(data.turn)} 字 > ${config.detailMaxChars * 2}`, true)
-            const raw = ((turnSummaryText.get(data.turn) ?? '') + tailText).trim()
-            turnSummaryText.delete(data.turn)
-            if (raw) {
-              const turnNo = data.turn
-              enqueueReframe(sid, turnNo, raw, 'summary')
-              // 等待上限：LLM 慢时不至于让宠物静默到让人以为挂了
-              setTimeout(() => {
-                if (!reframeQueue.some((j) => j.mode === 'summary' && j.turn === turnNo)) return // 已出队处理/已完成
-                if (summarizedTurns.has(turnNo)) return
-                broadcastSummaryFallback(sid, turnNo, 'wait-timeout')
-              }, config.summaryWaitMs) as unknown as number
-            }
-          } else if (!cooling && tailText) {
-            const blocks = splitBlocks(tailText)
+          const full = collectTurnText(sid, data.turn).trim()
+          if (!cooling && full) {
+            const blocks = splitBlocks(full)
             void reframeBlocks(sid, data.turn, blocks)
           }
-          // 轨道状态回收（防无界增长）
-          turnBand.delete(data.turn)
-          turnChars.delete(data.turn)
-          turnSummaryText.delete(data.turn)
-          for (const k of [...stepBand.keys()]) if (k.startsWith(prefix)) stepBand.delete(k)
-          for (const k of [...stepChars.keys()]) if (k.startsWith(prefix)) stepChars.delete(k)
           broadcast({ type: 'turn-end', session: sid, turn: data.turn, reason: data.reason?.kind })
           break
         }

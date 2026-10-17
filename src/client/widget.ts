@@ -7,6 +7,7 @@
  * 依赖：bundle banner 内联的 live2dcubismcore.js（真实 core，先于本代码执行）。
  */
 import * as PIXI from 'pixi.js'
+import { spokenUnits } from '../segmentation.js'
 import { Live2DModel } from 'pixi-live2d-display/cubism4'
 ;(window as any).PIXI = PIXI
 
@@ -307,30 +308,11 @@ let qfigureValue = 0
 let defaultHeadTop = -1
 
 /**
- * 句子切分：先按句末标点切主句，再按逗号/顿号切短（每段上限 40 字，过长硬切）。
- * 短句 → TTS 合成快 → 朗读延迟低，也更贴近 Nori 的短句口吻。
+ * 句子切分：统一走 src/segmentation.ts 的 spokenUnits（宿主与 widget 同一份实现，避免两套规则打架）。
+ * 目标长度 34 字、词感知断点（绝不在英文词/路径中间切）、允许 ≤4 字溢出贴合自然断点。
  */
 function splitSentences(text: string): string[] {
-  const MAX_LEN = 40
-  const mainParts = text.match(/[^。！？!?…;\n]+[。！？!?…;]?/g) || [text]
-  const out: string[] = []
-  for (const part of mainParts) {
-    const trimmed = part.trim()
-    if (!trimmed) continue
-    // 次级切分：逗号/顿号/空格
-    const sub = trimmed.split(/(?<=[，、,，])\s*/)
-    let buf = ''
-    for (const seg of sub) {
-      if (buf.length + seg.length <= MAX_LEN) { buf += seg; continue }
-      if (buf) { out.push(buf); buf = '' }
-      // 单段仍超长 → 硬切
-      let rest = seg
-      while (rest.length > MAX_LEN) { out.push(rest.slice(0, MAX_LEN)); rest = rest.slice(MAX_LEN) }
-      buf = rest
-    }
-    if (buf) out.push(buf)
-  }
-  return out.filter((s) => s.trim().length > 0)
+  return spokenUnits(text, 34).map((s) => s.trim()).filter((s) => s.length > 0)
 }
 
 /** 向宿主合成一句音频；返回 ArrayBuffer（被打断/失败返回 null）。不打断当前播放。 */
@@ -411,20 +393,10 @@ async function speakText(text: string, token: number): Promise<void> {
   const useTagged = tagged.length > 0 && tagged.some((t) => t.emo !== null)
   let sentences: TaggedSentence[]
   if (useTagged) {
-    // 标签行逐句；超长行按逗号/句号子切（情绪沿用）
+    // 标签行逐句；超长行按同一份断句规则子切（情绪沿用）
     sentences = []
     for (const t of tagged) {
-      if (t.text.length <= 45) { sentences.push(t); continue }
-      const sub = t.text.match(/[^，。！？!?…;\n]+[，。！？!?…;]?/g) || [t.text]
-      let buf = ''
-      for (const seg0 of sub) {
-        if (buf.length + seg0.length <= 45) { buf += seg0; continue }
-        if (buf) { sentences.push({ text: buf, emo: t.emo }); buf = '' }
-        let rest = seg0
-        while (rest.length > 45) { sentences.push({ text: rest.slice(0, 45), emo: t.emo }); rest = rest.slice(45) }
-        buf = rest
-      }
-      if (buf) sentences.push({ text: buf, emo: t.emo })
+      for (const unit of spokenUnits(t.text, 34)) sentences.push({ text: unit, emo: t.emo })
     }
   } else {
     sentences = splitSentences(text).map((s) => ({ text: s, emo: null }))

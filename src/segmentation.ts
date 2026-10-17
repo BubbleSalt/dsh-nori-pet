@@ -21,19 +21,64 @@ const isCjk = (ch: string): boolean => CJK.test(ch)
 const FULLWIDTH = /[，。！？；：、（）【】《》“”‘’…—～]/
 /** 仅由标点/空白构成（不承载语音）→ 并入相邻单元 */
 const PUNCT_ONLY = /^[\s。！？!?…；;，,、：:.\-—~～"'“”‘’()（）\[\]【】]+$/
+/**
+ * 情绪标签括号：`【` 之前与 `】` 之后都不允许切。
+ * 这样标签整体吸附到后文——既不切在 `【…】` 内部（会留下 `【` 残骸），也不会悬在句末
+ * （朗读前按"行首标签"剥离，悬在句末时前缀对不上，会被当正文念出来）。
+ */
+const TAG_BRACKET = /[【】]/
 /** 允许的溢出字数 */
 const OVERRUN = 4
 
 const trimAscii = (s: string): string =>
   s.replace(/^[\s\u3000]+/, '').replace(/[\s\u3000]+$/, '')
 
-/** 句级切分（ICU）；不可用时返回原文本 */
+/** 句级切分（ICU）；不可用时返回原文本。
+ *  后处理：句界紧跟情绪标签时把标签并入上一句——`…啦！【think】接下来…` 若在 `！` 处断开，
+ *  标签会悬在句末。（残留标签由 cleanSpeech 兜底清除，这里只避免制造悬空标签。） */
 function sentences(text: string): string[] {
   try {
     const seg = new Intl.Segmenter('zh-CN', { granularity: 'sentence' })
-    const out = [...seg.segment(text)].map((s) => s.segment).filter((s) => s.trim().length > 0)
-    return out.length ? out : [text]
+    const raw = [...seg.segment(text)].map((s) => s.segment).filter((s) => s.trim().length > 0)
+    if (!raw.length) return [text]
+    const out: string[] = []
+    for (const s of raw) {
+      const m = s.match(/^(\s*【[^】]{0,12}】)/)
+      if (m && out.length) {
+        out[out.length - 1] += m[1]!
+        const rest = s.slice(m[1]!.length)
+        if (rest.trim().length > 0) out.push(rest)
+      } else out.push(s)
+    }
+    return out
   } catch { return [text] }
+}
+
+/**
+ * 朗读前清理：剥掉情绪标签及其**被切断的残骸**。
+ *
+ * 为什么必须在朗读文本层兜底：`Intl.Segmenter` 的 sentence 粒度**会切在标签内部**——
+ * 实测 `…这样最稳。【serious】拉起前…` 被 ICU 从 `【` 与 `serious` 之间断开，于是产生
+ * `…【` 与 `serious】拉起…` 两个单元，朗读时 `【` 被当标点、`serious】` 被当正文**念出来**。
+ * 任何"只保护切点"的做法都管不到 ICU 的句级边界，所以统一在这里清干净。
+ *
+ * 清理顺序（后者兜前者，容忍任意切断方式）：
+ *  1) 完整标签 `【emo】`；
+ *  2) 带括号的残骸：`【`+词、词+`】`（`serious】`）、只剩括号；
+ *  3) 归一化：把"标签词"从词首剔除——ICU 可能正好切在 `】` 后，留下一段中文开头的裸标签词，
+ *     此时已无从判断它是标签而非正文，只能按词表剔除（词表在 chat 场景里不会出现在正文开头）。
+ */
+const EMO_WORDS = new Set(['default', 'happy', 'excited', 'angry', 'refuse', 'sad', 'doubt', 'troubled', 'shy', 'surprised', 'dizzy', 'serious', 'speechless', 'think'])
+export function cleanSpeech(text: string): string {
+  let t = String(text)
+    .replace(/【[^】]{0,12}】/g, '') // 1) 完整标签
+    .replace(/【[A-Za-z]{0,12}/g, '') // 2a) 【+词
+    .replace(/[A-Za-z]{0,12}】/g, '') // 2b) 词+】 / 裸括号
+    .replace(/[【】]/g, '') // 2c) 括号残骸
+  // 3) 裸标签词（只在词首剔除，避免误伤正文中的普通英文）
+  const seg = t.match(/^[A-Za-z]{3,12}/)
+  if (seg && EMO_WORDS.has(seg[0].toLowerCase())) t = t.slice(seg[0].length)
+  return t.replace(/[ \t]{2,}/g, ' ').trim()
 }
 
 /**
@@ -42,6 +87,8 @@ function sentences(text: string): string[] {
  */
 function isSafeCut(s: string, i: number): boolean {
   if (i <= 0 || i >= s.length) return true
+  // 0) 情绪标签括号两侧不可切：标签整体吸附后文（详见 TAG_BRACKET 注释）
+  if (TAG_BRACKET.test(s[i - 1]!) || TAG_BRACKET.test(s[i]!)) return false
   const prev = s[i - 1]!
   const next = s[i]!
   // 1) 空白归后一段：切点在空白**之后**（这样 trim 不会吞掉空格、中文也不会与后句粘连）
@@ -126,6 +173,15 @@ export function spokenUnits(text: string, max = 34, min = 10): string[] {
     if (!/[：:，,、]$/.test(u)) continue
     units[k] = u.slice(0, -1)
     units[k + 1] = u.slice(-1) + units[k + 1]!
+  }
+  // 收尾 1b：标签被留在上一句末尾（如"…啦！【think】"）→ 后移作下一句前缀。
+  //   句级已经按 `sentences()` 合并处理，这里兜住句内切分可能造出的残留。
+  for (let k = 0; k + 1 < units.length; k++) {
+    const u = units[k]!
+    const m = u.match(/【[^】]{0,12}】\s*$/)
+    if (!m || u.length <= m[0].length) continue // 整单元就是标签时保留原样（下一个收尾会合并）
+    units[k] = u.slice(0, u.length - m[0].length).trimEnd()
+    units[k + 1] = m[0].trim() + units[k + 1]!
   }
   // 收尾 2：碎片合并（先向右、再向左）；并入会超上限时只把左邻"剪到上限"
   const out: string[] = []
