@@ -244,13 +244,14 @@ GPT-SoVITS 是本地语音合成引擎（TTS）——Nori 用它把文字念成�
 
 | 落点 | 内容 | 默认 | 怎么关/清 |
 |---|---|---|---|
-| `nori.config.json`（仓库目录内） | 改写层 `apiKey` **明文**、你的端点地址、参考音频路径 | 安装时若填了就写入 | 不填 apiKey（改用 dsh credentials）；文件已被 `.gitignore` 屏蔽，但**整目录打包/转发会带走** |
-| `~/.dsh/logs/nori-pet/nori-pet-trace*.log` | **对话原文与改写结果各截 500 字**（5 个文件轮转，单文件满 1000 条清最早 200） | **关** | `nori.config.json` 里 `reframe.trace = true` 才开启；直接删文件即可清空 |
-| `~/.dsh/logs/nori-pet/nori-pet-summary.log` | 概括压缩比与概括输出（同样含对话内容） | 达到阈值时写 | 跟随上面的 `reframe.trace` 开关 |
-| `~/.dsh/logs/nori-pet/nori-pet-error.log` | 错误摘要（含 URL/模型名，可能含配置片段） | 开 | 排障用，可直接删 |
+| `nori.config.json`（仓库目录内） | 改写层 `apiKey` **明文**、你的端点地址、参考音频路径 | 安装时若填了就写入 | 不填 apiKey（改用 dsh credentials）；已被 `.gitignore` 屏蔽，**用 git 发布/分享不会带出去**（整目录打包才会） |
+| `~/.dsh/logs/nori-pet/nori-pet-trace.log` | **对话原文与改写结果各截 500 字**，用来复盘"刚才那句为什么这么念" | 开 | **自带长度上限**：超 900 条就从最旧删到 400 条（约 1.1MB → 500KB），日志目录超 8MB 再删最旧文件。想静默就设 `reframe.trace = false`（热改生效），或直接删文件 |
+| `~/.dsh/logs/nori-pet/nori-pet-summary.log` | 概括压缩比与概括输出（同样含对话内容） | 开 | 跟随上面的 `reframe.trace` 开关 |
+| `~/.dsh/logs/nori-pet/nori-pet-error.log` | 错误摘要（含 URL/模型名，可能含配置片段） | 开 | 排障用；满 100 条自动只留最新 50 条 |
 
-**要分享这个目录或提 issue 时**：`nori.config.json` 与 `~/.dsh/logs/nori-pet/` 都别直接发——里面会有 key 和你说过的话。
-提交前 `npm run guard` 会扫描仓库内的机器路径/密钥/人设文本，但它只看**仓库内**的文件，管不到上面这些日志。
+**分享时**：走 git（clone / 仓库链接）是安全的——上面这些都在 `.gitignore` 里；
+只有「把整个文件夹打包发人」才会把 `nori.config.json`（明文 key）与日志一起带走。
+提交前 `npm run guard` 会扫描仓库内的机器路径/密钥/私有端点，但它只看**仓库内**的文件，管不到这些日志。
 
 > 补充：`npm run guard` 有 git 时扫 `git ls-files`（即真正会提交的文件，`nori.config.json`/`voice/*` 已忽略、不会报）；
 > 无 git 时退化为遍历工作目录，会连本机资产一起报（`voice/nori.wav`、`persona/prompt.txt`、`nori.config.json`）——

@@ -34,6 +34,6 @@
     "reframeTimeoutMs": 0,
     "reframeMaxInput": 0,
     "reframeMaxTokens": 0,
-    "reframeTrace": false
+    "reframeTrace": true
   }
 }
