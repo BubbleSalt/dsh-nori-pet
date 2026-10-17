@@ -7,7 +7,7 @@
  * 依赖：bundle banner 内联的 live2dcubismcore.js（真实 core，先于本代码执行）。
  */
 import * as PIXI from 'pixi.js'
-import { spokenUnits } from '../segmentation.js'
+import { cleanSpeech, spokenUnits } from '../segmentation.js'
 import { Live2DModel } from 'pixi-live2d-display/cubism4'
 ;(window as any).PIXI = PIXI
 
@@ -381,9 +381,16 @@ function parseTagged(text: string): TaggedSentence[] {
     .filter((line) => line.length > 0)
     .map((line) => {
       const m = line.match(EMO_TAG_RE)
-      if (m && VALID_EMO_TAGS.has(m[1])) return { text: line.slice(m[0].length).trim(), emo: m[1] as Emotion }
-      return { text: line, emo: null }
+      if (m && VALID_EMO_TAGS.has(m[1])) return { text: stripTags(line.slice(m[0].length)).trim(), emo: m[1] as Emotion }
+      return { text: stripTags(line).trim(), emo: null }
     })
+}
+
+/** 剥掉残留的情绪标签：标签是控制标记，绝不能进入合成文本（否则会被当正文念出来）。
+ *  正常输出每行标签在行首、已由 parseTagged 消费；此处兜底处理行中/行尾残留，
+ *  以及 ICU 句级切分切断的残骸（`…【` / `serious】…`）。 */
+function stripTags(text: string): string {
+  return cleanSpeech(text)
 }
 
 /** 朗读：优先按【情绪】标签逐句（每句激活对应表情）；无标签文本回落 splitSentences 本地分类。

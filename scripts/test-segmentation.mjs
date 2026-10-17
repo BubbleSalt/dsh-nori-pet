@@ -9,7 +9,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { spokenUnits, softCut, findCut } from '../lib/segmentation.js'
+import { spokenUnits, softCut, findCut, cleanSpeech } from '../lib/segmentation.js'
 
 const MAX = 34
 const HARD = MAX + 4 // 允许的自然溢出
@@ -106,4 +106,35 @@ test('findCut：不在拉丁词内部下刀（中西交界与空格后可以）'
 
 test('findCut：窗口内没有任何可断点时返回 0，而不是乱切', () => {
   assert.equal(findCut('a'.repeat(50), 34), 0)
+})
+
+// ── 情绪标签绝不进入朗读文本 ──
+// 实测踩坑：Intl.Segmenter 的 sentence 粒度会切在标签内部（"…最稳。【" | "serious】拉起…"），
+// 朗读时 "serious】" 被当正文念出来。不变量 = 朗读文本里不出现标签，由 cleanSpeech 兜底。
+
+test('朗读文本里不出现任何标签痕迹（真实概括用例）', () => {
+  const text = '【think】看门狗用探测式为主、再加一个很长周期的兜底重启来清洗状态，这样最稳。'
+    + '【serious】拉起前要先确认端口占用者是谁，按PID核对命令行和启动时间。'
+  const units = spokenUnits(text, MAX)
+  for (const u of units) {
+    const spoken = cleanSpeech(u)
+    assert.ok(!/【|】/.test(spoken), '标签残骸进入朗读: ' + JSON.stringify(spoken))
+    assert.ok(!/^(happy|think|serious|default|sad|angry)/i.test(spoken), '裸标签词进入朗读: ' + JSON.stringify(spoken))
+  }
+  const joined = units.map((u) => cleanSpeech(u)).join('')
+  assert.ok(joined.includes('看门狗用探测式为主'), joined)
+  assert.ok(joined.includes('拉起前要先确认端口占用者是谁'), joined)
+})
+
+test('cleanSpeech：完整标签 / 各类残骸 / 裸标签词都被清掉', () => {
+  assert.equal(cleanSpeech('【happy】完成啦！'), '完成啦！')
+  assert.equal(cleanSpeech('…这样最稳。【'), '…这样最稳。')
+  assert.equal(cleanSpeech('serious】拉起前要先确认。'), '拉起前要先确认。')
+  assert.equal(cleanSpeech('think】接下来做这个：'), '接下来做这个：')
+  assert.equal(cleanSpeech('【serious】'), '')
+})
+
+test('cleanSpeech 不误伤正文里的普通英文', () => {
+  const s = '正常文本 ThinkPad 很好用，excitedly 也是这样。'
+  assert.equal(cleanSpeech(s), s)
 })

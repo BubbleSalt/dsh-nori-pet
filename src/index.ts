@@ -622,12 +622,9 @@ function applyInner(ctx: AppContext, config: Config) {
       else { pending.delete(key); clearRestFlushOne(key) }
       return
     }
-    pushChunkPlain(sid, turn, key, delta)
-  }
 
-  function pushChunkPlain(sid: string, turn: number, key: string, delta: string): void {
+    // ── reframe 关闭：实时按句广播原文（同一份 delta 只能走这里，绝不能再进改写批）──
     let buf = (pending.get(key) ?? '') + delta
-    // 按边界切句（reframe 关闭时的实时流式广播）
     for (;;) {
       let idx = -1
       for (let i = 0; i < buf.length; i++) {
@@ -745,7 +742,7 @@ function applyInner(ctx: AppContext, config: Config) {
             if (retry && retry.ok) {
               const d2: any = await retry.json().catch(() => null)
               const t2 = ((d2?.choices?.[0]?.message?.content as string) ?? '').trim()
-              if (t2) { traceReframe(input, t2, Date.now() - t0); return t2 }
+              if (t2) { traceReframe(input, t2, Date.now() - t0, mode); return t2 }
             }
             appendErr('reframe direct API retry failed; status=' + (retry ? retry.status : 'network'))
           }
@@ -755,7 +752,7 @@ function applyInner(ctx: AppContext, config: Config) {
         const out = (data?.choices?.[0]?.message?.content as string) ?? ''
         const trimmed = out.trim()
         if (!trimmed) appendErr('reframe direct API EMPTY output; model=' + dedicatedModel + ' (推理模型思考链占满 max_tokens? 可调大 reframeMaxTokens)')
-        traceReframe(input, trimmed, Date.now() - t0)
+        traceReframe(input, trimmed, Date.now() - t0, mode)
         return trimmed || null
       }
       // 路径 2：dsh 内置 llm 服务
@@ -775,7 +772,7 @@ function applyInner(ctx: AppContext, config: Config) {
       }
       const trimmed = out.trim()
       if (!trimmed) appendErr('reframe llm EMPTY output; provider=' + config.reframeProvider + ' model=' + config.reframeModel + ' (推理模型思考链占满 max_tokens? 可调大 reframeMaxTokens)')
-      traceReframe(input, trimmed, Date.now() - t0)
+      traceReframe(input, trimmed, Date.now() - t0, mode)
       return trimmed || null
     } catch (e) {
       log('[dsh-nori-pet] reframe failed: ' + String(e))
@@ -847,11 +844,14 @@ function applyInner(ctx: AppContext, config: Config) {
   /** 改写层输入/输出追踪（reframeTrace 开启时写入 nori-pet-trace*.log）：材料→改写结果，
    * 两列记录：IN=当前块材料本体、OUT=改写输出。存储：5 文件轮转（slot0~4）；当前文件满
    * 1000 条 → 删最早 200（保留 800）→ 轮换下一文件。 */
-  function traceReframe(input: string, output: string, ms: number): void {
+  function traceReframe(input: string, output: string, ms: number, src = ''): void {
     try {
       if (!config.reframeTrace) return
       const p = join(logDir(), tracePath(traceSlot.n))
-      appendFileSync(p, `[${new Date().toISOString()}] (${ms}ms)\nIN : ${input.slice(0, 500)}\nOUT: ${output.slice(0, 500)}\n────\n`)
+      // 记录来源与长度：出现"同一段被改写两次"时，靠 src/len 一眼判断是投递重复还是模型重复
+      const tag = src ? ` src=${src} len=${input.length}` : ` len=${input.length}`
+      const fp = createHash('sha1').update(input).digest('hex').slice(0, 8)
+      appendFileSync(p, `[${new Date().toISOString()}] (${ms}ms)${tag} fp=${fp}\nIN : ${input.slice(0, 500)}\nOUT: ${output.slice(0, 500)}\n────\n`)
       traceCount.n += 1
       if (traceCount.n >= TRACE_MAX) {
         // 文件内裁剪：保留最近 TRACE_KEEP（满 1000 → 删最早 200）
@@ -958,7 +958,48 @@ function applyInner(ctx: AppContext, config: Config) {
   let reframeBusy = false
   const REFRAME_QUEUE_MAX = 30
 
+  /**
+   * 投递去重：同一 turn 内**完全相同的文本**只排队一次。
+   *
+   * 为什么需要：曾出现同一段文字被投递两次（trace 里两条 IN 完全相同、各自跑了 LLM），
+   * 结果是同一段内容被改写、播报两遍——听感上非常明显。触发路径与增量怎么切分有关，
+   * 与其在每条路径上各堵一次，不如在唯一的收口处按指纹去重（指纹同时写进 trace，
+   * 下次真出现重复时能一眼对上是哪条路径送进来的）。
+   */
+  const reframeHashes = new Map<number, Set<string>>()
+
+  /**
+   * 本代一次性定时器登记表：所有"稍后要做事"的 setTimeout 都登记进来，fiber dispose 时统一清。
+   *
+   * 为什么必须收口（实测踩过）：不清的定时器在热重载后仍会触发，带着**旧代的状态**再投递/再
+   * 播报一次（同一段被改写播报两遍）。单个地方各清一次容易漏（概括等待上限这处就漏过），
+   * 所以这里提供一个统一入口。
+   */
+  const genTimers = new Set<any>()
+
+  function later(fn: () => void, ms: number): void {
+    const id = setTimeout(() => {
+      genTimers.delete(id)
+      fn()
+    }, ms)
+    genTimers.add(id)
+  }
+
   function enqueueReframe(sid: string, turn: number, text: string, mode: 'reframe' | 'summary' = 'reframe'): void {
+    const body = text.trim()
+    if (!body) return
+    const fp = createHash('sha1').update(body).digest('hex').slice(0, 8)
+    let seen = reframeHashes.get(turn)
+    if (!seen) {
+      if (reframeHashes.size > 16) reframeHashes.clear() // 只关心近期 turn
+      seen = new Set<string>()
+      reframeHashes.set(turn, seen)
+    }
+    if (seen.has(fp)) {
+      appendErr(`[nori-pet] reframe dedup: 同一 turn(${turn}) 内重复投递已丢弃 fp=${fp} len=${body.length} head=${body.slice(0, 40)}`)
+      return
+    }
+    seen.add(fp)
     if (reframeQueue.length >= REFRAME_QUEUE_MAX) {
       const dropped = reframeQueue.shift() // 防积压：丢最旧保最新
       if (dropped) appendErr('[nori-pet] reframe queue overflow: dropped ' + dropped.text.slice(0, 40) + '…')
@@ -1129,11 +1170,11 @@ function applyInner(ctx: AppContext, config: Config) {
               const turnNo = data.turn
               enqueueReframe(sid, turnNo, raw, 'summary')
               // 等待上限：LLM 慢时不至于让宠物静默到让人以为挂了
-              setTimeout(() => {
+              later(() => {
                 if (!reframeQueue.some((j) => j.mode === 'summary' && j.turn === turnNo)) return // 已出队处理/已完成
                 if (summarizedTurns.has(turnNo)) return
                 broadcastSummaryFallback(sid, turnNo, 'wait-timeout')
-              }, config.summaryWaitMs) as unknown as number
+              }, config.summaryWaitMs)
             }
           } else if (tailText) {
             const blocks = splitBlocks(tailText)
@@ -1682,6 +1723,20 @@ function applyInner(ctx: AppContext, config: Config) {
   ctx.effect(() => ctx.webServer.registerUpgrade({ path: PREFIX + '/ws', handler: handleUpgrade }), 'nori-pet-ws')
   ctx.effect(() => () => { for (const c of clients) { try { c.close() } catch { /* ignore */ } } clients.clear() }, 'nori-pet-ws-cleanup')
   ctx.effect(() => () => { if (ttsWatchTimer) { try { clearInterval(ttsWatchTimer) } catch { /* ignore */ } ttsWatchTimer = null } }, 'nori-pet-tts-watch')
+  /**
+   * 关键：清掉本代所有待触发的播报定时器。
+   *
+   * 不清的后果（实测踩过）：热重载后旧代 fiber 的 setTimeout 回调仍会触发，带着**它那一代的
+   * batchText/pending** 再走一遍 flushBatch → 同一段文字被投递第二次 → 同一段内容被改写、
+   * 播报两遍（trace 里两条 IN 完全相同、指纹相同）。即"重复播报"的真凶是跨代遗留定时器。
+   */
+  ctx.effect(() => () => {
+    if (batchTimer) { try { clearTimeout(batchTimer) } catch { /* ignore */ } batchTimer = null }
+    for (const t of restFlushTimers.values()) { try { clearTimeout(t) } catch { /* ignore */ } }
+    restFlushTimers.clear()
+    for (const t of genTimers) { try { clearTimeout(t) } catch { /* ignore */ } }
+    genTimers.clear()
+  }, 'nori-pet-broadcast-timers')
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: PREFIX + '/widget.js',
