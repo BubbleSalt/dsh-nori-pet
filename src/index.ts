@@ -567,6 +567,7 @@ function applyInner(ctx: AppContext, config: Config) {
       if (stepChars.size > 64) { const f = stepChars.keys().next().value; if (f !== undefined && f !== key) stepChars.delete(f) }
       if (config.summaryEnabled && acc > config.detailMaxChars) {
         stepBand.set(key, 'sum')
+        if (stepBand.size > 64) { const f = stepBand.keys().next().value; if (f !== undefined && f !== key) stepBand.delete(f) }
         lockSummaryBand(sid, turn, key, `本段 ${acc} 字 > ${config.detailMaxChars}`)
         band = 'sum'
       }
@@ -713,24 +714,41 @@ function applyInner(ctx: AppContext, config: Config) {
         const baseUrl = dedicatedBase.replace(/\/+$/, '')
         // 兼容通用 OpenAI 格式端点：baseUrl 已含 /chat/completions 则直接用，否则补全
         const url = /\/chat\/completions$/i.test(baseUrl) ? baseUrl : baseUrl + '/chat/completions'
+        const retryBody = JSON.stringify({
+          model: dedicatedModel,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: userContent },
+          ],
+          temperature: 0.8,
+          max_tokens: dedicatedMaxTokens,
+          stream: false,
+        })
         const res = await fetch(url, {
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: 'Bearer ' + dedicatedKey },
-          body: JSON.stringify({
-            model: dedicatedModel,
-            messages: [
-              { role: 'system', content: system },
-              { role: 'user', content: userContent },
-            ],
-            temperature: 0.8,
-            max_tokens: dedicatedMaxTokens,
-            stream: false,
-          }),
+          body: retryBody,
           signal: ctrl.signal,
         })
         if (!res.ok) {
           const errBody = await res.text().catch(() => '')
           appendErr('reframe direct API HTTP ' + res.status + ' url=' + url + ' model=' + dedicatedModel + ': ' + errBody.slice(0, 200))
+          // 中转端点偶发 400/5xx（实测 "There was an error parsing the body" 后紧接一次就成功）
+          // → 重试一次，仍失败才降级。重试比"直接播原文"便宜，也比再包一层容错简单。
+          if (res.status >= 400) {
+            const retry = await fetch(url, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', authorization: 'Bearer ' + dedicatedKey },
+              body: retryBody,
+              signal: ctrl.signal,
+            }).catch(() => null)
+            if (retry && retry.ok) {
+              const d2: any = await retry.json().catch(() => null)
+              const t2 = ((d2?.choices?.[0]?.message?.content as string) ?? '').trim()
+              if (t2) { traceReframe(input, t2, Date.now() - t0); return t2 }
+            }
+            appendErr('reframe direct API retry failed; status=' + (retry ? retry.status : 'network'))
+          }
           return null
         }
         const data: any = await res.json().catch(() => null)
@@ -970,6 +988,10 @@ function applyInner(ctx: AppContext, config: Config) {
   async function summarizeAndBroadcast(sid: string, turn: number, text: string): Promise<void> {
     if (summarizedTurns.has(turn)) return
     summarizedTurns.add(turn)
+    if (summarizedTurns.size > 32) { // 防无界增长：只需覆盖仍在等待判定的 turn
+      const f = summarizedTurns.values().next().value
+      if (f !== undefined && f !== turn) summarizedTurns.delete(f)
+    }
     const t0 = Date.now()
     let out = await reframeText(text, 'summary')
     if (!out) out = extractSpeakable(text) // 概括失败 → 播精简后的原文（跳过代码/日志/清单），仍好过念全文
@@ -990,6 +1012,10 @@ function applyInner(ctx: AppContext, config: Config) {
   function broadcastSummaryFallback(sid: string, turn: number, reason: string): void {
     if (summarizedTurns.has(turn)) return
     summarizedTurns.add(turn)
+    if (summarizedTurns.size > 32) {
+      const f = summarizedTurns.values().next().value
+      if (f !== undefined && f !== turn) summarizedTurns.delete(f)
+    }
     broadcast({ type: 'assistant', session: sid, text: '内容有点多，我先记下来，稍后说重点。', turn: `${turn}-sum` })
     appendErr(`[nori-pet] summary fallback (${reason}) turn=${turn} chars=${(turnSummaryText.get(turn) ?? '').length}`)
   }
