@@ -41,26 +41,110 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+# ⚠ 辅助函数必须在首次调用之前定义：PowerShell 以 -File 执行脚本时**不做**函数提升
+#   （实测 PS 5.1 与 PS 7 均抛 CommandNotFoundException），配合上面的 Stop 偏好即为
+#   终止性错误。曾致首次安装的交互引导在写配置那一步整段中断、配置文件从未生成。
+function Write-U8($Path, $Content) {
+  [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# JSON 字符串字面量：必须先转义反斜杠、再转义双引号。
+# 手拼 JSON 只转义 `"` 时，用户粘贴的 Windows 路径（C:\repo\...）会拼出非法转义
+# （\v 直接报错、\r 被静默吞成回车）→ 生成的 nori.config.json 无法解析。
+function JsonStr($v) {
+  # 顺序很重要：先转义反斜杠，再转义双引号，最后转义控制字符。
+  # 若先做控制字符（会插入 \uXXXX），后面的反斜杠转义会把插入的反斜杠再翻倍 → 产出非法 JSON。
+  $s = ($v -replace '\\', '\\') -replace '"', '\"'
+  # 控制字符（U+0000–U+001F）按 JSON 规范必须写成 \uXXXX。PowerShell 的 ConvertFrom-Json 会
+  # **宽容接受**裸 TAB，但插件侧用的是 Node 的 JSON.parse，它会报
+  # "Bad control character in string literal"，用户填的答案被静默丢弃 —— 正是本函数要消灭的那类 bug。
+  $s = [regex]::Replace($s, '[\u0000-\u001f]', [System.Text.RegularExpressions.MatchEvaluator] {
+    param($m) '\u' + ('{0:x4}' -f [int][char]$m.Value)
+  })
+  return '"' + $s + '"'
+}
+
 $Repo     = $PSScriptRoot
 $Pkg      = '@bubblesalt/dsh-nori-pet'
 $PkgShort = 'dsh-nori-pet'
+# 判定"某个 patch 条目是不是我们自己的"：只认**列 0 的**条目顶层 `- id:` 行。
+# ⚠ 绝不能按子串 'dsh-nori-pet' 匹配——那会把"注释里提到该名字 / 配置值里含该名字 /
+#   块标量里有该名字"的**其它插件条目**，乃至名字以它开头的**兄弟包**
+#   （如 @someone/dsh-nori-pet-extras）整块删掉，属静默数据丢失（已实测复现）。
+# ⚠ 这里**不能**写前导 `\s*`：`^\s*-\s*id:` 会命中别的条目里**嵌套**的 `- id: dsh-nori-pet`
+#   （例如宿主条目里的 insert: 列表），于是把宿主条目整块删掉（已实测复现）。
+#   锚定列 0 与本文件的分块方式 `'(?m)^(?=- )'` 保持一致。
+# ⚠ 必须容忍"冒号前有空格"（`- id : 'x'`，合法 YAML）与锚点（`- &a id: 'x'`）：
+#   漏认的后果是**写入重复条目**并在 js-yaml 关卡硬报错（已实测 ARRAY(n=2) mine=2）。
+#   列 0 锚 + 块内 id 行数恰好为 1 这两道保险已经兜住了放宽后的风险。
+$OursEntryRx = "(?m)^-\s*(?:&\S+\s+)?['""]?id['""]?\s*:\s*(?:&\S+\s+|![^\s]+\s+)?['""]?(?:@[\w.-]+/)?$([regex]::Escape($PkgShort))['""]?\s*(?:#.*)?$"
 $DshHome  = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
 $ProfRoot = Join-Path $DshHome "profiles\$Profile"
 if (-not (Test-Path $ProfRoot)) { throw "profile not found: $ProfRoot (use -Profile)" }
 
-# ---- 0) load nori.config.json（配置外置；文件缺失/损坏则全部走默认约定）----
+# ---- 0) load nori.config.json（配置外置；文件缺失/损坏则重新走配置引导）----
 $ConfigPath = Join-Path $Repo 'nori.config.json'
 $cfgFile = @{}
+$cfgLoaded = $false
 if (Test-Path $ConfigPath) {
-  try { $cfgFile = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json }
-  catch { Write-Warning "nori.config.json 解析失败，按默认约定继续：$($_.Exception.Message)" }
+  try {
+    $cfgRaw = Get-Content $ConfigPath -Raw -Encoding UTF8
+    $cfgFile = $cfgRaw | ConvertFrom-Json
+    # 只有**对象**才算有效配置：
+    #  · 空文件 / 字面量 null 会被解析成 $null（不抛错）；
+    #  · 顶层是数组/标量（如 `[1,2]`、`123`）也不是配置——数组经 PSObject 会暴露
+    #    Count/Length 等**适配器属性**，会被下面的 Count≠0 误判成"已有配置"，
+    #    于是引导同样再也不出现（与损坏 JSON 是同一类陷阱，实测 [1,2] → NeedGuide=False）。
+    #  · ⚠ 还要看**原文首字符**：PowerShell 7 的 ConvertFrom-Json 会把**单元素数组**展开，
+    #    `[{"modelDir":null}]` 于是变成一个 PSCustomObject，类型判定完全看不出它是数组
+    #    （2 元素才变 Object[]）——判定随数组**元素个数**摇摆。JSON 对象文档不可能以 `[`
+    #    开头，所以直接用原文拦，两个引擎行为一致（实测 PS7 下该文件曾骗过引导判定）。
+    #  · ⚠ 千万不要写成 `if ([string]$cfgRaw.TrimStart().StartsWith('['))`：那会被解析成
+    #    `[string](<bool>)` → 得到字符串 'False'，而**非空字符串在 PowerShell 里为真** →
+    #    分支永远命中，连正常配置都被当成数组（实测：正常配置被误判、引导判定全反）。
+    #    同时用 IsNullOrWhiteSpace 挡住空文件（Get-Content -Raw 对 0 字节文件返回 $null，
+    #    直接 .TrimStart() 会抛 "You cannot call a method on a null-valued expression"，
+    #    被 catch 兜成"解析失败"——结论虽然对，提示文案是错的）。
+    if ((-not [string]::IsNullOrWhiteSpace($cfgRaw)) -and $cfgRaw.TrimStart().StartsWith('[')) {
+      Write-Warning 'nori.config.json 顶层是数组（原文以 [ 开头），将重新进入配置引导。'
+      $cfgFile = @{}
+    } elseif ($null -eq $cfgFile) {
+      $cfgFile = @{}
+    } elseif (($cfgFile -is [System.Collections.IDictionary]) -or ($cfgFile -is [System.Management.Automation.PSCustomObject])) {
+      $cfgLoaded = $true
+    } else {
+      Write-Warning "nori.config.json 顶层不是对象（实际是 $($cfgFile.GetType().Name)），将重新进入配置引导。"
+      $cfgFile = @{}
+    }
+  } catch {
+    Write-Warning "nori.config.json 解析失败，将重新进入配置引导（不会被这个坏文件永久卡住）：$($_.Exception.Message)"
+    $cfgFile = @{}
+  }
 }
 
 # ---- 0b) 模型预检：Nori Live2D 模型不存在则拒绝安装 ----
+# modelDir 允许是**相对路径**。相对值必须相对**仓库**解析，绝不能相对调用者的 CWD：
+# 否则从别的目录运行（`& C:\path\dsh-nori-pet\install.ps1`）就会得到"模型缺失"的误导性中止 ——
+# 模型明明在仓库里，报错却让人去检查模型目录（已实测复现：沙箱内模型存在、配置写
+# "modelDir":"Nori_web"，仅因 CWD 不同即抛 模型缺失）。
+# 触发条件不夸大：本脚本自己**不写** modelDir（引导只写 refAudio/refPrompt/sovits/reframe；
+# nori.config.example.json 给的是空串 ""，走默认探测那一支）。所以受影响的是**手写过相对
+# modelDir 的配置**——但这写法很自然：overlay 的 assetsDir 用的正是 'Nori_web' 这种相对写法，
+# 而且本函数的报错文案本身就在引导用户去"仓库 Nori_web/ 目录"。
+function Resolve-ModelDir([string]$v) {
+  if (-not $v) { return '' }
+  if ([System.IO.Path]::IsPathRooted($v)) { return $v }
+  return (Join-Path $Repo $v)
+}
 # 优先用配置的 modelDir，否则探测仓库 Nori_web。缺失即抛错，避免"引导填半天最后才发现模型缺失"。
-$preModelDir = if ([string]$cfgFile.modelDir) { [string]$cfgFile.modelDir } else { Join-Path $Repo 'Nori_web' }
-if (-not (Test-Path (Join-Path $preModelDir 'Nori.model3.json'))) {
-  throw "Nori 模型缺失：未找到 Nori.model3.json（$preModelDir）。请先把 Live2D 模型放入仓库 Nori_web/ 目录（含 Nori.model3.json），再重跑本脚本。"
+$preModelDir = if ([string]$cfgFile.modelDir) { Resolve-ModelDir ([string]$cfgFile.modelDir) } else { Join-Path $Repo 'Nori_web' }
+# ⚠ Test-Path 会抛，不是只会返回 False：`a:b`（驱动器相对）→ "找不到驱动器"，
+#   UNC `\\…` → 真的发起 SMB 连接、失败时抛 "Access to the path … is denied"（实测，且对不可达
+#   主机要等 1.5 秒）。EAP=Stop 下这些都会盖掉本意要给的"Nori 模型缺失"提示。
+$preProbeOk = $false; $preProbeErr = ''
+try { $preProbeOk = [bool](Test-Path (Join-Path $preModelDir 'Nori.model3.json')) } catch { $preProbeErr = $_.Exception.Message }
+if (-not $preProbeOk) {
+  throw "Nori 模型缺失：未找到 Nori.model3.json（$preModelDir）。请先把 Live2D 模型放入仓库 Nori_web/ 目录（含 Nori.model3.json），再重跑本脚本。$(if ($preProbeErr) { "（探测该路径时报错：$preProbeErr）" })"
 }
 
 # ---- 0c) 配置引导：nori.config.json 缺失/为空时，交互式生成并让用户填写 ----
@@ -72,8 +156,13 @@ function Confirm-Prompt($label, $default) {
   if ($r -eq '') { return $default }
   return ($r -in @('y', 'yes', '是', '1'))
 }
-$cfgProps = @($cfgFile.PSObject.Properties)
-$NeedConfigGuide = -not (Test-Path $ConfigPath) -or ($cfgProps.Count -eq 0)
+# ⚠ 判断"是否已有配置"**必须**用显式标志 $cfgLoaded，不能写成
+#   `@($cfgFile.PSObject.Properties).Count -eq 0`：解析失败时 $cfgFile 退化成 @{}，
+#   而哈希表经 PSObject 暴露 7 个**适配器属性**（Count/Keys/Values/IsReadOnly/
+#   IsFixedSize/IsSynchronized/SyncRoot）→ Count≠0 → 引导再也不出现，
+#   用户被永久卡死在这个坏文件上（已实测：corrupt=Hashtable props=7 NeedGuide=False）。
+$cfgProps = if ($cfgLoaded) { @($cfgFile.PSObject.Properties) } else { @() }
+$NeedConfigGuide = (-not $cfgLoaded) -or ($cfgProps.Count -eq 0)
 $Interactive = -not [Console]::IsInputRedirected
 if ($NeedConfigGuide) {
   Write-Host ''
@@ -109,28 +198,65 @@ if ($NeedConfigGuide) {
       $aGsvBase = Read-Host '  ④ GPT-SoVITS 根目录 gsvBase（外部已有部署时填；回车=未配置，语音暂不可用）'
       $aVenvPy  = Read-Host '  ⑤ venv python 路径（回车=<gsvBase>/.venv/Scripts/python.exe）'
     }
+    # ⚠ ③ 选 yes 时，gsvBase/venvPy 是 install-sovits.ps1 写进 nori.config.json 的，
+    #   而 $aGsvBase/$aVenvPy 只在 else 分支被赋值、这里仍是空串。若不读回来，
+    #   下面第 157 行的整体覆盖会把刚写好的 sovits 段冲掉 → $SovitsConfigured 为 false
+    #   → patch 里没有 gsvBase/venvPy → 用户看着"语音引擎装好了"却始终没有声音。
+    if (-not $aGsvBase.Trim() -and -not $aVenvPy.Trim() -and (Test-Path $ConfigPath)) {
+      try {
+        $probe = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($probe.sovits) {
+          $aGsvBase = [string]$probe.sovits.gsvBase
+          $aVenvPy  = [string]$probe.sovits.venvPy
+          if ($aGsvBase -or $aVenvPy) { Write-Host "  已从 install-sovits.ps1 写入的配置读回 sovits 路径" }
+        }
+      } catch {
+        # 不能静默：读不回来还继续，就会用空值重建配置，把 install-sovits.ps1 刚写好的
+        # gsvBase/venvPy 丢掉（那正是这段读回代码要防的事）。
+        Write-Warning "读回 nori.config.json 的 sovits 失败，将按空值写入（可能丢失 gsvBase/venvPy）：$($_.Exception.Message)"
+      }
+    }
     # ⑥ 改写层开关（进配置，reframe: true/false 写入 patch）
     $aReframe = Confirm-Prompt '  ⑥ 是否启用 Nori 口吻改写层（assistant 输出先经 LLM 改写再朗读）？' $true
     $aApiKey  = Read-Host '  ⑦ 改写层 DeepSeek apiKey（回车=回退 dsh 内置 llm）'
     # 组装最小结构 JSON（手写字符串保留中文，不依赖 ConvertTo-Json 的 \u 转义）
+    # ⚠ 值一律经 JsonStr（转义 \ 与 "）：直接拼会因未转义反斜杠产出非法 JSON。
     $pairs = @()
-    if ($aRefAudio.Trim())  { $pairs += "`"refAudio`": `"$($aRefAudio.Trim() -replace '"', '\"')`"" }
-    if ($aRefPrompt.Trim()) { $pairs += "`"refPrompt`": `"$($aRefPrompt.Trim() -replace '"', '\"')`"" }
+    if ($aRefAudio.Trim())  { $pairs += "`"refAudio`": $(JsonStr $aRefAudio.Trim())" }
+    if ($aRefPrompt.Trim()) { $pairs += "`"refPrompt`": $(JsonStr $aRefPrompt.Trim())" }
     if ($aGsvBase.Trim() -or $aVenvPy.Trim()) {
       $sov = @()
-      if ($aGsvBase.Trim()) { $sov += "`"gsvBase`": `"$($aGsvBase.Trim() -replace '"', '\"')`"" }
-      if ($aVenvPy.Trim())  { $sov += "`"venvPy`": `"$($aVenvPy.Trim() -replace '"', '\"')`"" }
+      if ($aGsvBase.Trim()) { $sov += "`"gsvBase`": $(JsonStr $aGsvBase.Trim())" }
+      if ($aVenvPy.Trim())  { $sov += "`"venvPy`": $(JsonStr $aVenvPy.Trim())" }
       $pairs += "`"sovits`": { $($sov -join ', ') }"
     }
     $refSub = @("`"reframe`": $(if ($aReframe) { 'true' } else { 'false' })")
-    if ($aApiKey.Trim()) { $refSub += "`"apiKey`": `"$($aApiKey.Trim() -replace '"', '\"')`"" }
+    if ($aApiKey.Trim()) { $refSub += "`"apiKey`": $(JsonStr $aApiKey.Trim())" }
     $pairs += "`"reframe`": { $($refSub -join ', ') }"
     $json = "{ $($pairs -join ', ') }"
-    Write-U8 $ConfigPath $json
+    # 写前自检（硬中止）：宁可不写，也不能留下一个解析不了的配置把用户填的答案静默丢掉。
+    try { $null = $json | ConvertFrom-Json }
+    catch { throw "内部错误：生成的配置不是合法 JSON，已中止（未写入 $ConfigPath）：$($_.Exception.Message)" }
+    # 先写临时文件 → 读回校验 → 再原子替换。
+    # 旧写法是"直接覆盖、失败才报错"：中止时盘上已留下一个坏配置，而且下一轮
+    # $NeedConfigGuide 会因该文件存在而判定"已有配置"（解析失败时 $cfgFile 退化成 @{}，
+    # 哈希表的适配器属性让 Count≠0）→ 引导再也不出现，用户被卡死在这个坏文件上。
+    $tmpPath = "$ConfigPath.tmp"
+    Write-U8 $tmpPath $json
+    try { $cfgFile = Get-Content $tmpPath -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch {
+      Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue
+      throw "生成的配置读回解析失败，已中止（未改动 $ConfigPath）：$($_.Exception.Message)"
+    }
+    # 目标若是个**目录**，Move-Item -Force 会"成功"地把 tmp 塞进目录里（PS 5.1 实测），
+    # 脚本随后还打印"配置已生成"，而盘上根本没有配置文件。显式拦掉。
+    if (Test-Path $ConfigPath -PathType Container) {
+      Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue
+      throw "$ConfigPath 是一个目录，不是文件。请先移走/删除该目录再重跑。"
+    }
+    Move-Item $tmpPath $ConfigPath -Force
     Write-Host "  配置已生成: $ConfigPath"
     Write-Host '  （后续可直接编辑此文件，或对照 nori.config.example.json 增删项）'
-    try { $cfgFile = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json }
-    catch { Write-Warning "生成的配置解析失败：$($_.Exception.Message)（继续用默认约定）" }
   }
 }
 $ModelDir  = [string]$cfgFile.modelDir
@@ -144,20 +270,22 @@ $SovitsConfigured = ($GsvBase -ne '') -or ($VenvPy -ne '')
 # 无空格 staging path（dsh plugin -> pnpm 经 cmd.exe 转发，含空格的绝对路径会被拆断）
 $StagingLink = Join-Path $env:LOCALAPPDATA 'dsh-links\dsh-nori-pet'
 
-function Write-U8($Path, $Content) {
-  [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding($false)))
-}
-
 # ---- 1) resolve model / core ----------------------------------------------
 # 资产约定：模型/语音放仓库内占位目录（Nori_web/、voice/）；Live2D Core 是官方通用文件，
 # 仓库内不存在时自动下载官方 CDN（live2dcubismcore.min.js -> cubism_sdk/Core/live2dcubismcore.js）。
 $ModelGiven = ($ModelDir -ne '')
+# 同一处相对路径陷阱（见 0b 的注释）：配置里的相对 modelDir 也要相对仓库解析，
+# 否则 0b 放行、这里再抛，症状一样是"仓库里明明有模型却说取不到"。
+$ModelDir = Resolve-ModelDir $ModelDir
 if (-not $ModelDir) {
   $probe = Join-Path $Repo 'Nori_web'
   if (Test-Path (Join-Path $probe 'Nori.model3.json')) { $ModelDir = $probe }
 }
-if (-not $ModelDir -or -not (Test-Path (Join-Path $ModelDir 'Nori.model3.json'))) {
-  throw "model dir unavailable (nori.config.json modelDir 或仓库内 Nori_web)：$ModelDir"
+# ⚠ Test-Path 会抛而不是返回 False（驱动器相对 `a:b`、UNC 网络路径），见 0b 处的说明。
+$modelProbeOk = $false; $modelProbeErr = ''
+try { $modelProbeOk = [bool](Test-Path (Join-Path $ModelDir 'Nori.model3.json')) } catch { $modelProbeErr = $_.Exception.Message }
+if (-not $ModelDir -or -not $modelProbeOk) {
+  throw "model dir unavailable (nori.config.json modelDir 或仓库内 Nori_web)：$ModelDir$(if ($modelProbeErr) { "（探测该路径时报错：$modelProbeErr）" })"
 }
 # 模型完整性校验（只查不改，保证安装效果一致）：只适配原版 Nori_web——睡眠动作
 # 00_Sleep 在 Idle 组（idle 池一员），缺失时睡眠会退化（不出错但不闭眼），提示换回原版。
@@ -167,7 +295,12 @@ try {
   if (-not (($idleNames -match 'Sleep|EyeClosed').Count -gt 0)) {
     Write-Warning '模型 Idle 组缺少睡眠动作（00_Sleep/EyeClosed）；睡眠会退化，请使用 Nori_web 原版模型'
   }
-} catch { /* 校验失败不阻断 */ }
+} catch {
+  # 校验失败不阻断（模型能用则照装）。
+  # ⚠ 这里**不能**图省事写 `/* 校验失败不阻断 */`：PowerShell 没有 /* */ 注释语法，
+  #    它会被当成命令名 `/*` 执行 → CommandNotFoundException；本脚本 EAP=Stop，
+  #    于是"不阻断"变成"直接中止安装"（已实测，PS 5.1 与 7 都一样）。
+}
 $CoreFile = Join-Path $Repo 'cubism_sdk\Core\live2dcubismcore.js'
 if (-not (Test-Path $CoreFile)) {
   Write-Host '==> live2dcubismcore.js 缺失，从官方 CDN 下载（所有用户同一官方文件）...'
@@ -183,8 +316,27 @@ if (-not (Test-Path $CoreFile)) {
   }
   Write-Host "    core downloaded: $CoreFile"
 }
-# 写入 patch 的值：模型显式传参原样（可为绝对）；缺省探测命中则写相对仓库根的值（发布友好）。
-$CfgModel = if ($ModelGiven) { $ModelDir } else { 'Nori_web' }
+# 写入 patch 的值：**尽量写成仓库相对路径**——主机（src/index.ts resolveConfigPath）对相对
+# assetsDir 一律以仓库根为基准解析，绝对路径则原样用（见 1031-1038 行注释）。
+# ⚠ 这里曾经直接写 `$ModelDir`，而 $ModelDir 已被 Resolve-ModelDir 解析成绝对路径 →
+#   配置里被烤进机器专属路径（用户移动/重命名仓库后失效），而缺省分支写的却是相对的 'Nori_web'，
+#   同一份配置两种风格（对显式 modelDir 与缺省调用者的行为还不一致）。
+#   不为空的相对结果才用，反例：modelDir 恰好等于仓库根本身（Substring 后为空串）。
+# ⚠⚠ 前缀判定**必须带上分隔符**，不能只写 StartsWith($Repo)：兄弟目录只共享字符串前缀，
+#   实测仓库 `…\pre` + 模型 `…\pre-ext\Nori_web` → 算出 `'-ext\Nori_web'` 这种残缺相对路径，
+#   主机按仓库根解析后指向不存在的目录 → 桌宠资源 404，而安装照报成功。
+#   所以必须是 "$RepoRoot\" / "$RepoRoot/" 前缀；等值（模型就是仓库根）也不相对化。
+$RepoRoot = $Repo.TrimEnd([char[]]('\', '/'))
+$CfgModel = if ($ModelGiven) {
+  $rel = ''
+  foreach ($sep in @('\', '/')) {
+    if ($ModelDir.StartsWith($RepoRoot + $sep, [System.StringComparison]::OrdinalIgnoreCase)) {
+      $rel = $ModelDir.Substring(($RepoRoot + $sep).Length).TrimStart([char[]]('\', '/'))
+      break
+    }
+  }
+  if ($rel) { $rel } else { $ModelDir }
+} else { 'Nori_web' }
 $CfgCore  = 'cubism_sdk\Core\live2dcubismcore.js'
 Write-Host "model : $ModelDir"
 Write-Host "core  : $CoreFile"
@@ -237,8 +389,47 @@ $content   = ''
 if (Test-Path $patchPath) { $content = [System.IO.File]::ReadAllText($patchPath, [System.Text.Encoding]::UTF8) }
 
 $blocks = @($content -split '(?m)^(?=- )' | Where-Object { $_.Trim() -ne '' })
-$keep   = @($blocks | Where-Object { $_ -notmatch 'dsh-nori-pet' })
-$keep   = @($keep | ForEach-Object { $_ -replace '(?m)^\s*\[\s*\]\s*$', '' } | Where-Object { $_.Trim() -ne '' })
+# 只重写"**整块就是一个条目、且该条目是我们自己的**"的块（与 uninstall.ps1 对称）。两道保险：
+#  ① $OursEntryRx 锚定列 0 的 `- id:`（不带前导 \s*），避免命中别的条目里嵌套的
+#     `- id: dsh-nori-pet` 而删掉宿主条目；
+#  ② 块内 `- id:` 行数必须**恰好为 1**。若用户用**缩进写法**或**流式数组**写顶层数组，
+#     整份文件会落进同一个块，此时删掉"匹配到的那个块"等于删掉**所有**插件的条目。
+#     宁可留下旧条目 + 警告，也不能静默清空别人的配置。
+$keep   = @($blocks | Where-Object {
+  # ⚠ 必须用 -cmatch（大小写敏感）：dsh 装载器是按**小写** entry.id 建表的
+  #   （dsh-app-boot: `if (entry.id) entryMap.set(entry.id, entry)`），所以 `- ID:` 那条
+  #   根本不是我们的条目，不该被当作"我们的块"处理。默认的 -match 是**大小写不敏感**的，
+  #   而下面的计数用 [regex]::Matches（大小写敏感）——两边口径不一致就会自相矛盾
+  #   （实测 `- ID: 'dsh-nori-pet'` → 匹配=真、计数=0）。
+  if (-not ($_ -cmatch $OursEntryRx)) { return $true }
+  # ⚠ 计数只数**列 0** 的 `- id:`（与 $OursEntryRx 的锚点一致），不能带前导 `\s*`：
+  #   带上就会把块内**嵌套**的 `- id: xxx` 也算进来（例如 config 里的 routeTable 列表），
+  #   于是"我们的块"被判成"不止一个条目"→ 不删、再追加一条重复 → 被自己的
+  #   「恰好一条」断言卡死（实测 exit=1 overlay validation failed，且每次重跑都一样）。
+  #   去掉前导 \s* 后：缩进写法/流式数组的计数仍为 0 → 照样走"保留 + 警告"那条安全路径。
+  $entryIds = ([regex]::Matches($_, '(?m)^-\s*(?:&\S+\s+)?[''"]?id[''"]?\s*:\s*\S')).Count
+  return ($entryIds -ne 1)
+})
+# 与 uninstall.ps1 对称：判定条件与"是否删了东西"解耦——只要**改写后**的文本里仍有
+# 一处 `id:` 指名本包，就会出现重复条目，必须出声（旧写法只在"一条都没删"时警告）。
+# 结尾用分隔符前瞻而非 `$`：流式写法 `{id: 'x'}` 后面紧跟 `}`，用 `$` 会漏掉；
+# 分隔符集合不含 `-`，兄弟包 `dsh-nori-pet-extras` 不会被误报。
+# ⚠ 三处放宽都是为了"别漏报"（漏报 = 静默报成功，最坏）：
+#   · `['""]?id['""]?`：JSON 写法 `{"id": "@bubblesalt/dsh-nori-pet"}` 也是合法 YAML，
+#     旧式 `id\s*:` 被键名后的引号挡住 → 实测整条残留**零警告**；
+#   · `(?:&\S+\s+)?`：值上带锚点 `- id: &nori 'dsh-nori-pet'` 同样漏过；
+#   · `^[^#\r\n]*?`：只在**非注释行**上判定——`# 注意：id: dsh-nori-pet 那条是旧的`
+#     这种纯提示性注释不该喊狼来了（误报会让真警告失去意义）。锚定行首故不受影响。
+$keptText = ($keep -join '')
+$leftoverRx = "(?m)^[^#\r\n]*?(?<![\w$])['""]?id['""]?\s*:\s*(?:&\S+\s+)?(?:![^\s']+\s+)?['""]?(?:@[\w.-]+/)?$([regex]::Escape($PkgShort))['""]?(?=[\s,'""\]\}#]|$)"
+if ($keptText -cmatch $leftoverRx) {
+  Write-Warning "cordis.patch.yml 里仍有一处 id: 指向 '$PkgShort'，本脚本没能安全改写它（可能用了缩进写法、流式数组，或该名字包在别的条目的 insert: 里）——即将写入的条目可能与之重复。请手动检查：$patchPath"
+}
+# 剥掉**顶层**（列 0）的独立 `[]` 占位行——历史上旧版 uninstall 无条件追加过它，留下的坏文件。
+# ⚠ 必须锚定列 0：写成 `^\s*\[\s*\]\s*$` 会把别的插件条目里**嵌套的**空序列
+#   （如 `  config:\n    list:\n      []`）一并删掉，静默改掉别人的配置（已实测 → list: null）。
+# 允许行尾注释：`[] # was empty` 这种残留同样会让整份文件变成非法 YAML。
+$keep   = @($keep | ForEach-Object { $_ -replace '(?m)^\[\s*\]\s*(?:#.*)?$', '' } | Where-Object { $_.Trim() -ne '' })
 
 # 语音默认目录约定（发布友好，不依赖任何旧数据）：未配置 refAudio 时，
 # 探测仓库内 voice/ 目录的第一个 wav（与 Nori_web、cubism_sdk、GPT-SoVITS 同一套约定），
@@ -254,7 +445,36 @@ if (-not $RefAudio) {
   }
 }
 
-function Y($v) { return "'" + ($v -replace "'", "''") + "'" }
+# 单引号 YAML 标量。⚠ 但**含换行的值必须换成双引号 + \n 转义**：
+# personaPrompt / refPrompt 这类文本值天然可能多行，而单引号标量里的裸换行会让
+#   (a) 续行落在**列 0** —— 若该行以 `- ` 开头，本脚本下一轮切块 `(?m)^(?=- )` 就把它
+#       当成新条目：实测 personaPrompt 写 "- 保持简短 / - 不要自称AI" 时，三轮安装把
+#       overlay 从 2 条撑到 6 条，数组里多了字符串元素，而每轮都报 entries=N + Install done；
+#   (b) YAML 折叠把换行**变成空格**（实测 js-yaml 读回来是 "…宠物。 - 保持简短 - 不要自称AI"），
+#       即使用户没写 `- `，值也被静默改掉。
+# 双引号标量把 \n 写成转义序列 → 整条配置只占一行，绝不与切块器打架，且原值可无损还原。
+function Y($v) {
+  $s = [string]$v
+  # YAML c-printable 之外的控制字符（含 DEL 与 C1 段）
+  $ctrl = '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]'
+  if ($s -match "[`r`n]" -or $s -match $ctrl) {
+    $e = $s -replace '\\', '\\'
+    $e = $e -replace '"', '\"'
+    # ⚠ CR 与 LF 必须**分别**转义，不能把 CRLF 一律压成 \n：那样读回来是 LF，值被静默改写
+    #   （实测 "l1`r`nl2" 往返后变成 "l1`nl2"）。YAML 双引号标量支持 \r，可以无损。
+    $e = $e -replace "`r", '\r'
+    $e = $e -replace "`n", '\n'
+    $e = $e -replace "`t", '\t'
+    # ⚠ 剩下的控制字符**必须**转成 \uXXXX。上一版的致命自相矛盾：判断条件里列出了
+    #   0x00-0x08/0x0B/0x0C/0x0E-0x1F（意思是"这些得走双引号分支"），分支里却只转义了
+    #   \ " CR LF TAB —— 于是 VT/FF/NUL/ESC/BEL 被**原样**写进双引号标量，js-yaml 直接抛
+    #   "expected valid JSON character" / "null byte is not allowed in input"，install 从一份
+    #   普通的 nori.config.json 起就永久卡死（且报的是"条目数不对"这种错误诊断）。
+    $e = [regex]::Replace($e, $ctrl, [System.Text.RegularExpressions.MatchEvaluator] { param($m) '\u' + ([int][char]$m.Value).ToString('x4') })
+    return '"' + $e + '"'
+  }
+  return "'" + ($s -replace "'", "''") + "'"
+}
 $cfg = @()
 $cfg += "    assetsDir: $(Y $CfgModel)"
 $cfg += "    coreFile: $(Y $CfgCore)"
@@ -287,13 +507,28 @@ if ($Origins -is [array] -and $Origins.Count -gt 0) {
 # 未填的键跳过 → 插件用源码默认（默认：reframeApiKeyRef=DEEPSEEK_NORI_API_KEY，解析到即直连官方 API，否则回退 dsh llm）。
 $ReframeCfg = $cfgFile.reframe
 if ($ReframeCfg) {
-  foreach ($k in @('reframe', 'reframeProvider', 'reframeModel', 'reframeApiKeyRef', 'reframeBaseUrl', 'reframeTimeoutMs', 'reframeMaxInput', 'reframeTrace')) {
+  # ⚠ reframeMaxTokens 必须在这个白名单里：Config schema 有它（z.number().default(2048)）且
+  #   src 里真的用它当 max_tokens（"思考链占满 max_tokens" 那条报错就指着它）。此前漏出名单 →
+  #   用户明明在 nori.config.json 里写了 4096，会被**静默丢弃**、退回 2048。
+  foreach ($k in @('reframe', 'reframeProvider', 'reframeModel', 'reframeApiKeyRef', 'reframeBaseUrl', 'reframeTimeoutMs', 'reframeMaxInput', 'reframeMaxTokens', 'reframeTrace')) {
     $v = $ReframeCfg.$k
     if ($null -eq $v) { continue }
     if ($v -is [bool]) { $cfg += "    ${k}: $(if ($v) { 'true' } else { 'false' })"; continue }
-    if ($v -is [int] -and $v -gt 0)  { $cfg += "    ${k}: $v"; continue }
-    if ($v -is [double] -and $v -gt 0 -and [math]::Abs($v - [math]::Round($v)) -lt 1e-9) { $cfg += "    ${k}: $([int]$v)"; continue }
-    if ($v -is [int] -or $v -is [double]) { continue }  # 0/负数/非整数 → 视为未设置，跳过（防 '0' 字符串被 z.number 拒绝）
+    # ⚠ 数值判定**不能**只认 [int]/[double]：pwsh 7 的 ConvertFrom-Json 把 60000 反序列化成
+    #   **Int64**（PS 5.1 是 Int32），于是 `-is [int]` / `-is [double]` / "是数字就跳过" 三条全 False，
+    #   直接掉到下面的字符串分支 → 写出 `reframeTimeoutMs: '60000'`。宿主 schema 是 z.number()，
+    #   字符串会让**整份 config 校验失败 → cordis 把该条目置为 INACTIVE → Nori 根本不挂载**，
+    #   而脚本照样打印 Install done（真实 nori.config.json 里就是 60000，下一次 pwsh 安装即触发）。
+    #   实测：PS5.1 Int32/Decimal，pwsh Int64/Double，大整数两边都是 Int64。
+    if ($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [single] -or $v -is [decimal]) {
+      $d = [double]$v
+      # 只接受正数：z.number() 收 0/负数也合法，但 0 在这里意味着"没配"，语义上跳过更安全。
+      if ($d -gt 0) {
+        if ([math]::Abs($d - [math]::Round($d)) -lt 1e-9) { $cfg += "    ${k}: $([long][math]::Round($d))"; continue }
+        # 非整数正数：不写（旧的 [double] 分支同样是"跳过"）——避免小数点在不同区域设置下写成逗号
+      }
+      continue
+    }
     $s = [string]$v
     if ($s -eq '') { continue }
     $cfg += "    ${k}: $(Y $s)"
@@ -309,15 +544,42 @@ if ($ReframeKey) {
   $CredPath = Join-Path $DshHome '.credentials.yaml'
   if (-not (Test-Path $DshHome)) { New-Item -ItemType Directory $DshHome -Force | Out-Null }
   $lines = @()
-  if (Test-Path $CredPath) { $lines = @([System.IO.File]::ReadAllLines($CredPath, [System.Text.Encoding]::UTF8)) }
-  else { $lines = @('version: 1', 'refs:') }
-  $hit = -1
-  for ($i = 0; $i -lt $lines.Count; $i++) {
-    if ($lines[$i] -match '^\s*DEEPSEEK_NORI_API_KEY\s*:') { $hit = $i; break }
+  # 行尾沿用原文件的（与 patch 写入同理）：旧写法一律用 `n 拼回去，会把 CRLF 的凭据文件
+  # 整份改成 LF。⚠ 仍然用 ReadAllLines 拆行（它认得 CRLF/LF/单独 CR 三种），只把"拼接用的
+  # 行尾"改成从原文探测 —— 换成自己 -split 会因为不认单独 CR 而把整份文件粘成一行、进而
+  # 把 API key 追加到错误位置（那是比行尾严重得多的问题）。
+  $credEol = "`n"
+  $credExists = Test-Path $CredPath
+  if ($credExists) {
+    $credRaw = [System.IO.File]::ReadAllText($CredPath, [System.Text.Encoding]::UTF8)
+    if ($credRaw -match "`r`n") { $credEol = "`r`n" }
+    elseif ($credRaw -match "`r") { $credEol = "`r" }
+    $lines = @([System.IO.File]::ReadAllLines($CredPath, [System.Text.Encoding]::UTF8))
   }
   $keyLine = '  DEEPSEEK_NORI_API_KEY: ' + $ReframeKey
-  if ($hit -ge 0) { $lines[$hit] = $keyLine } else { $lines += $keyLine }
-  Write-U8 $CredPath (($lines -join "`n") + "`n")
+  # ⚠ 旧写法是**无条件追加到最后一行**：它默认"文件里必有 refs:，且 refs: 是最后一个顶层键"。
+  #   两种情况都会把整份凭据库写坏（实测）：
+  #     ① 没有 refs: 段（如只有 version: 1）→ 追加出 "version: 1\n  KEY: sk-…" →
+  #        js-yaml: bad indentation of a mapping entry → **整个凭据库不可解析**；
+  #     ② refs: 后面还有别的顶层段 → 我们的 key 被塞进**后面那个段**里（缩进恰好合法，静默错位，
+  #        dsh 的 credentials 服务永远解析不到 → API key 形同没写）。
+  #   现在：定位顶层 refs: 行 → 有就在它**正下方**插入/就地更新；没有就补一个 refs: 段。
+  $refsIdx = -1; $hit = -1
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($refsIdx -lt 0 -and $lines[$i] -match '^refs\s*:\s*(#.*)?$') { $refsIdx = $i }
+    if ($lines[$i] -match '^\s*DEEPSEEK_NORI_API_KEY\s*:') { $hit = $i; break }
+  }
+  if ($hit -ge 0) {
+    $lines[$hit] = $keyLine                      # 已存在 → 就地替换（位置不变，不会挪段）
+  } elseif ($refsIdx -ge 0) {
+    $lines = @($lines[0..$refsIdx]) + @($keyLine) + $(if ($refsIdx + 1 -lt $lines.Count) { @($lines[($refsIdx + 1)..($lines.Count - 1)]) } else { @() })
+  } else {
+    # 没有 refs: 段：空文件/不存在 → 补上标准头部；已有其它内容 → 末尾另起一个顶层 refs: 段
+    if (-not $credExists -or ($lines -join '').Trim() -eq '') { $lines = @('version: 1', 'refs:') }
+    else { $lines = @($lines) + @('', 'refs:') }
+    $lines += $keyLine
+  }
+  Write-U8 $CredPath (($lines -join $credEol) + $credEol)
   Write-Host "credentials: DEEPSEEK_NORI_API_KEY -> $CredPath"
 } else {
   Write-Host 'credentials: reframe.apiKey 未填，跳过（现有 DEEPSEEK_NORI_API_KEY 保持不变）'
@@ -327,19 +589,30 @@ if ($ReframeKey) {
 # config 子键缩进 4 空格。禁止 update:/insert: 包装（非法字段会被静默跳过 → patch 从未生效：
 # 曾致 refAudio 从未注入，直连 9880 正常但 /api/speak 一直 502 tts http 400）。
 # 插件行本身由 bundle 层装配，这里只重写该行的 config（restate 全部字段，patch 是整块替换）。
-$entry = "- id: '$Pkg'`n  config:`n" + ($cfg -join "`n")
+# ⚠ 行尾必须沿用原文件（与 uninstall.ps1 对称）：旧写法在这里硬编码 `n，而 $keep 里的保留块
+#   带着原文件的 CRLF —— 结果是"保留块 CRLF、我们这条裸 LF"的混合行尾（实测写完 15 处裸 LF）。
+#   YAML 合法，但没有理由制造混合行尾；别处（uninstall）已经这么做了，install 漏了。
+$eol = if ($content -match "`r`n") { "`r`n" } else { "`n" }
+$entry = "- id: '$Pkg'$eol  config:$eol" + ($cfg -join $eol)
 
 $out = @()
 if ($keep.Count -gt 0) { $out += ($keep -join '') }
 $out += $entry
-Write-U8 $patchPath (($out -join "`n") + "`n")
-Write-Host "overlay written: $patchPath"
+$patchText = ($out -join $eol) + $eol
 
-# ---- 5) structural validation with dsh's own yaml --------------------------
+# ---- 5) 写盘前校验 + 备份 + 原子替换 ---------------------------------------
+# ⚠ 顺序很重要：旧写法是"先覆盖 $patchPath，再用 js-yaml 校验"，一旦校验失败就已经
+#   把 profile 的 patch 层写坏了，而且 install.ps1 从不留备份（uninstall.ps1 留）——
+#   此时 dsh plugin add 早已执行、credentials 也已写入，脚本却以非零码退出，
+#   用户以为"什么都没发生"。现在改为：先写临时文件 → 校验临时文件 → 备份 → 原子替换。
+#   校验不过就整份不落地，profile 保持原样。
 # 探测 dsh CLI 自带 js-yaml（不写死 npm 全局根路径；找不到则跳过校验，仅给警告）
 $jsyaml = ''
 $dshCmd = Get-Command dsh -ErrorAction SilentlyContinue
-if ($dshCmd) {
+# ⚠ $dshCmd.Source 可能为空（dsh 被解析成别名/函数时）：Split-Path -Parent '' 会抛
+#   "Cannot bind argument to parameter 'Path' because it is an empty string"，
+#   EAP=Stop 下会在**最后一步**中止安装（前面全都成功了）。
+if ($dshCmd -and $dshCmd.Source) {
   $dshDir = Split-Path $dshCmd.Source -Parent
   foreach ($c in @(
     (Join-Path $dshDir 'node_modules\@deepseek-ai\dsh\node_modules\js-yaml'),
@@ -348,12 +621,76 @@ if ($dshCmd) {
     if (Test-Path $c) { $jsyaml = $c; break }
   }
 }
+$tmpPatch = "$patchPath.tmp"
+Write-U8 $tmpPatch $patchText
+# ⚠ 有 js-yaml 不代表有 node：校验器本身是 `node -e`。node 不在 PATH 时旧写法会在这里抛
+#   "术语 'node' 不会被识别为…"（EAP=Stop）→ **安装死在最后一步**（此时 dsh plugin add 与
+#   凭据写入都已经发生），而且 $gateCode 根本没机会赋值、exit 码→诊断的 switch 也跑不到，
+#   与"找不到 js-yaml 就大声警告并跳过"的既定策略自相矛盾。这里把 node 也一起探测。
+$nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+$jsyaml = if ($nodeCmd) { $jsyaml } else { '' }
 if ($jsyaml) {
-  node -e "const fs=require('fs');const y=require(process.argv[1]);const p=y.load(fs.readFileSync(process.argv[2],'utf8'));if(!Array.isArray(p))process.exit(3);const e=p[0];if(!e||!e.id||!e.config)process.exit(4);console.log('overlay valid: id='+e.id);" $jsyaml $patchPath
-  if ($LASTEXITCODE -ne 0) { throw 'overlay validation failed (js-yaml)' }
+  # 校验**我们这条**条目，不是 p[0]。我们的条目是 append 在最后的，别的插件条目可能排在前头，
+  # 用 p[0] 等于在校验别人的条目（旧写法：多条目 patch 下这个校验基本没有意义）。
+  # 顺带断言两件事：
+  #  ① "恰好一条 id=<我们>"：若因缩进/流式写法没能清掉旧条目，这里立刻暴露，而不是留两条重复 id；
+  #  ② **每个元素都必须是对象**：dsh 的 Loader patch 是"对象数组"，出现字符串元素说明文件
+  #     已经被写坏了。旧写法只数我们自己的条目，于是实测这种坏文件（多行字符串被换行截断 →
+  #     列 0 的 `- xxx` 被下一轮切块器当成新条目）会被判为"valid … entries=4"并报 Install done，
+  #     用户的 patch 数组里就静静躺着字符串垃圾。注意这里**只要求是对象**、不要求带 id：
+  #     真实环境里可能存在靠 name 等字段、没有小写 id 的条目（装载器会跳过它们），
+  #     要求带 id 会把这类合法文件误判成坏文件而阻断安装。
+  # ⚠ 必须用 **dsh 自己那套 schema** 解析：dsh 装载 patch 用的是
+  #   cordis-plugin-include 里的 `yaml.JSON_SCHEMA.extend(JsExpr)`（自定义 !!js 标量类型，
+  #   见 dsh-base/dsh-headless/dsh-web-app 自带的 cordis.patch.yml，它们自己就在用 !!js）。
+  #   上一版这里用 js-yaml 的**默认** schema → 用户 patch 里只要有一处合法的 !!js
+  #   （哪怕属于别的插件，或从 dsh 自带文件抄来的），校验就抛
+  #   "unknown tag !<tag:yaml.org,2002:js>"，install/uninstall **永久**卡死，
+  #   而且报出来的原因是"条目数不对"——完全指错方向。
+  #   现在：schema 与 dsh 对齐（只多认 !!js，不放松任何结构要求），并且把失败原因
+  #   分门别类打出来（exit 3/4/5/6/7 各对应一条准确诊断）。
+  $jsGate = "const fs=require('fs');const y=require(process.argv[1]);const Js=new y.Type('tag:yaml.org,2002:js',{kind:'scalar',resolve:d=>typeof d==='string',construct:d=>({__jsExpr:d})});const sch=y.JSON_SCHEMA.extend(Js);let p;try{p=y.load(fs.readFileSync(process.argv[2],'utf8'),{schema:sch});}catch(e){console.log('PARSE_FAIL: '+String(e.message).split('\n')[0]);process.exit(7);}if(!Array.isArray(p)){console.log('NOT_ARRAY');process.exit(3);}if(!p.every(e=>e&&typeof e==='object'&&!Array.isArray(e))){console.log('BAD_ELEMENTS');process.exit(6);}const m=p.filter(e=>e.id===process.argv[3]);if(m.length!==1){console.log('ID_COUNT: '+m.length);process.exit(4);}if(!m[0].config||typeof m[0].config!=='object'||Array.isArray(m[0].config)){console.log('NO_CONFIG');process.exit(5);}console.log('overlay valid: id='+m[0].id+' entries='+p.length);"
+  # ⚠ EAP 是 Stop，而 node 会往 stderr 写 YAMLException：直接 2>&1 会变成**终止性**
+  #   NativeCommandError（实测），必须把偏好临时降下来再取输出。
+  $eapPrev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try { $gateOut = (& node -e $jsGate $jsyaml $tmpPatch $Pkg 2>&1 | Out-String).Trim(); $gateCode = $LASTEXITCODE }
+  finally { $ErrorActionPreference = $eapPrev }
+  if ($gateCode -ne 0) {
+    Remove-Item $tmpPatch -Force -ErrorAction SilentlyContinue
+    $why = switch ($gateCode) {
+      3 { 'overlay 顶层不是数组（dsh 的 Loader patch 要求"对象数组"）' }
+      4 { "overlay 里 id=$Pkg 的条目不是恰好一条——最可能的原因：该文件的顶层序列是**缩进写法**或**流式写法**（`  - id:` / `[{id: …}]`），本脚本只认列 0 的 `- ` 切块，改不动它。为免误删你的其它条目，这里选择整份不落地" }
+      5 { "id=$Pkg 的条目缺少 config 段" }
+      6 { 'overlay 里存在**不是条目对象**的元素（缺 id 的字符串/标量）——常见原因：多行文本值曾被换行截断，或该文件是历史坏文件' }
+      7 { "overlay 不是本校验器能解析的 YAML：$gateOut" }
+      default { "未知校验失败（exit $gateCode）：$gateOut" }
+    }
+    throw "overlay validation failed (js-yaml, exit $gateCode)：$why；已放弃写入，$patchPath 保持原样。请手工清理该文件后重跑。"
+  }
+  # ⚠ 成功时也要把 node 的那行打出来：改成"捕获输出"之后，用户再也看不到
+  #   "overlay valid: id=… entries=N" 了 —— 前一版是直接把 node 的 stdout 透到控制台。
+  #   校验悄悄发生而没有任何可见证据，等于把"校验过了"这条信息弄丢了（自测时才发现）。
+  Write-Host $gateOut
 } else {
-  Write-Warning 'js-yaml 未在 dsh 安装目录找到，跳过 overlay 结构校验（不阻塞安装）'
+  if (-not $nodeCmd) {
+    Write-Warning 'node 不在 PATH（校验器是 node 脚本），跳过 overlay 结构校验（不阻塞安装）——本次 overlay 未被校验，请自行确认 profile/cordis.patch.yml 仍是合法的对象数组。'
+  } else {
+    Write-Warning 'js-yaml 未在 dsh 安装目录找到，跳过 overlay 结构校验（不阻塞安装）——本次 overlay 未被校验，请自行确认 profile/cordis.patch.yml 仍是合法的对象数组。'
+  }
 }
+if (Test-Path $patchPath) {
+  Copy-Item $patchPath "$patchPath.bak" -Force
+  Write-Host "overlay backup: $patchPath.bak"
+}
+try {
+  Move-Item $tmpPatch $patchPath -Force
+} catch {
+  # 原子替换失败（例如目标被别的进程占着）：原文件没动，但别把 .tmp 留在 profile 目录里
+  # 冒充正常文件。备份**故意保留**（它等于未改动的原文件，删备份比留垃圾更危险）。
+  Remove-Item $tmpPatch -Force -ErrorAction SilentlyContinue
+  throw "overlay 写入失败（$patchPath 未被改动，原文件保持原样；备份保留在 $patchPath.bak）：$($_.Exception.Message)"
+}
+Write-Host "overlay written: $patchPath"
 
 Write-Host ''
 Write-Host 'Install done (official dsh plugin + overlay).'
