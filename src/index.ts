@@ -91,8 +91,8 @@ export const Config = z.object({
    * 改写层输入/输出追踪日志（排障用，**默认开启**）。
    *
    * 内容与落点：每轮对话的原文与改写结果各截 500 字，写进
-   * `~/.dsh/logs/nori-pet/nori-pet-trace.log`。**自带长度上限**：超过 900 条就从最旧删到 400 条
-   *（约 1.1MB → 500KB），整个日志目录超 8MB 时再删最旧的文件（见 enforceLogBudget）。
+   * `~/.dsh/logs/nori-pet/nori-pet-trace.log`。**自带长度上限**：超过 1MB 就从最旧删到约 512KB
+   *（约留最近 500 轮），整个日志目录超 8MB 时再删最旧的文件（见 enforceLogBudget）。
    * 所以长期开着也不会无限增长——需要翻"刚才那句为什么这么念"时，历史就在手边。
    * 不想要这些内容落盘就设 false（nori.config.json 的 `reframe.trace` 支持热改）。
    */
@@ -799,31 +799,34 @@ function applyInner(ctx: AppContext, config: Config) {
   // 迁到 ~/.dsh/logs/nori-pet/（DSH_HOME 未设置则用 ~/.dsh）
   const logDir = () => join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'logs', 'nori-pet')
   try { mkdirSync(logDir(), { recursive: true }) } catch { /* ignore */ }
-  // 日志条数内存计数（文件裁剪阈值 100 → 保留 50）
-  const errCount = { n: 0 }
   /** 最近一次 reframeText 读到的 trace 开关（nori.config.json 可热改）：
    * traceSummary 在 reframeText 之后调用，用它跟主开关保持一致 */
   let lastTraceOn = config.reframeTrace
-  /** trace 文件当前条数（内存计数，避免每次写都读盘数一遍） */
-  let traceCount = 0
 
-  // ── trace 日志：单文件 + 行数硬上限 ──
-  // 追踪日志用于排障，但**必须自带上限**：早期版本是 5 个 slot 轮转、每个只按"条数"裁剪，
-  // 总量无上限，且热重载会把 slot 指针重置回 0 → 同一个文件被反复续写，实测长到 1MB 还在涨。
+  // ── 日志结构（详见 README「🔒 隐私：哪些东西留在磁盘上」）──
+  //   nori-pet-trace.log    改写层每轮的 IN/OUT 原文（各截 500 字）—— 排障主力
+  //   nori-pet-summary.log  原文→概括的压缩比与摘要样本
+  //   nori-pet-error.log    错误摘要（含 URL/模型名/堆栈片段）
+  // 三者各自**自带上限**（见 trimLogBySize），另有目录总预算 8MB。
   //
-  // 现在只有**一条规则**：单文件超过 TRACE_MAX_ENTRIES 条就从最旧删到 TRACE_KEEP_ENTRIES 条。
-  // 为什么不按字节设阈值：字节阈值必须配"裁到多少字节"，两者挨太近会抖动
-  //（刚裁到目标、下一次写入又贴上限 → 每条都读写一遍 1MB 文件）。行数上限单调、可一眼证明有界，
-  // 实际体积由"每条 ≤ 约 1.2KB（IN/OUT 各 500 字）"封顶 —— 400 条 ≈ 500KB。
+  // 历史教训（都是"看着有上限、其实没有"）：
+  //  1) trace 曾是 5 个 slot 轮转、按条数裁、总量无上限，且 slot 指针是模块级变量、
+  //     热重载即重置回 0 → 同一文件被反复续写，实测涨到 1MB。
+  //  2) error/summary 用的是"满 100 条裁到 50 条"，计数器同样活不过一次热重载 →
+  //     实测 error.log 涨到 677 条仍无人裁。故现在统一按**字节**判（每次 stat 一下即可，
+  //     不依赖任何跨实例状态）。字节阈值只保留下限、不做"裁到刚好"，避免在上限附近抖动。
   const TRACE_FILE = 'nori-pet-trace.log'
-  const TRACE_MAX_ENTRIES = 900 // 超过即裁剪（实测约 1.1MB 触发一次）
-  const TRACE_KEEP_ENTRIES = 400 // 裁剪后保留最新（约 500KB）
+  const TRACE_MAX_BYTES = 1 << 20 // 单文件超 1MB 即裁剪
+  const TRACE_KEEP_BYTES = 512 << 10 // 裁到约 512KB（保留最新，按记录块切分）
+  const ERROR_MAX_BYTES = 512 << 10
+  const ERROR_KEEP_BYTES = 256 << 10
+  const SUMMARY_MAX_BYTES = 256 << 10
+  const SUMMARY_KEEP_BYTES = 128 << 10
   const LOG_BUDGET = 8 << 20 // 日志目录总预算 8MB：超了就删最旧的文件
-  const TRACE_ENTRY_RE = /(?=^\[\d{4}-\d{2}-\d{2}T)/m
   const tracePath = join(logDir(), TRACE_FILE)
 
-  /** 载入现有条数（启动时一次），并做一次总体预算检查 */
-  function initTraceLog(): void {
+  /** 启动清理：收掉旧版多文件轮转留下的文件，并做一次目录预算检查 */
+  function initLogs(): void {
     try {
       // 旧版是「nori-pet-trace.1.log ~ .4.log + slot 文件」多文件轮转，总量无上限。
       // 改成单文件后这些旧文件不会再被写入，留着只会让人分不清哪个是当前日志 → 顺手收掉。
@@ -831,28 +834,21 @@ function applyInner(ctx: AppContext, config: Config) {
       for (let s = 1; s < 10; s++) {
         try { unlinkSync(join(logDir(), `nori-pet-trace.${s}.log`)) } catch { /* 可能不存在 */ }
       }
-      if (existsSync(tracePath)) {
-        const raw = readFileSync(tracePath, 'utf8')
-        traceCount = raw.split(TRACE_ENTRY_RE).filter((b) => b.trim()).length
-      }
+      // 启动即把"已经超限的历史遗留文件"收进上限内：否则要等到下次写入才裁，
+      // 期间用户看到的就是个超标文件（本次就是这么发现 error.log 涨到 677 条的）。
+      traceTrim()
+      trimLogBySize(join(logDir(), 'nori-pet-error.log'), ERROR_MAX_BYTES, ERROR_KEEP_BYTES)
+      trimLogBySize(join(logDir(), 'nori-pet-summary.log'), SUMMARY_MAX_BYTES, SUMMARY_KEEP_BYTES)
       enforceLogBudget()
     } catch { /* ignore */ }
   }
 
   /**
-   * 单文件裁剪：条数超上限就从最旧删起，保留最新 TRACE_KEEP_ENTRIES 条。
-   * 返回裁剪后条数；未超限返回 null（跳过读盘，正常路径零额外开销）。
+   * 单文件裁剪：超 TRACE_MAX_BYTES 就从最旧删到 TRACE_KEEP_BYTES 附近（保留最新）。
+   * 每次 stat 一下判是否超限，未超即返回（正常路径不读盘）。
    */
-  function traceTrim(): number | null {
-    try {
-      if (traceCount + 1 <= TRACE_MAX_ENTRIES) return null
-      const blocks = readFileSync(tracePath, 'utf8').split(TRACE_ENTRY_RE).filter((b) => b.trim())
-      const slice = blocks.slice(-TRACE_KEEP_ENTRIES)
-      writeFileSync(tracePath, slice.join(''), 'utf8')
-      traceCount = slice.length
-      enforceLogBudget()
-      return traceCount
-    } catch { return null }
+  function traceTrim(): void {
+    trimLogBySize(tracePath, TRACE_MAX_BYTES, TRACE_KEEP_BYTES)
   }
 
   /**
@@ -875,36 +871,53 @@ function applyInner(ctx: AppContext, config: Config) {
         if (total <= LOG_BUDGET) break
         try { unlinkSync(x.p) } catch { /* ignore */ }
         total -= x.size
-        if (x.p === tracePath) traceCount = 0
         log(`[dsh-nori-pet] 日志超出预算，已删除最旧：${x.f}（${Math.round(x.size / 1024)}KB）`)
       }
     } catch { /* ignore */ }
   }
 
-  initTraceLog()
+  initLogs()
 
-  /** 日志自动裁剪：连续写入 MAX 条后保留最新 KEEP 条（按 ISO 时间戳行切记录块），防无限膨胀 */
-  function pruneLogFile(p: string, countRef: { n: number }, max = 100, keep = 50): void {
-    countRef.n += 1
-    if (countRef.n < max) return
+  /**
+   * 文本日志自动裁剪（trace / summary / error 共用）：**按字节上限**，超了就从最旧删到保留目标。
+   *
+   * 为什么不再按"条数"计：条数需要一个跨写入累加的计数器，而计数器活在插件实例里 ——
+   * 热重载/重启就归零，于是"满 100 条才裁"几乎永远不触发。实测 error.log 已涨到 677 条无上限。
+   * 字节上限每次 stat 一下就能判，不依赖任何跨实例状态，也不怕条目长短悬殊
+   *（error.log 里是堆栈，一条可能上千字节）。
+   */
+  function trimLogBySize(p: string, maxBytes: number, keepBytes: number): void {
     try {
+      if (!existsSync(p) || statSync(p).size <= maxBytes) return
       const raw = readFileSync(p, 'utf8')
       const blocks = raw.split(/(?=^\[\d{4}-\d{2}-\d{2}T)/m).filter((b) => b.trim())
-      if (blocks.length > keep) writeFileSync(p, blocks.slice(-keep).join(''), 'utf8')
-      countRef.n = blocks.length > keep ? keep : blocks.length
-    } catch { countRef.n = keep }
+      let kept = blocks.length
+      let total = 0
+      // 从后往前累计保留量：一直删到"累计不足 keepBytes"为止，且**至少留最后 1 条**。
+      // 注意不能写成"一超就 break"——那样遇到单条大于 keepBytes 的情况会只留极少条数，
+      // 体积仍贴着 max，于是下次写入又触发裁剪（既抖动又留不住历史）。实测就是这么翻车的。
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        const len = blocks[i]!.length
+        if (total + len > keepBytes && i < blocks.length - 1) break
+        total += len
+        kept = i
+      }
+      const slice = blocks.slice(kept)
+      if (slice.length) writeFileSync(p, slice.join(''), 'utf8')
+    } catch { /* ignore */ }
   }
 
   function appendErr(line: string): void {
+    const p = join(logDir(), 'nori-pet-error.log')
     try {
-      appendFileSync(join(logDir(), 'nori-pet-error.log'), '[' + new Date().toISOString() + '] ' + line + '\n')
+      appendFileSync(p, '[' + new Date().toISOString() + '] ' + line + '\n')
     } catch { /* ignore */ }
-    pruneLogFile(join(logDir(), 'nori-pet-error.log'), errCount)
+    trimLogBySize(p, ERROR_MAX_BYTES, ERROR_KEEP_BYTES)
   }
 
   /**
    * 改写层输入/输出追踪：材料→改写结果，两列记录（IN=当前块材料本体、OUT=改写输出）。
-   * 存储在单文件 `nori-pet-trace.log`，超 1MB 自动从最旧删到 512KB（见 TRACE_MAX_BYTES）。
+   * 存储在单文件 `nori-pet-trace.log`，超 1MB 自动从最旧删到约 512KB（见 TRACE_MAX_BYTES）。
    *
    * ⚠ 这条日志写的是**对话原文**（各截 500 字），只在排障时有用；不想要就设
    * `nori.config.json` 的 `reframe.trace = false`。
@@ -919,23 +932,18 @@ function applyInner(ctx: AppContext, config: Config) {
       const entry = `[${new Date().toISOString()}] (${ms}ms)${tag} fp=${fp}\nIN : ${input.slice(0, 500)}\nOUT: ${output.slice(0, 500)}\n────\n`
       traceTrim() // 先裁后写：文件始终在上限内
       appendFileSync(tracePath, entry)
-      traceCount += 1
     } catch { /* ignore */ }
   }
 
   /** 概括层追踪：原文→概括输出，用"压缩比"验证是否真的省了朗读时间。
-   * 与 traceReframe 同开关（traceOn）：这里同样会写原文片段，属隐私面，默认关。
-   * 计数用独立对象：原先与 trace 共用一个计数器，会把 trace 的行数当成 summary 的条数，
-   * 于是 summary 日志几乎每次都被判定"超上限"而裁剪，日志被反复重写。 */
-  const summaryCount = { n: 0 }
+   * 与 traceReframe 同开关（traceOn）：这里同样会写原文片段，默认随 reframe.trace 走。 */
   function traceSummary(raw: string, out: string, ms: number, on: boolean): void {
     try {
       if (!on) return
       const ratio = raw.length ? Math.round((out.length / raw.length) * 100) : 0
       const p = join(logDir(), 'nori-pet-summary.log')
       appendFileSync(p, `[${new Date().toISOString()}] (${ms}ms) 原文${raw.length}字 → 概括${out.length}字（压缩到 ${ratio}%）\nRAW: ${raw.slice(0, 300)}\nSUM: ${out.slice(0, 300)}\n────\n`)
-      summaryCount.n += 1
-      pruneLogFile(p, summaryCount)
+      trimLogBySize(p, SUMMARY_MAX_BYTES, SUMMARY_KEEP_BYTES)
     } catch { /* ignore */ }
   }
 

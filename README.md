@@ -242,12 +242,18 @@ GPT-SoVITS 是本地语音合成引擎（TTS）——Nori 用它把文字念成�
 
 本插件会把一些内容落到磁盘，请按自己的接受度处理：
 
-| 落点 | 内容 | 默认 | 怎么关/清 |
+| 落点 | 内容 | 默认 | 上限（自动裁剪，无需手动清） |
 |---|---|---|---|
-| `nori.config.json`（仓库目录内） | 改写层 `apiKey` **明文**、你的端点地址、参考音频路径 | 安装时若填了就写入 | 不填 apiKey（改用 dsh credentials）；已被 `.gitignore` 屏蔽，**用 git 发布/分享不会带出去**（整目录打包才会） |
-| `~/.dsh/logs/nori-pet/nori-pet-trace.log` | **对话原文与改写结果各截 500 字**，用来复盘"刚才那句为什么这么念" | 开 | **自带长度上限**：超 900 条就从最旧删到 400 条（约 1.1MB → 500KB），日志目录超 8MB 再删最旧文件。想静默就设 `reframe.trace = false`（热改生效），或直接删文件 |
-| `~/.dsh/logs/nori-pet/nori-pet-summary.log` | 概括压缩比与概括输出（同样含对话内容） | 开 | 跟随上面的 `reframe.trace` 开关 |
-| `~/.dsh/logs/nori-pet/nori-pet-error.log` | 错误摘要（含 URL/模型名，可能含配置片段） | 开 | 排障用；满 100 条自动只留最新 50 条 |
+| `nori.config.json`（仓库目录内） | 改写层 `apiKey` **明文**、你的端点地址、参考音频路径 | 安装时若填了就写入 | 不适用；不填 apiKey 可改用 dsh credentials。已被 `.gitignore` 屏蔽，**用 git 发布/分享不会带出去**（整目录打包才会） |
+| `~/.dsh/logs/nori-pet/nori-pet-trace.log` | **对话原文与改写结果各截 500 字**，用来复盘"刚才那句为什么这么念" | 开 | 超 **1MB** 就从最旧删到约 **512KB**（约留最近 500 轮） |
+| `~/.dsh/logs/nori-pet/nori-pet-summary.log` | 概括压缩比与概括样本（同样含对话内容） | 开 | 超 **256KB** 删到约 **128KB**；跟随 `reframe.trace` 开关 |
+| `~/.dsh/logs/nori-pet/nori-pet-error.log` | 错误摘要（含 URL/模型名/堆栈片段） | 开 | 超 **512KB** 删到约 **256KB** |
+
+三套日志共用一个目录，**目录总量再有 8MB 兜底**：超了按修改时间删最旧的文件。
+所有上限都**按字节判定**（每次写入 stat 一下即可），因此不依赖任何内存计数器——
+早先按"满 N 条"判，计数器随热重载归零，实测 trace 涨到 1MB、error 涨到 677 条都没被裁掉。
+
+想彻底不留对话原文：设 `nori.config.json` 的 `reframe.trace = false`（热改生效，无需重装），或直接删文件。
 
 **分享时**：走 git（clone / 仓库链接）是安全的——上面这些都在 `.gitignore` 里；
 只有「把整个文件夹打包发人」才会把 `nori.config.json`（明文 key）与日志一起带走。
