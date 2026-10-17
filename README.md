@@ -86,20 +86,22 @@ git clone <仓库地址>
 ## ⚙️ 配置
 
 所有配置外置在 `nori.config.json`（复制 `nori.config.example.json` 得到；本机文件不进 git）。
-**留空 = 走默认约定**（探测仓库内资产）；改了之后重跑 `.\install.ps1` 生效。
+**留空 = 走默认约定**（探测仓库内资产）。
+- **热生效**（改完即生效，无需重跑安装）：`reframe.apiKey`、`reframe.reframeBaseUrl`、`reframe.reframeModel`、`reframe.reframeMaxTokens`、`reframe.reframeTimeoutMs`、`ttsTemperature`、`ttsTopK`、`ttsSpeedFactor`、`refAudio`、`refPrompt`、`sovits.t2sWeights`、`sovits.vitsWeights`——这些键宿主每次请求/每次守护周期直读该文件。
+- **需重跑 `.\install.ps1`**：其余键（如改写层开关 `reframe.reframe`、`maxSentence`、`ttsUrl`、`gsvBase`、`persona*`、`ttsWatch*`、`allowedOrigins`）会被写进 profile 的 `cordis.patch.yml`，只有重装才更新。
 - 安装前**先检测 `Nori_web` 模型**（`Nori.model3.json`）——缺失直接拒绝安装；
 - 首次若没有 `nori.config.json`（或为空），`install.ps1` 会**交互式引导**逐项询问：声线 wav、转写文本、**是否安装 GPT-SoVITS**（约 2~3GB，可选默认权重另约 1GB+，同意则顺手调用 `install-sovits.ps1` 部署并写配置）、**改写层开关**、改写层 apiKey，并自动生成该文件；非交互环境（如 CI）自动跳过询问、全部走默认约定。
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `assetsDir` / `coreFile` | 空（探测 `Nori_web/`、`cubism_sdk/Core`） | 模型目录 / core 文件，绝对或相对仓库根 |
+| `modelDir` | 空（探测 `Nori_web/`） | 模型目录，绝对或相对仓库根。安装时由 `install.ps1` 换算为 patch 的 `assetsDir`（Live2D core 文件路径由安装脚本自动探测，不在本文件里配置） |
 | `ttsUrl` | `http://127.0.0.1:9880/tts` | GPT-SoVITS 地址（api_v2 端点） |
 | `refAudio` / `refPrompt` | 空（留空自动探测 `voice/` 下的 wav） / `你好,初次见面,我的名字是Nori` | 声线 wav 路径与其转写文本 ⚠ 见下方[参考音频须知](#参考音频须知refaudio--refprompt) |
 | `sovits.gsvBase` / `sovits.venvPy` | 空（探测 `GPT-SoVITS/`） | 守护拉起 api_v2 用的目录与 venv python |
 | `sovits.t2sWeights` / `sovits.vitsWeights` | 空 / 空 | 推理权重路径（GPT 模型 s1 / SoVITS 模型 s2；见[GPT-SoVITS 章节](#gpt-sovits可选)） |
 | `personaPrompt` / `personaReframe` | 空（探测 `persona/`） | 人设文件路径覆盖 |
 | `maxSentence` / `ttsTemperature` / `ttsTopK` / `ttsSpeedFactor` | 140 / 0.9 / 12 / 1.0 | 断句与合成参数，多数无需改动（0.9/12 为防 AR 循环卡顿的推荐值，勿降回低温低 top_k） |
-| `ttsWatch` / `ttsWatchIntervalMs` | true / 30000 | 9880 掉线守护：30s 内自动拉起 api_v2 |
+| `ttsWatch` / `ttsWatchIntervalMs` | true / 30000 | 9880 掉线守护：探测到服务不可达才自动拉起 api_v2（探测间隔下限 5000ms；判断依据是"能否拿到 HTTP 响应"，4xx/5xx 均视为存活） |
 | `allowedOrigins` | 空数组 | 非本机来源访问 WS/API 时的放行主机名（见[安全边界](#安全边界本地服务)） |
 
 <a id="参考音频须知refaudio--refprompt"></a>
@@ -124,10 +126,13 @@ git clone <仓库地址>
 默认开启：把 assistant 输出改写成 Nori 的说话方式再朗读。
 
 - **总开关**：`nori.config.json` 的 `reframe.reframe`（`true` 开 / `false` 关）；关闭后直接朗读原文。
+  ⚠ 该键在安装时被写进 profile 的 `cordis.patch.yml`（运行期读的是那里），**改完必须重跑 `.\install.ps1`**；改完即时生效的只有 `reframe.apiKey` / `reframeBaseUrl` / `reframeModel` / `reframeMaxTokens` / `reframeTimeoutMs`。
 - **API**：优先直连 **DeepSeek 官方 API**。在 `nori.config.json` 的 `reframe.apiKey` 填入你的 key，
   安装脚本会自动写入 dsh 的 credentials（`DEEPSEEK_NORI_API_KEY` ref），卸载脚本会一并移除——全程不用手动开文件；
   留空则自动回退到 dsh 内置 llm 服务（`deepseek-official` / `deepseek-chat`，与主会话共用计量）。
-- **流式分批（低延迟）**：句子成句即攒批（~150 字或 1.2s 无新句就改写广播），长 turn 中途就开始播；断句保序，无标点长段按自然断点软切——不会从英文单词中间劈开。
+  ⚠ 提示：`reframe.apiKey` 以**明文**保存在仓库目录内的 `nori.config.json`（已被 `.gitignore` 屏蔽，不会进 git），
+  但整个目录拷贝/打包/转发会带走它——介意的话把 key 直接写进 dsh credentials 并把该键留空。
+- **流式分批（低延迟）**：逐字流来自 dsh 的 `agent/assistant-stream`（会话格式 v2 起顶层 `assistant/chunk` 事件已废弃），句子成句即攒批（≤500 字或 1.2s 无新句就改写广播），长 turn 中途就开始播；断句保序，无标点长段按自然断点软切——不会从英文单词中间劈开。
 - **防幻觉**：改写指令内置约束——只讲材料里真实有的内容；进行中的动作（"正在检查…"）不虚构完成结果，检查/验证类描述不自造结论。
 - **人设**：system 提示来自 `persona/prompt.txt`（授权文本，用户放置）+ `persona/reframe.txt`（改写任务指令，随仓库提供）；
   授权文本缺失时改写层自动关闭，直接朗读原文。

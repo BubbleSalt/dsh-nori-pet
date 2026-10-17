@@ -1,0 +1,12 @@
+# PowerShell 脚本一律：以 LF 存入 Git，检出为 CRLF。
+#
+# 为什么需要这条：这些 .ps1 里含中文，且目标是 Windows PowerShell 5.1。
+#  - 必须带 UTF-8 BOM（无 BOM 时 5.1 按 ANSI 代码页 936 读，中文变乱码并直接解析失败）；
+#  - 仓库里存 LF、工作区用 CRLF。
+# 这两点原先只靠本机 core.autocrlf=true 兜着：贡献者若 autocrlf=false，会把 CRLF 提交进仓库，
+# 之后别人检出、或脚本被复制/打包，行尾就不可预测。写死在这里就与本地 git 配置无关了。
+# （BOM 无法用 .gitattributes 表达，只能靠约定 + 提交前自查。）
+#
+# 只声明 *.ps1：其当前工作区状态就是 CRLF、仓库里是 LF，加这条不产生任何改动；
+# 其余文件维持现状（不做 `* text=auto`，那会重写全仓库的规范化策略）。
+*.ps1   text eol=crlf

@@ -1,10 +1,13 @@
 {
-  "_comment": "Nori 桌宠安装配置（install.ps1 读取）。留空 = 使用默认约定（探测仓库内 Nori_web/、voice/、core 自动下载）。复制本文件为 nori.config.json 后编辑；nori.config.json 不进 git（含机器路径）。⚠ refAudio 与 refPrompt 必须配套：refPrompt 是 refAudio 那段音频的逐字转写文本，换 refAudio 必须同步换 refPrompt，否则会跳字/吞句/音色漂移。",
+  "_comment": "Nori 桌宠安装配置（install.ps1 读取）。留空 = 使用默认约定（探测仓库内 Nori_web/、voice/、core 自动下载）。复制本文件为 nori.config.json 后编辑；nori.config.json 不进 git（含机器路径）。⚠ refAudio 与 refPrompt 必须配套：refPrompt 是 refAudio 那段音频的逐字转写文本，换 refAudio 必须同步换 refPrompt，否则会跳字/吞句/音色漂移。⚠ detailMaxChars/summaryEnabled：一段连续输出超过 detailMaxChars 字就只播一次概括（不再逐句念全文），避免 dsh 输出长文时朗读几分钟；两者互斥，不会出现「前半详细、后半快进」。",
   "modelDir": "",
   "refAudio": "",
   "refPrompt": "你好,初次见面,我的名字是Nori",
   "ttsUrl": "http://127.0.0.1:9880/tts",
   "maxSentence": 140,
+  "detailMaxChars": 400,
+  "summaryEnabled": true,
+  "summaryWaitMs": 8000,
   "ttsTemperature": 0.9,
   "ttsTopK": 12,
   "ttsSpeedFactor": 1.0,
@@ -21,7 +24,7 @@
     "vitsWeights": ""
   },
   "reframe": {
-    "_comment": "人设改写层（可选，默认开启）。把 assistant 输出改写为 Nori 口吻后朗读：填 apiKey（DeepSeek 官方 key）由安装脚本自动写入 dsh credentials 的 DEEPSEEK_NORI_API_KEY ref → 直连官方 API（独立计量，与主会话互不影响）；留空则自动回退 dsh 内置 llm（与主会话共用计量）。其余键全部留空即用默认值，无需填。卸载脚本会同时移除该 credentials ref。",
+    "_comment": "人设改写层（可选，默认开启）。把 assistant 输出改写为 Nori 口吻后朗读。填 apiKey（任意 OpenAI 兼容端点的 key）即直连、独立计量、与主会话 token 互不影响：默认端点 DeepSeek 官方（reframeBaseUrl=https://api.deepseek.com/v1、reframeModel=deepseek-chat），也可换成任意 OpenAI 兼容端点（自建中转或第三方聚合，形如 https://your-endpoint.example.com/v1）。⚠ 请选非推理/快模型（如 Qwen3.8-Flash、MiniMax-M3）——推理型模型（DeepSeek-V4-*、GLM-5.x、Kimi-K3 等）思维链会吃光 max_tokens 导致输出为空/超时。apiKey 也可直接写进本文件 reframe.apiKey（明文、运行时直读、立即生效）；配置了 apiKey 后改写失败会降级朗读原文、绝不回退主会话计量；apiKey 留空才回退 dsh 内置 llm（与主会话共用计量）。其余键全部留空即用默认值，无需填。",
     "apiKey": "",
     "reframe": true,
     "reframeProvider": "",
@@ -30,6 +33,7 @@
     "reframeBaseUrl": "",
     "reframeTimeoutMs": 0,
     "reframeMaxInput": 0,
-    "reframeTrace": true
+    "reframeMaxTokens": 0,
+    "reframeTrace": false
   }
 }

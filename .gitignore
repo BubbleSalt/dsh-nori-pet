@@ -4,11 +4,18 @@ node_modules/
 dist/
 *.tsbuildinfo
 *.tgz
+# 压缩包一律不入库：仓库内的 *.rar/*.7z/*.zip 往往是模型/声线/人设的打包备份，
+# 属授权第三方资产（README「许可与第三方资产」承诺不入库、不随 Release 分发）。
+*.rar
+*.7z
+*.zip
 
 # ── 本地缓存 / 备份（不入库）───────────────────
 .npm-cache/
 .backup-*/
 *.bak*
+# install.ps1 写 nori.config.json 时先落 .tmp 再原子替换；进程被杀可能残留
+*.tmp
 
 # ── 本机日志与排障痕迹 ──────────────────────────
 *.log
