@@ -974,6 +974,10 @@ function applyInner(ctx: AppContext, config: Config) {
   //    assistant/message.stream），实时逐字流改由 agent 作用域的 `agent/assistant-stream`
   //    发布（进程本地、非持久）：start 帧带 turn/step，chunk 帧带 frame.chunk（StreamChunk）。
   //    只认 session/event 的旧代码因此永不触发 → chunk 分批改写/中途播放全部失效。──
+  //   ⚠ `agent/assistant-stream` 是 **scope-filtered** 事件（`this: Scoped<Agent>`）：
+  //     agent 作用域内的监听器只收自己那个 agent。插件在**外层作用域**注册，必须显式
+  //     `{ global: true }` 才能收到任何 agent 的帧——漏掉这个参数时监听器永不触发、
+  //     且不报错（旧版因此整条流式播报静默，是"长内容一口气读完"的根因之一）。
   const attemptTurn = new Map<string, { turn: number; step: number }>()
   ;(ctx as any).on('agent/assistant-stream', (payload: any) => {
     const frame = payload?.frame
@@ -991,10 +995,18 @@ function applyInner(ctx: AppContext, config: Config) {
     if (frame.type === 'end') { attemptTurn.delete(String(frame.attemptId)); return }
     if (frame.type !== 'chunk') return
     const c = frame.chunk
-    if (!c || c.type !== 'text-delta' || typeof c.text !== 'string' || !c.text) return
+    if (!c || typeof c.type !== 'string') return
     const ts = attemptTurn.get(String(frame.attemptId))
-    pushChunk(sid, ts?.turn ?? 0, ts?.step ?? 0, c.text)
-  })
+    const feed = (text: string): void => { if (text) pushChunk(sid, ts?.turn ?? 0, ts?.step ?? 0, text) }
+    // 协议（实测当前 DSH）：文本不走 text-delta，而是 `block-end` 携带整块内容：
+    //   { type:'block-end', index, block:{ type:'text'|'reasoning'|'tool-call', text } }
+    // 旧的 `text-delta` 分支保留兼容（其他 provider/版本可能仍发增量）。
+    if (c.type === 'text-delta') { if (typeof c.text === 'string') feed(c.text); return }
+    if (c.type !== 'block-end') return
+    const block = c.block
+    if (!block || block.type !== 'text' || typeof block.text !== 'string') return // 只播正文：reasoning 规划与 tool-call 参数不朗读
+    feed(block.text)
+  }, { global: true })
   const delayedSub = setTimeout(() => {
     ;(ctx as any).on('session/event', (session: any, event: any) => {
       eventCount += 1
