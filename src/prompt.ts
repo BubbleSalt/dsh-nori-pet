@@ -22,6 +22,42 @@ export interface PersonaConfig {
   personaReframe?: string
 }
 
+/**
+ * 解析两个人设文件的实际路径（空串 = 未找到）。
+ * 供"启动加载 + 请求时热读"两处共用：规则改一句就能听出来，不必重载插件。
+ */
+export function resolvePersonaPaths(repoRoot: string, cfg: PersonaConfig = {}): { promptPath: string; reframePath: string } {
+  const locate = (v: string | undefined, fallback: string): string => {
+    if (v) return isAbsolute(v) ? v : resolve(repoRoot, v)
+    const p = join(repoRoot, fallback)
+    return existsSync(p) ? p : ''
+  }
+  return {
+    promptPath: locate(cfg.personaPrompt, join('persona', 'prompt.txt')),
+    reframePath: locate(cfg.personaReframe, join('persona', 'reframe.txt')),
+  }
+}
+
+/**
+ * 热读改写任务指令（persona/reframe.txt）。
+ *
+ * 为什么单独热读这一个文件：它是**调风格的旋钮**——嫌啰嗦、嫌太短、语气不对，改的都是它。
+ * 启动只读一次的话，每次调风格都要重载插件，试错成本高到没人愿意调。
+ * 文件很小（几 KB），每个改写请求读一次可忽略；读失败就退回启动时的副本，不影响链路。
+ * 人设 system prompt（prompt.txt）较大且不常改，仍然只在启动时读。
+ */
+export function readReframeHot(reframePath: string, cached: string): string {
+  if (!reframePath) return cached
+  try {
+    const s = readFileSync(reframePath, 'utf8')
+    const stripBom = (t: string) => (t.charCodeAt(0) === 0xfeff ? t.slice(1) : t)
+    const t = stripBom(s)
+    return t.trim() ? t : cached
+  } catch {
+    return cached
+  }
+}
+
 export function loadPersona(repoRoot: string, cfg: PersonaConfig = {}): Persona | null {
   const locate = (v: string | undefined, fallback: string): string => {
     if (v) return isAbsolute(v) ? v : resolve(repoRoot, v)

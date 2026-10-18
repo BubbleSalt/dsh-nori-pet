@@ -57,7 +57,8 @@
     "test:guard": "node scripts/guard-release.mjs",
     "test:smoke": "node scripts/smoke-test.mjs",
     "guard": "node scripts/guard-release.mjs",
-    "guard:staged": "node scripts/guard-release.mjs --staged"
+    "guard:staged": "node scripts/guard-release.mjs --staged",
+    "test:reframe": "node scripts/test-reframe-brevity.mjs && node scripts/test-reframe-brevity.mjs --long"
   },
   "exports": {
     ".": {

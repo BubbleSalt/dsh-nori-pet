@@ -21,7 +21,7 @@ import { extractSpeakable } from './speakable.js'
 import { toSpeakable } from './speakText.js'
 import type { Socket } from 'node:net'
 import { homedir } from 'node:os'
-import { loadPersona } from './prompt.js'
+import { loadPersona, resolvePersonaPaths, readReframeHot } from './prompt.js'
 import { buildRuntimeTtsConfig } from './modelPreset.js'
 
 // 宿主以 ESM 方式被 loader import（无 __dirname），用 import.meta.url 推导包目录
@@ -380,6 +380,8 @@ function applyInner(ctx: AppContext, config: Config) {
   if (!config.enabled) return
   // 人设资产（persona/ 或配置覆盖）；缺失 → 改写层降级为原文朗读（启动即判定，进程内只读一次）
   const persona = loadPersona(dirname(HOST_DIR), { personaPrompt: config.personaPrompt, personaReframe: config.personaReframe })
+  // 改写任务指令的路径（persona/reframe.txt）：每次改写请求热读一次，改风格无需重载插件
+  const personaPaths = resolvePersonaPaths(dirname(HOST_DIR), { personaPrompt: config.personaPrompt, personaReframe: config.personaReframe })
   if (!persona) log('[dsh-nori-pet] persona 人设文件缺失（persona/prompt.txt 或 persona/reframe.txt），改写层关闭：直接朗读原始输出')
   const clients = new Set<PetClient>()
   const chunkedSteps = new Set<string>() // 已走流式处理的 step（assistant/message 兜底防重复）
@@ -683,7 +685,7 @@ function applyInner(ctx: AppContext, config: Config) {
     const t0 = Date.now()
     const input = text.length > config.reframeMaxInput ? text.slice(0, config.reframeMaxInput) + '……' : text
     const userContent = input
-    const system = persona.prompt + '\n\n' + persona.reframe + (mode === 'summary' ? '\n\n' + SUMMARY_RULES : '')
+    const system = persona.prompt + '\n\n' + readReframeHot(personaPaths.reframePath, persona.reframe) + (mode === 'summary' ? '\n\n' + SUMMARY_RULES : '')
 
     // 运行时直读 nori.config.json reframe 段（明文，可随时改无需重装）：
     // apiKey / reframeBaseUrl / reframeModel / reframeMaxTokens / reframeTimeoutMs / reframeTrace
