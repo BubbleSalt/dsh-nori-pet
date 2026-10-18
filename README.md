@@ -144,10 +144,37 @@ dsh 输出很快（约 300 token/s ≈ 450 字/秒），而中文朗读只有约
 
 ### 朗读文本规整（speak 自动处理，无需配置）
 
-`/api/speak` 在送 TTS 前会自动做两处规整，均无需配置：
+`/api/speak` 在送 TTS 前会自动规整文本，均无需配置。分为**两段**：
 
-- 句尾无标点时补"。"，便于 cut5 分句；
-- **中英混排保护**：英文词会让 AR 对齐失败、有约 75% 概率跳过其前面的中文片段（如"会自己移除那条 ref"→ 丢掉"会自己移除那条"）。因此中文与英文词（≥2 字符，不误伤"C盘"）之间会自动补逗号强制分片，并把反引号 `` ` `` 清掉。实测把读出率从 ~25% 提到 ~90%+。
+**一、可朗读性清理**（`src/speakText.ts`）——解决"偶尔念出听不懂的外星文"。
+
+根因不在采样参数，而在 **GPT-SoVITS 中文前端会把非汉字字符整段删掉**：删完残句太短，
+AR 就开始自由发挥。实机取证（合成 → 用 faster-whisper 回转成汉字 → 比相似度）：
+
+| 文本 | 模型实际念出的 | 相似度 |
+| --- | --- | --- |
+| `https://github.com/BubbleSalt/dsh-nori-pet` | 想尽太刺激哈,坎坷不受DSHNORI PATCH的抵制 | 0.20 |
+| `npm run build` | 施行三批耳门斗都行啦 | 0.12 |
+| `C:/…/AppData/Roaming/npm` | 路径是CU325update 互联攀片这里 | 0.33 |
+| `嗯……唔……那个……` | 嗯~~~n-n-n-n-n-n-n-n | 0.11 |
+
+对应处理（顺序有讲究）：
+
+- **URL / 路径 / 命令行 / 代码块** → 换成可朗读说法（"某个链接""某个路径""那句命令"）或直接删；
+  代码块整段丢弃——逐字符念代码必然怪音，内容价值也低。
+- **符号按读音替换**：`→`→"变成"、`≥`→"大于等于"、`|`→"或"、`==`→"等于"。
+- **Markdown 只是格式**：`**` `#` `>` 反引号与列表序号（`1.` `- `）都剥掉。
+- **数字/小数/版本号/百分号/`3~5` 一律不动**——交给前端 PaddleSpeech NSW，它做得更好
+  （`0.9`→"零点九"、`90%`→"百分之九十"）。插件侧再转一次会变成"90百分之"，反而更差。
+- **没有可朗读内容就静默跳过**（HTTP 204）：纯语气词（"嗯…唔…那个…"）、纯符号串
+  （`****----====`）、纯 emoji。**宁可不出声，也不吐怪音**。
+
+**二、中英混排保护**——英文词会让 AR 对齐失败，有约 75% 概率跳过其前面的中文片段
+（如"会自己移除那条 ref"→ 丢掉"会自己移除那条"）。因此中文与英文词（≥2 字符，不误伤"C盘"）
+之间会自动补逗号强制分片。实测把读出率从 ~25% 提到 ~90%+。
+
+> 采样参数（`ttsTemperature` / `ttsTopK`）保持 0.9 / 12：**这已是防 AR 循环的推荐值，
+> 不要降回低温低 top_k**。外星文问题在文本层，不在参数层。
 
 ### 改写层（Nori 口吻）
 
@@ -233,10 +260,40 @@ GPT-SoVITS 是本地语音合成引擎（TTS）——Nori 用它把文字念成�
 |---|---|
 | 语音 502 `tts http 400` | api_v2 强制要求参考音频：把 wav 放进 `voice/` 或配置 `refAudio` 后重跑 install |
 | 跳字/吞句（某小段中文不读，中英混排时更明显） | 多为 `refPrompt` 与 `refAudio` 不配套（转写文本和音频内容对不上）：改成一致即可；speak 已内置混排逗号规整兜底 |
-| 某字被拖长后吞句（"嗯/唔"等鼻音） | AR 采样循环：确认 `ttsTemperature`/`ttsTopK` 不低于 0.9/12（speak 已内置拖长自动重试兜底） |
+| 某字被拖长后吞句（"嗯/唔"等鼻音） | AR 采样循环：确认 `ttsTemperature`/`ttsTopK` 不低于 0.9/12（speak 已内置拖长自动重试兜底）；**纯语气词句子现在会直接跳过不合成**（实测合成必然出怪音） |
 | 语音 503 `tts offline` | 9880 不可达：`Test-NetConnection 127.0.0.1 -Port 9880`；ttsWatch 会在 30s 内自动拉起 |
+| 念出听不懂的"外星文" | 文本层问题（URL/路径/命令/符号被前端剥光后 AR 自由发挥）：`src/speakText.ts` 已内置清理；新增可疑句式请用 `node scripts/test-tts-quality.mjs` 回归 |
 | 睡眠睁眼 / 头每 3 秒回正 | 已适配原版模型解决（睡眠动作在 Idle 组，配 `setIsLoop(true)` 稳住）；换成别的模型会睡眠退化 |
 | 日志 | 错误：`~/.dsh/logs/nori-pet/nori-pet-error.log`；改写追踪：`~/.dsh/logs/nori-pet/nori-pet-trace*.log`（**默认关闭**，见下方隐私说明） |
+
+### 🔊 声音引擎回归工具（排障用）
+
+合成质量是**可测量**的，不靠耳朵猜：
+
+```powershell
+# 1) 单句探针：合成 + 波形分析（时长/语速/峰值/最长连续有声）
+node scripts/tts-probe.mjs --text "要试的句子"
+
+# 2) 金句集回归：18 条典型句式批量合成 + 波形指标
+node scripts/test-tts-quality.mjs
+
+# 3) 文本清理 A/B 对照（现状 vs toSpeakable），对照表直接打在屏幕上
+node scripts/test-speaktext-ab.mjs
+```
+
+想验证"到底念对了没有"，再跑一趟 **ASR 回转**（用本地 faster-whisper 把合成音频转回汉字，
+与原文比编辑距离相似度——这是发现"外星文"的判据）：
+
+```powershell
+# 用部署 GPT-SoVITS 时那个 venv 的 python（见 nori.config.json 的 venvPy），例如：
+$py = '<你的 GPT-SoVITS 目录>\.venv\Scripts\python.exe'
+& $py ..\audio\asr_batch.py scripts\.tts-quality scripts\.tts-quality\cases.json scripts\.tts-quality\asr.json
+& $py ..\audio\asr_report.py scripts\.tts-quality\asr.json scripts\.tts-quality\report.txt
+```
+
+报告里相似度 **< 0.6 基本可判"念的不是这句话"**。纯波形指标（语速骤降）可以作为旁证，
+但**不要只凭波形下结论**——本次就是 ASR 回转才定位到 URL 被拆成"秒每每.米每每毫秒减减"。
+（`audio/` 脚本属本机工具，不入库。）
 
 ### 🔒 隐私：哪些东西留在磁盘上
 
@@ -316,13 +373,16 @@ Nori 打开时会往页面挂一个全局对象 **`__noriPetWidget`**——按 *
 
 ```
 src/index.ts           宿主：会话监听 / 断句 / 改写 / TTS 代理 / 资产服务 / WebSocket / 安全校验
+src/speakText.ts       朗读文本清理：URL/路径/命令→可朗读说法、符号→读音、Markdown→剥、无内容→跳过
+src/segmentation.ts    断句与清洗（Intl.Segmenter 句粒度、情绪标签剥离、安全切点）
 src/prompt.ts          人设加载器（persona/*.txt → 改写层；缺失自动降级）
 src/client/widget.ts   浏览器 widget：Live2D 渲染、情绪、睡眠、摸头、UI 锚定（单独打包，不经宿主 tsc）
 src/client/url-shim.ts widget 打包用的浏览器安全 url 垫片（pixi 依赖 Node url 的替代）
 tsconfig.json          宿主编译配置（严格模式，含未使用检查）
 tsconfig.widget.json   widget 类型检查配置（`npm run typecheck:client`）
 install.ps1 / install-sovits.ps1 / uninstall.ps1   安装 / GPT-SoVITS 部署 / 卸载（PowerShell 5.1）
-scripts/               guard-release.mjs（发布守卫）、smoke-test.mjs（冒烟自检）、lib/home-path.mjs（守卫规则）
+scripts/               guard-release.mjs（发布守卫）、smoke-test.mjs（冒烟自检）、
+                       test-speaktext.mjs（朗读清理单测）、tts-probe.mjs / test-tts-quality.mjs（声音引擎回归）
 .githooks / .github    pre-commit 守卫钩子 / Guard CI（push、PR 自动执行）
 ```
 

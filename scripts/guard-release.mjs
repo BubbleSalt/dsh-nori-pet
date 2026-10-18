@@ -15,16 +15,46 @@
  *   - 密钥模式与家目录形态度故意拆字拼接（不在源码中出现连续字面量），避免守卫自身触发扫描。
  *   - 资产文件（模型/语音/图片）只允许占位（.gitkeep 已单独放行），任何真实资产入树即失败。
  */
-import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { existsSync, readFileSync, readdirSync, statSync, openSync, closeSync, unlinkSync, mkdtempSync } from 'node:fs'
 import { join, relative } from 'node:path'
+import { tmpdir } from 'node:os'
 import { buildHomePath } from './lib/home-path.mjs'
 
 const STAGED = process.argv.includes('--staged')
+
+/**
+ * 跑一个命令并拿到 stdout。
+ *
+ * ⚠ 不能用 `execFileSync`/默认 stdio：那是**管道**，而受限环境（DSH 沙箱等）禁止创建命名管道，
+ * 直接 EPERM 失败。失败后本脚本会静默降级成"文件系统遍历"，于是把 `.gitignore` 掉的
+ * 本机资产（nori.config.json、persona、voice、探针 wav）全报成"入树"——**看起来像 55 项严重泄露，
+ * 其实一件也不会上库**。这种"静默降级 + 误报"比直接报错危险得多（会训练人忽略守卫输出）。
+ * 所以改成把 stdout **重定向到临时文件**（文件 I/O 不受该限制），拿不到就明确报错退出。
+ */
+function run(cmd, args) {
+  let dir = null
+  try {
+    dir = mkdtempSync(join(tmpdir(), 'nori-guard-'))
+    const out = join(dir, 'out.txt')
+    const fd = openSync(out, 'w')
+    try {
+      const r = spawnSync(cmd, args, { stdio: ['ignore', fd, 'ignore'], cwd: process.cwd() })
+      if (r.error) return { ok: false, err: String(r.error.message ?? r.error) }
+      if (r.status !== 0) return { ok: false, err: cmd + ' 退出码 ' + r.status }
+      return { ok: true, data: readFileSync(out, 'utf8').split(/\r?\n/).map((s) => s.trim()).filter(Boolean) }
+    } finally { closeSync(fd) }
+  } catch (e) {
+    return { ok: false, err: String(e?.message ?? e) }
+  } finally {
+    if (dir) { try { unlinkSync(join(dir, 'out.txt')) } catch { /* 忽略 */ } }
+  }
+}
+
 // 仓库根：git 定位不可用（如受限环境）时回退到当前工作目录
 const root = (() => {
-  try { return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim() }
-  catch { return process.cwd() }
+  const r = run('git', ['rev-parse', '--show-toplevel'])
+  return r.ok && r.data[0] ? r.data[0] : process.cwd()
 })()
 
 /**
@@ -74,8 +104,8 @@ function walkFiles(dir, out = [], depth = 0) {
 }
 
 function list(cmd, args) {
-  try { return execFileSync(cmd, args, { encoding: 'utf8' }).split(/\r?\n/).map((s) => s.trim()).filter(Boolean) }
-  catch { return null }
+  const r = run(cmd, args)
+  return r.ok ? r.data : null
 }
 
 // 文件清单：环境变量 GUARD_FILES 优先（分号/换行分隔）→ git 暂存区/全树 → 文件系统遍历回退
@@ -91,7 +121,12 @@ const files = (() => {
     // 暂存区拿不到（git 不可用）：pre-commit 钩子本身也跑不起来，此处退化成全树扫描并说明
     console.error('guard: 暂存区文件清单不可用（git 被限制？）→ 回退为全树扫描')
   } else {
-    console.error(`guard: git 不可用 → 回退为文件系统遍历（跳过顶层产物目录：${[...SKIP_DIRS].join('/')}）`)
+    // 回退模式**必须**说清后果：它不看 .gitignore，会把本机资产当"入树"报出来（误报），
+    // 因此结论只可信"命中的文件里有没有真被 git 跟踪的"——别让它训练出"守卫老误报"的习惯。
+    console.error('guard: ⚠ git 不可用 → 回退为文件系统遍历（此模式**不读 .gitignore**）')
+    console.error('guard:   因此 nori.config.json / persona/ / voice/ 与探针产物都会被报为命中，')
+    console.error('guard:   但其中的被忽略文件**不可能入库**。要精确判定请在有 git 的环境重跑，')
+    console.error('guard:   或把待查文件列进 GUARD_FILES 环境变量。')
   }
   return walkFiles(root)
 })()

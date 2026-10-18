@@ -20,6 +20,13 @@ dist/
 # ── 本机日志与排障痕迹 ──────────────────────────
 *.log
 
+# ── 声音引擎排障产物（scripts/tts-probe.mjs 与 A/B 回归脚本的落盘）──
+# wav 是真实语音样本（含声线），目录里还有每次跑的用例清单与 ASR 结果，都只对本机有意义。
+.tts-probe-*.wav
+.tts-quality/
+.tts-ab/
+.tts-quality-report.txt
+
 # ── 团队资产原件：授权人设由用户放置到 persona/（不入库）；人设原文档如置于根目录请勿提交 ──
 
 # ── 人设资产（授权文本 prompt.txt 不入库；改写任务指令 reframe.txt 随仓库提供）─

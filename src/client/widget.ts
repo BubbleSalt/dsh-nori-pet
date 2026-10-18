@@ -323,6 +323,9 @@ function fetchTts(text: string, token: number): Promise<ArrayBuffer | null> {
     body: JSON.stringify({ text }),
   })
     .then(async (res) => {
+      // 204 = 宿主判定"这段没有可朗读内容"（纯符号/纯语气词）→ 静默跳过，不弹气泡、不重试。
+      // 这类文本若硬送合成，AR 会吐怪音（实测"嗯……唔……那个……"被唱成"嗯~~~n-n-n-n-n-n"）。
+      if (res.status === 204) return null
       // 给用户看的气泡文案：503/连不上 = sovits 未上线（清晰易懂）；其它错误码保留 codes 便于排障
       if (res.status === 503) { showBubble('（sovits 未上线）'); return null }
       if (!res.ok) { showBubble('（TTS 未就绪：' + res.status + '）'); return null }

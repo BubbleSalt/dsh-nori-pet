@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { cleanSpeech, softCut, spokenUnits } from './segmentation.js'
 import { extractSpeakable } from './speakable.js'
+import { toSpeakable } from './speakText.js'
 import type { Socket } from 'node:net'
 import { homedir } from 'node:os'
 import { loadPersona } from './prompt.js'
@@ -1338,6 +1339,18 @@ function applyInner(ctx: AppContext, config: Config) {
       res.end(JSON.stringify({ error: 'empty text' }))
       return
     }
+    // 朗读文本清理：URL/路径/命令→可朗读说法、符号→读音、Markdown→剥。
+    // 必须在**合成之前**做：GPT-SoVITS 前端会把非汉字字符整段删掉，残句太短时 AR 会自由发挥
+    // （实测 URL 被念成"秒每每.米每每毫秒减减"、命令被念成"施行三批耳门斗都行啦" ）。
+    const speak = toSpeakable(normalizeSpeakText(text))
+    if (speak.dropped) {
+      // 没有可朗读内容（纯符号 / 纯语气词）：**宁可不出声**，也不让模型吐怪音。
+      // 返回 204 让面板当作"本段无需朗读"处理，而不是当成失败重试。
+      appendErr('[nori-pet] speak skipped（无可朗读内容）: ' + text.slice(0, 60))
+      res.writeHead(204, { 'content-type': 'application/json' })
+      res.end()
+      return
+    }
     // TTS 配置以 nori.config.json 为运行时真相（注入器热重载不重读该文件，这里请求时即时读取，
     // 改 refAudio/refPrompt/温度/top_k 无需重载插件即生效）
     const fileCfg: Record<string, unknown> = {}
@@ -1361,7 +1374,7 @@ function applyInner(ctx: AppContext, config: Config) {
       res.end(JSON.stringify({ error: 'tts url invalid', ttsUrl: String(tts.ttsUrl) }))
       return
     }
-    url.searchParams.set('text', normalizeSpeakText(text))
+    url.searchParams.set('text', speak.text)
     url.searchParams.set('text_lang', 'zh')
     url.searchParams.set('prompt_lang', 'zh')
     url.searchParams.set('media_type', 'wav')
