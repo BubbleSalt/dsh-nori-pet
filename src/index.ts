@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { cleanSpeech, softCut, spokenUnits } from './segmentation.js'
 import { extractSpeakable } from './speakable.js'
-import { toSpeakable } from './speakText.js'
+import { endWithPeriod, friendlyApprovalReason, toSpeakable } from './speakText.js'
 import { applyBlockEnd, applyTextDelta, blockKey, clearFeedByPrefix } from './streamFeed.js'
 import type { FeedState } from './streamFeed.js'
 import type { Socket } from 'node:net'
@@ -209,8 +209,7 @@ function normalizeSpeakText(raw: string): string {
   // 必须在送去合成前剥干净，否则 GPT-SoVITS 会把"serious】"当文本念出来（用户实测听到过）
   t = cleanSpeech(t)
   t = t.replace(/([\u4e00-\u9fff])\s*([A-Za-z]{2,}[A-Za-z0-9'\-]*)/g, '$1，$2')
-  if (!/[。！？!?；;…]$/.test(t)) t += '。'
-  return t
+  return endWithPeriod(t)
 }
 
 /** 解析 WAV（RIFF/WAVE，PCM 8/16/32 位，单/双声道），返回每 100ms 帧的 RMS 能量数组（失败返回 []） */
@@ -408,6 +407,16 @@ function applyInner(ctx: AppContext, config: Config) {
   let statAck = 0
   let lastAssistant = ''
   let lastSendFrame = ''
+  /**
+   * 取证环：最近 10 次送进合成的文本（前端每段气泡各发一次 /api/speak）。
+   * 用途：判断"切分发生在哪一层"——若一次气泡的内容被拆成两条请求，就是**客户端**切的；
+   * 若只有一条完整请求却看见两个气泡，则是**宿主广播**粒度造成的。排障时看 /api/status。
+   */
+  const recentSpeaks: Array<{ ts: number; len: number; head: string; budget?: number; units?: number; lines?: number; dropped?: number }> = []
+  function noteSpeak(text: string, budget?: number, units?: number, lines?: number, dropped?: number): void {
+    recentSpeaks.push({ ts: Date.now(), len: text.length, head: text.slice(0, 40), budget, units, lines, dropped })
+    if (recentSpeaks.length > 10) recentSpeaks.shift()
+  }
   const pending = new Map<string, string>() // `${sid}/${turn}/${step}` -> 未断句文本
   function log(...args: unknown[]): void {
     const logger: any = (ctx as any).logger
@@ -1117,6 +1126,8 @@ function applyInner(ctx: AppContext, config: Config) {
     const ms = Date.now() - t0
     statAssistant += 1
     lastAssistant = out.slice(0, 60)
+    // turn 用 `<N>-sum` 标记"这是概括"；widget 侧会把它归一成同一个逻辑 turn N
+    // （同一轮回答的改写与概括应当排队朗读，不能互相抢断——否则前一句被腰斩、最后一句消失）
     broadcast({ type: 'assistant', session: sid, text: out, turn: `${turn}-sum` })
     traceSummary(text, out, ms, lastTraceOn)
     log(`[dsh-nori-pet] summary: turn=${turn} 原文${text.length}字 → 播报${out.length}字 (${ms}ms)`)
@@ -1244,8 +1255,10 @@ function applyInner(ctx: AppContext, config: Config) {
       case 'approval/asked': {
         // 权限申请提醒：原文播报（不走改写，保证准确）
         const tool = String((data as any)?.toolName ?? '')
-        const reason = String((data as any)?.reason ?? '').trim()
-        const text = '有权限申请' + (tool ? '：' + tool : '') + (reason ? '。原因：' + reason : '') + '。'
+        // reason 由 dsh 拼接（`escalate sandbox to <mode>: <理由>`），理由通常自带句号；
+        // 全程用 endWithPeriod 收口，避免"固定前缀 + 自带句号"拼出 `。。`（曾经的气泡双句号）。
+        const reason = friendlyApprovalReason(String((data as any)?.reason ?? ''))
+        const text = endWithPeriod('有权限申请' + (tool ? '：' + tool : '') + (reason ? '。原因：' + reason : ''))
         broadcast({ type: 'approval', session: sid, text })
         break
       }
@@ -1362,6 +1375,15 @@ function applyInner(ctx: AppContext, config: Config) {
     try {
       const parsed = JSON.parse(body || '{}')
       text = String(parsed.text ?? '').slice(0, 512)
+      const budget = Number(parsed.budget)
+      const units = Number(parsed.units)
+      const lines = Number(parsed.lines)
+      if (text) noteSpeak(
+        text,
+        Number.isFinite(budget) && budget > 0 ? budget : undefined,
+        Number.isFinite(units) && units > 0 ? units : undefined,
+        Number.isFinite(lines) && lines > 0 ? lines : undefined,
+      )
     } catch {
       res.writeHead(400, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ error: 'invalid json' }))
@@ -1661,7 +1683,7 @@ function applyInner(ctx: AppContext, config: Config) {
     const path = url.pathname.slice(PREFIX.length)
     if (path === '/api/status' && req.method === 'GET') {
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ ok: true, tts: config.ttsUrl, model: 'Nori', prefix: PREFIX, ws: clients.size, events: eventCount, chunks: statChunks, textDelta: statTextDelta, dupFeed: statDupFeed, assistant: statAssistant, turnEnd: statTurnEnd, hello: statHello, ack: statAck, lastAssistant, last: lastBroadcast, sent: lastSendFrame, recentBroadcasts }))
+      res.end(JSON.stringify({ ok: true, tts: config.ttsUrl, model: 'Nori', prefix: PREFIX, ws: clients.size, events: eventCount, chunks: statChunks, textDelta: statTextDelta, dupFeed: statDupFeed, assistant: statAssistant, turnEnd: statTurnEnd, hello: statHello, ack: statAck, lastAssistant, last: lastBroadcast, sent: lastSendFrame, recentBroadcasts, recentSpeaks }))
       return
     }
     if (path === '/api/ws-test' && req.method === 'GET') {
@@ -1692,7 +1714,11 @@ function applyInner(ctx: AppContext, config: Config) {
   const WIDGET_PATH = join(HOST_DIR, 'widget.js')
   let widgetJs = ''
   try { widgetJs = readFileSync(WIDGET_PATH, 'utf8') } catch (e) { log('[dsh-nori-pet] widget.js missing: ' + WIDGET_PATH + ' ' + String(e)) }
-  const WIDGET_TAG = '<script defer src="' + PREFIX + '/widget.js"></script>'
+  // 版本戳 = widget.js 的 mtime：每次重建后 URL 变化，浏览器不会拿旧缓存里的 bundle
+  // （否则改了前端还得靠"硬刷 Ctrl+F5"，实测踩过好几次：改了代码、页面还在跑上一版）
+  let widgetStamp = '0'
+  try { widgetStamp = String(Math.round(statSync(WIDGET_PATH).mtimeMs)) } catch { /* ignore */ }
+  const WIDGET_TAG = '<script defer src="' + PREFIX + '/widget.js?v=' + widgetStamp + '"></script>'
 
   // ─── api_v2 守护：定时探测 9880，掉了自动拉起（tts_infer.yaml 已指向新权重，重启即新声线） ──
   // 判活原则：只要能拿到 HTTP 响应（含 4xx/5xx）就说明服务活着——api_v2 缺 ref_audio_path 时
