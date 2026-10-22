@@ -13,20 +13,47 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { toSpeakable, speakableLength, MIN_SPEAKABLE_CHARS } from '../lib/speakText.js'
+import { endWithPeriod, friendlyApprovalReason, toSpeakable, speakableLength, MIN_SPEAKABLE_CHARS } from '../lib/speakText.js'
 
 const clean = (s) => toSpeakable(s).text
 const dropped = (s) => toSpeakable(s).dropped
 
-test('URL/路径/命令：换成可朗读说法（实机曾念成"秒每每.米每每毫秒减减"）', () => {
+test('URL/命令：换成可朗读说法（实机曾念成"秒每每.米每每毫秒减减"）', () => {
   assert.equal(clean('详见 https://github.com/BubbleSalt/dsh-nori-pet 这个地址。'), '详见 某个链接 这个地址。')
-  assert.equal(clean('路径是 D:/models/nori/voice.wav 这里。'), '路径是 某个路径 这里。')
   assert.equal(clean('执行 npm run build 就行了。'), '执行 那句命令 就行了。')
-  assert.equal(clean('我把配置写进 nori.config.json 了。'), '我把配置写进 那个文件 了。')
   // 裸域名（无协议）也要认出来
   assert.equal(clean('去 example.com/a 看看。'), '去 某个链接 看看。')
   // 可配置：不朗读 URL 时直接删掉
   assert.equal(toSpeakable('详见 https://example.com/a 这个地址。', { readUrls: false }).text, '详见 这个地址。')
+})
+
+// ── 路径只留文件名（用户口径："把路径去掉只剩文件名就可以接受了"）──
+// 曾经的两版都错：① 只认文件名 → 剩下半截路径被逐字符念成"波浪号 反斜杠 dsh 反斜杠…"；
+// ② 硬换成"那个文件"/"某个路径" → 语音里没有先行词，听着莫名其妙。现在只留文件名，
+// 拉丁文件名交给合成前端（v2 前端本来就会丢非汉字部分），不做任何中文占位替换。
+test('★ 路径整段去掉、只留文件名（不许留半截，也不许硬换中文词）', () => {
+  const bs = '\\'
+  assert.equal(clean('注册在 `~' + bs + '.dsh' + bs + 'storages' + bs + 'workspace.json` 里。'), '注册在 workspace.json 里。')
+  assert.equal(clean('改 `kernel/bpf/helpers_chimera.c` 那一行。'), '改 helpers_chimera.c 那一行。')
+  assert.equal(clean('路径是 D:/models/nori/voice.wav 这里。'), '路径是 voice.wav 这里。')
+  assert.equal(clean('留 `2026' + bs + '09' + bs + '12/` 那个目录。'), '留 12 那个目录。')
+  // 带空格的路径：靠"先按行内代码识别"才能整段吃掉
+  assert.equal(clean('改 `C:' + bs + 'a b' + bs + 'c' + bs + 'd.md` 那段。'), '改 d.md 那段。')
+  // 中文名文件名照留
+  assert.equal(clean('先读 `prefer-a100-交接说明.md` 再说。'), '先读 prefer-a100-交接说明.md 再说。')
+  // 裸文件名本来就不动（没有路径要去）
+  assert.equal(clean('先读 package.json 确认版本号。'), '先读 package.json 确认版本号。')
+  // 已经不该再出现这些硬换词
+  const out = clean('改 `C:' + bs + 'a' + bs + 'b.md` 和 D:/x/y.json。')
+  assert.ok(!/那个文件|某个路径/.test(out), '不许再出现"那个文件/某个路径"：' + out)
+  assert.ok(!/[A-Za-z]:|[\\/]/.test(out), '不许残留路径符号：' + out)
+})
+
+test('★ 反向：不是路径的别动（"和/或"、分数、版本号）', () => {
+  assert.equal(clean('和/或 都行。'), '和/或 都行。')
+  assert.equal(clean('差不多 1/2 的量。'), '差不多 1/2 的量。')
+  assert.equal(clean('当前版本 0.2.4 已经发布。'), '当前版本 0.2.4 已经发布。')
+  // 可配置：不朗读路径时整段删掉
   assert.equal(toSpeakable('路径是 C:/a/b 这里。', { readPaths: false }).text, '路径是 这里。')
 })
 
@@ -77,4 +104,28 @@ test('空白与重复标点整理（前端遇重复标点会制造怪停顿）',
   assert.equal(clean('  前后有空白  '), '前后有空白')
   assert.equal(speakableLength('今天天气不错'), 6)
   assert.ok(MIN_SPEAKABLE_CHARS >= 2)
+})
+
+// ── 结尾句号：只许一个（用户实测：气泡里"结尾出现两个句号"）──
+// 根因是宿主**拼接**文案：`'有权限申请：' + tool + '。原因：' + reason + '。'`，
+// 而 dsh 传进来的 reason 通常自带句号 → `。。`。朗读侧会把重复标点折叠掉，
+// 所以只有界面文字露馅，光听声音发现不了。
+test('★ 结尾句号只补一个，不叠加', () => {
+  assert.equal(endWithPeriod('有权限申请：pwsh。原因：允许本次操作使用 danger-full-access 权限：推送 tag。'),
+    '有权限申请：pwsh。原因：允许本次操作使用 danger-full-access 权限：推送 tag。')
+  assert.equal(endWithPeriod('有权限申请：pwsh'), '有权限申请：pwsh。')
+  assert.equal(endWithPeriod('好的。。'), '好的。', '连续句号要折叠')
+  assert.equal(endWithPeriod('好的，，吧。'), '好的，吧。', '连续逗号同理')
+  assert.equal(endWithPeriod('好的，'), '好的。', '悬空逗号换成句号，不能拼成"，。"')
+  assert.equal(endWithPeriod('真的吗…'), '真的吗…')
+  assert.equal(endWithPeriod('真的吗……'), '真的吗……', '中文省略号是有意的，不许压成一个')
+  assert.equal(endWithPeriod('什么！？'), '什么！？', '感叹+疑问组合保留')
+  assert.equal(endWithPeriod('   '), '')
+})
+
+test('DSH 技术文案翻成人话（英文前缀不该念给用户听）', () => {
+  assert.equal(friendlyApprovalReason('escalate sandbox to danger-full-access: 需要推送 tag。'),
+    '允许本次操作使用 danger-full-access 权限：需要推送 tag。')
+  assert.equal(friendlyApprovalReason('用户拒绝了这次操作'), '用户拒绝了这次操作', '不认识的原样返回，绝不猜')
+  assert.equal(friendlyApprovalReason(''), '')
 })

@@ -49,23 +49,43 @@ export function speakableLength(text: string): number {
  * 覆盖 http(s)://、www.、裸域名（含端口/路径/查询）。
  */
 const RE_URL = /(?:https?:\/\/|www\.)[^\s，。！？；、）】」》"'…]+|\b[a-z0-9-]+(?:\.[a-z0-9-]+)+\/[^\s，。！？；、）】」》"'…]*/gi
+
+/** 去掉行号/锚点后缀：`a.json:416`、`x.ts#L24-L30` */
+const stripLineRef = (s: string): string => s.replace(/(?::\d+(?:-\d+)?|#L\d+(?:-L?\d+)?)$/i, '')
+
 /**
- * 绝对路径。只拦两种**形态明确**的：
- *   · Windows 盘符：`C:\a\b`、`C:/a/b`
- *   · UNC 共享：`\\server\share`
+ * 路径只保留**文件名**，目录部分整段去掉（用户口径：把路径去掉、只剩文件名就可以接受）。
  *
- * ⚠ 为什么**不**覆盖 Unix 家目录前缀（形如 `/用户目录/…`）：
- * 插件跑在本机 Windows 上，实际会飘进对话的是盘符路径；而那个家目录形态的字面量一旦出现在
- * 仓库源码里，`npm run guard` 就没法区分"这是我写的识别规则"还是"真泄露了机器路径"
- * ——守卫的判据正是这个形态本身，于是它会把本文件判为泄露（这条注释本身写全了就命中）。
- * 结论是**把正则写小**，只覆盖真实会遇到的形态，而不是加标记绕过守卫
- *（曾试过插零宽空格，结果正则匹配被破坏、路径又漏给前端。绕守卫是错的方向）。
- * 家目录形态的识别能力保留在唯一需要它的地方：`scripts/lib/home-path.mjs`（守卫自己用）。
+ * 为什么**不**硬换成"那个文件"/"某个路径"这类中文词（那一版被否掉了）：语音里没有先行词，
+ * "那个文件"等于什么都没说，反而莫名其妙。而文件名是拉丁串，GPT-SoVITS v2 前端本来就
+ * 会丢掉非汉字部分——所以"路径不读"在听感上自然成立，不需要也不该塞中文占位词。
+ *
+ * ⚠ 必须**整串连目录一起**匹配：只认文件名时 `~\.dsh\storages\workspace.json` 会剩下
+ * `~\.dsh\storages\` 这半截路径，被逐字符念成"波浪号 反斜杠 dsh 反斜杠…"——这才是
+ * 用户说的"莫名其妙"。所以要先把整条路径吃掉，再只把文件名放回去。
+ * ⚠ 尾串**排除中文**：`C:/a/b里的内容` 不能把"里的内容"一起吞掉（会吃掉正文）。
  */
-const RE_WINPATH = /(?:[A-Za-z]:[\\/]|\\\\)[^\s，。！？；、）】」》"…]*/
+const RE_PATH = /(?:[A-Za-z]:[\\/]|~[\\/]|\\\\)[^\s，。！？；、）】」》"…\u4e00-\u9fff\u3000-\u303f]*|(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+/g
+/** 行内代码 `` `…` ``：agent 的路径几乎都在里面，按代码跨识别才能吃掉**带空格的路径** */
+const RE_CODE_SPAN = /`([^`\n]{1,200})`/g
+
+/**
+ * 取路径的文件名部分：`C:\a\b\x.ts` → `x.ts`；`~/a/b.json` → `b.json`；`/a/b/` → `b`。
+ * 返回空串表示这串里没有任何段（调用方按"整段删掉"处理）。
+ */
+const basenameOf = (p: string): string => {
+  const s = stripLineRef(String(p).trim().replace(/^[`'"]+|[`'"]+$/g, ''))
+  const segs = s.split(/[\\/]+/).filter((x) => x.length > 0)
+  return segs.length ? segs[segs.length - 1]! : ''
+}
+/** 这串是不是路径（带分隔符、含 ASCII 字母数字、且不是 `1/2` 这类分数） */
+const looksLikePath = (raw: string): boolean => {
+  const s = stripLineRef(String(raw).trim())
+  return /[\\/]/.test(s) && /[A-Za-z0-9]/.test(s) && !/^[\d.]+[\\/][\d.]+$/.test(s)
+}
+
 /** 命令行形态：`npm run build`、`git commit -m`、带 .exe/.ps1 的文件名 */
 const RE_COMMAND = /\b(?:npm|npx|pnpm|yarn|node|git|pip|python|cargo|go|docker)\b(?:\s+(?:run|install|add|commit|push|pull|clone|build|test|-{1,2}[a-z-]+|[A-Za-z0-9_.-]+))+/gi
-const RE_SCRIPTFILE = /\b[A-Za-z0-9_.-]+\.(?:exe|ps1|bat|cmd|sh|mjs|js|ts|py|json|log|md|wav)\b/gi
 /** 符号读音（前端会把这些当音素念成怪音） */
 const SYMBOL_READ: Array<[RegExp, string]> = [
   [/→|->|=>/g, '变成'],
@@ -124,11 +144,16 @@ export function toSpeakable(text: string, opts: SpeakTextOptions = {}): { text: 
 
   // 0) 代码块整段丢弃（代码逐字符念出来必然怪音，且内容价值低）
   t = t.replace(RE_CODE_FENCE, ' ')
-  // 1) 整串内容先替换/删除（顺序：URL → 命令行 → 路径 → 文件名）
+  // 1) 行内代码里的路径**先整体识别**：agent 的路径几乎都在反引号里，按代码跨处理才能
+  //    连"带空格的路径"一起吃掉（裸正则会在空格处断开，留下半截路径被逐字符念出来）
+  t = t.replace(RE_CODE_SPAN, (m: string, inner: string) => {
+    if (!looksLikePath(inner)) return m // 不是路径 → 原样返回，后面照常剥反引号
+    return readPaths ? basenameOf(inner) : ' '
+  })
+  // 2) 整串替换/删除（顺序：URL → 命令行 → 路径只留文件名）
   t = t.replace(RE_URL, readUrls ? '某个链接' : ' ')
   t = t.replace(RE_COMMAND, '那句命令')
-  t = t.replace(RE_WINPATH, readPaths ? '某个路径' : ' ')
-  t = t.replace(RE_SCRIPTFILE, '那个文件')
+  t = t.replace(RE_PATH, (m: string) => (readPaths ? basenameOf(m) : ' '))
   // 2) 情绪标签与其残骸（`【happy】` / 被 ICU 切开的 `【`、`serious】`）——控制标记不是正文。
   //    放在"整串替换"之后：标签里一般不含 URL/路径，顺序不影响正确性，但先剥标签能让后面
   //    的符号规则少走弯路。实机教训：`serious】` 曾被当成正文念出来过。
@@ -166,4 +191,39 @@ export function toSpeakable(text: string, opts: SpeakTextOptions = {}): { text: 
 
   const dropped = kept < MIN_SPEAKABLE_CHARS || mostlyFiller || (syms > 0 && mostlySymbols && kept <= syms)
   return { text: t, dropped }
+}
+
+/**
+ * 保证一句话以**唯一的**句末标点结尾。
+ *
+ * 为什么需要（真实踩坑，用户在气泡里看到"结尾两个句号"）：宿主会**拼接**文案——
+ * 权限提醒 = `'有权限申请：' + tool + '。原因：' + reason + '。'`，无条件补的那个句号
+ * 撞上 reason 自带的句号就变成 `。。`。朗读侧 `toSpeakable` 会把重复标点折叠掉，
+ * 所以**只有界面文字露馅**（声音反而正常）——这类坑不跑到视图层根本看不见。
+ *
+ * 规则：
+ *  - 连续相同的中文标点压成一个（`。。` `，，` `；；`）；`……`、`！？` 这类**有意**的组合原样保留；
+ *  - 结尾没有任何句末标点时补一个 `。`；已有则不再追加。
+ */
+export function endWithPeriod(input: string): string {
+  const t = String(input).trim().replace(/([。．.，,；;、：:])\1+/g, '$1')
+  if (!t) return ''
+  if (/[。．.！!？?…；;]$/.test(t)) return t
+  // 悬空的逗号/顿号/冒号（截断、拼接没接上）→ 换成句号，绝不拼出"，。"这种鬼东西
+  if (/[，,、：:]$/.test(t)) return t.slice(0, -1) + '。'
+  return t + '。'
+}
+
+/**
+ * 把 DSH 的技术文案翻成人话（只匹配已知模式；不认识的原样返回，绝不猜）。
+ *
+ * dsh-sandbox 的 `reason` 形如 `escalate sandbox to danger-full-access: <理由>`——
+ * 英文技术前缀念出来又长又怪，在气泡里对用户也没有意义。
+ */
+export function friendlyApprovalReason(reason: string): string {
+  const raw = String(reason ?? '').trim()
+  if (!raw) return ''
+  const m = raw.match(/^escalate sandbox to (\S+?):\s*([\s\S]*)$/)
+  if (m) return `允许本次操作使用 ${m[1]} 权限：${m[2]}`
+  return raw
 }
