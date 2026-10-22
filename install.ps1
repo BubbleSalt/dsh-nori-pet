@@ -495,7 +495,7 @@ if ($VenvPy)  { $cfg += "    venvPy: $(Y $VenvPy)" }
 # 值类型按 Config schema（src/index.ts）：布尔/字符串按类型处理，其余数值（int/double/decimal）
 # 裸写保留原值（含小数 0.9/1.2；0/负数视为未设置跳过）。allowedOrigins 为字符串数组。
 # 未填的键跳过 → 插件用源码默认。
-foreach ($k in @('maxSentence', 'ttsTemperature', 'ttsTopK', 'ttsSpeedFactor', 'ttsWatch', 'ttsWatchIntervalMs', 'personaPrompt', 'personaReframe')) {
+foreach ($k in @('maxSentence', 'detailMaxChars', 'summaryEnabled', 'summaryWaitMs', 'reframeDelayMs', 'ttsTemperature', 'ttsTopK', 'ttsSpeedFactor', 'ttsWatch', 'ttsWatchIntervalMs', 'personaPrompt', 'personaReframe')) {
   $v = $cfgFile.$k
   if ($null -eq $v) { continue }
   if ($v -is [bool]) { $cfg += "    ${k}: $(if ($v) { 'true' } else { 'false' })"; continue }
@@ -543,8 +543,7 @@ if ($ReframeCfg) {
   }
 }
 
-# 改写开关独立字段（schema: reframeEnabled）。旧配置可能把布尔写在 reframe 里吗？
-# 不会——配置文件的 reframe 一直是对象；布尔只在 patch 层。这里支持显式写 reframeEnabled。
+# 改写开关是独立字段 reframeEnabled（reframe 是参数对象，两者不可同名）
 if ($null -ne $cfgFile.reframeEnabled) {
   $cfg += "    reframeEnabled: $(if ($cfgFile.reframeEnabled) { 'true' } else { 'false' })"
 }
