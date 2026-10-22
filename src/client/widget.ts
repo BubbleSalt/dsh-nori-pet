@@ -8,10 +8,11 @@
  */
 import * as PIXI from 'pixi.js'
 import { cleanSpeech, SPEAK_MAX, spokenUnits, widthOf } from '../segmentation.js'
+import { PREFIX } from '../protocol.js'
 import { Live2DModel } from 'pixi-live2d-display/cubism4'
 ;(window as any).PIXI = PIXI
 
-const PREFIX = '/@bubblesalt/dsh-nori-pet'
+// 路由前缀来自 protocol.ts（与宿主、smoke-test 同一份）；宿主 hello 帧下发的 prefix 与之同源
 // 口型驱动：ParamMouthOpenY（编辑器实测 = 张嘴 open 参数，运行时表情管道证实有效）。
 // 关键时序：变形在 model.update()（csmUpdateModel）时按参数值计算，之后 setParameterValueById
 // 只改存储不重算顶点 → 必须把口型写在 coreModel.update() 之前，让变形用我们的值。

@@ -9,22 +9,26 @@
  *  4. PREFIX/assets/* 静态服务 Nori Live2D 模型文件（Nori_web/）与 live2dcubismcore.js。
  */
 import type { Context } from 'cordis'
-import z from 'schemastery'
 import { createHash } from 'node:crypto'
-import { createReadStream, readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, statSync, readdirSync, unlinkSync } from 'node:fs'
+import { createReadStream, readFileSync, writeFileSync, existsSync, statSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { join, dirname, normalize, extname, resolve, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { cleanSpeech, softCut, spokenUnits } from './segmentation.js'
+import { softCut, spokenUnits } from './segmentation.js'
 import { extractSpeakable } from './speakable.js'
-import { endWithPeriod, friendlyApprovalReason, toSpeakable } from './speakText.js'
+import { endWithPeriod, friendlyApprovalReason } from './speakText.js'
 import { applyBlockEnd, applyTextDelta, blockKey, clearFeedByPrefix } from './streamFeed.js'
 import type { FeedState } from './streamFeed.js'
 import type { Socket } from 'node:net'
-import { homedir } from 'node:os'
 import { loadPersona, resolvePersonaPaths, readReframeHot } from './prompt.js'
 import { buildRuntimeTtsConfig } from './modelPreset.js'
+import type { Config } from './config.js'
+import { appendFatal, createLogs } from './logs.js'
+import { createSpeakHandler } from './tts.js'
+import { PREFIX } from './protocol.js'
+import { acceptKey, encodeFrame, parseFrame } from './ws.js'
+import type { ParsedFrame } from './ws.js'
 
 // 宿主以 ESM 方式被 loader import（无 __dirname），用 import.meta.url 推导包目录
 const HOST_DIR = fileURLToPath(new URL('.', import.meta.url))
@@ -32,126 +36,10 @@ const HOST_DIR = fileURLToPath(new URL('.', import.meta.url))
 export const name = '@bubblesalt/dsh-nori-pet'
 export const inject = ['webServer', 'llm', 'credentials', 'sessions']
 
-export const Config = z.object({
-  enabled: z.boolean().default(true),
-  /** Nori Live2D 模型目录（含 Nori.model3.json）；留空自动探测仓库内 Nori_web */
-  assetsDir: z.string().default(''),
-  /** live2dcubismcore.js 绝对路径；留空自动探测仓库内 cubism_sdk/Core */
-  coreFile: z.string().default(''),
-  /** 本地 GPT-SoVITS 服务地址（api_v2 的 /tts 端点） */
-  ttsUrl: z.string().default('http://127.0.0.1:9880/tts'),
-  /** 零样本参考音频（Nori 声线 wav，绝对或相对仓库根；留空自动回退插件自带 voice/nori.wav）。建议 3~10 秒（api_v2 强制要求）。 */
-  refAudio: z.string().default(''),
-  /** 参考音频的逐字转写文本（prompt text）。⚠ 必须与 refAudio 的音频内容完全一致：
-   *  换 refAudio 时必须同步换 refPrompt，否则 AR 条件作用劣化 → 跳字/吞句（中英混排时更明显）、音色漂移。 */
-  refPrompt: z.string().default('你好,初次见面,我的名字是Nori'),
-  /** 单句推送的最大长度（超出强制截断） */
-  maxSentence: z.number().min(1).default(140),
-  /**
-   * 超长内容的"详读预算"（字）。一段连续输出 ≤ 此字数 → 全文逐句详读（保持原有即时反馈）；
-   * 超过 → 这一段一个字都不详读，整轮只播一次概括 —— 两者互斥，避免"前半详细、中间快进"的口径不一。
-   * 输出速度约 300 token/s 时，400 字约 0.9 秒即可判定，所以长内容判定几乎不产生等待。
-   */
-  detailMaxChars: z.number().min(20).default(400),
-  /** 超长内容概括总开关（关闭 = 完全保持逐句详读的旧行为） */
-  summaryEnabled: z.boolean().default(true),
-  /** 概括等待上限（毫秒）：超过则先播一句提示，避免长静默（LLM 慢/超时兜底） */
-  summaryWaitMs: z.number().min(1000).default(8000),
-  /**
-   * TTS 推理参数。低温度更稳更收敛（避免采样噪声导致电音感），但温度过低 + top_k 过小
-   * 会让 AR 模型在"嗯/唔"等鼻音叹词上进入采样循环：某个字无限拖长、随后吞掉句尾一小段。
-   * 实测 0.65/5 约 1/6 卡顿；0.9/12 基本消除，且 speak 路径内置"拖长自动热参数重试"兜底。
-   */
-  ttsTemperature: z.number().default(0.9),
-  ttsTopK: z.number().default(12),
-  ttsSpeedFactor: z.number().default(1.0),
-  /** Nori 人设改写层：agent 输出先经 LLM 改写为 Nori 口吻再朗读 */
-  reframe: z.boolean().default(true),
-  /** 改写 LLM 的 provider（dsh-llm 注册名） */
-  reframeProvider: z.string().default('deepseek-official'),
-  /** 改写 LLM 的模型 */
-  reframeModel: z.string().default('deepseek-chat'),
-  /** 改写单次调用的超时（毫秒）。实测真实负载（11.9K 人设 system + 材料）约 10s，
-   * 网关波动时易撞线 → 放宽到 60s；失败仅降级原文，无副作用。可在 nori.config.json reframe.reframeTimeoutMs 运行时覆盖。 */
-  reframeTimeoutMs: z.number().min(1000).default(60000),
-  /** 改写输入的最大字符数（超出截断）。只作用于材料（user），不含 system 里的预设人设。
-   *  调大后超长文本可一次喂更大块，改写请求次数更少、输出更精炼（配合 splitBlocks/BATCH_MAX）。 */
-  reframeMaxInput: z.number().min(1).default(4000),
-  /**
-   * 改写单次调用的最大输出 token。推理型模型（DeepSeek-V4-Flash 等）思维链会先吃满
-   * tokens 再出 content——512 常被 reasoning 占光导致 content 空、判 EMPTY 降级原文。
-   * 非推理模型（deepseek-chat 等）512 足够，此处按需调大（如 2048）。
-   */
-  reframeMaxTokens: z.number().min(1).default(2048),
-  /**
-   * Nori 专用 API key 的 credentials ref（如 DEEPSEEK_NORI_API_KEY）。
-   * 设置后改写层直连 DeepSeek 官方 API（独立计量，不走主会话）；留空则走 dsh 内置 llm 服务。
-   */
-  reframeApiKeyRef: z.string().default('DEEPSEEK_NORI_API_KEY'),
-  /** 专用 key 直连的 API 地址（OpenAI 兼容 /chat/completions） */
-  reframeBaseUrl: z.string().default('https://api.deepseek.com/v1'),
-  /**
-   * 改写层输入/输出追踪日志（排障用，**默认开启**）。
-   *
-   * 内容与落点：每轮对话的原文与改写结果各截 500 字，写进
-   * `~/.dsh/logs/nori-pet/nori-pet-trace.log`。**自带长度上限**：超过 1MB 就从最旧删到约 512KB
-   *（约留最近 500 轮），整个日志目录超 8MB 时再删最旧的文件（见 enforceLogBudget）。
-   * 所以长期开着也不会无限增长——需要翻"刚才那句为什么这么念"时，历史就在手边。
-   * 不想要这些内容落盘就设 false（nori.config.json 的 `reframe.trace` 支持热改）。
-   */
-  reframeTrace: z.boolean().default(true),
-  /** api_v2 守护：定时探测 9880，掉了自动拉起（桌面朗读保底） */
-  ttsWatch: z.boolean().default(true),
-  /** 守护探测间隔（毫秒）。下限 5s：填 0 会让 setInterval 退化成定时器风暴 + 反复 spawn */
-  ttsWatchIntervalMs: z.number().min(5000).default(30000),
-  /**
-   * GPT-SoVITS 安装根目录（api_v2.py 所在，守护拉起时作为 cwd）。
-   * 留空自动探测仓库内 GPT-SoVITS；不在此处的机器用 -GsvBase 指定。
-   */
-  gsvBase: z.string().default(''),
-  /** GPT-SoVITS venv 的 python 路径（守护拉起用）。留空默认 <gsvBase>/.venv/Scripts/python.exe */
-  venvPy: z.string().default(''),
-  /** 人设 system prompt 文件（绝对/相对仓库根；留空探测 persona/prompt.txt） */
-  personaPrompt: z.string().default(''),
-  /** 改写任务补充指令文件（绝对/相对仓库根；留空探测 persona/reframe.txt） */
-  personaReframe: z.string().default(''),
-  /** WS/API 额外放行的 Origin 主机名（缺省仅 localhost/127.0.0.1；浏览器跨站请求一律拒绝） */
-  allowedOrigins: z.array(z.string()).default([]),
-})
-export interface Config {
-  enabled: boolean
-  assetsDir: string
-  coreFile: string
-  ttsUrl: string
-  refAudio: string
-  refPrompt: string
-  maxSentence: number
-  detailMaxChars: number
-  summaryEnabled: boolean
-  summaryWaitMs: number
-  ttsTemperature: number
-  ttsTopK: number
-  ttsSpeedFactor: number
-  reframe: boolean
-  reframeProvider: string
-  reframeModel: string
-  reframeTimeoutMs: number
-  reframeMaxInput: number
-  reframeMaxTokens: number
-  reframeApiKeyRef: string
-  reframeBaseUrl: string
-  reframeTrace: boolean
-  ttsWatch: boolean
-  ttsWatchIntervalMs: number
-  gsvBase: string
-  venvPy: string
-  personaPrompt: string
-  personaReframe: string
-  allowedOrigins: string[]
-}
+// 配置 schema 与类型住在 config.ts（唯一真相，类型由 schema 派生）：此处原样再导出，
+// 保持插件入口的对外 API 不变（dsh loader 按 `Config` 导出名读 schema）。
+export { Config } from './config.js'
 
-const PREFIX = '/@bubblesalt/dsh-nori-pet'
-const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 /**
  * 朗读文本硬截断：按句累加，超过 maxSentences 句或 maxChars 字就停。
  * 用于概括输出的兜底——提示词约束实测会被超，超长的"概括"会重新变成长朗读。
@@ -194,87 +82,6 @@ const SUMMARY_RULES = [
   '6. 只输出要朗读的话，不要加任何前缀、编号、标题、markdown 标记。',
 ].join('\n')
 
-/** 朗读文本规整：
- *  1) 保证句尾有断句标点（便于 GPT-SoVITS cut5 分句）；
- *  2) 中英混排保护：英文词会让 AR 对齐失败，有约 75% 概率跳过它前面的中文片段
- *     （实测"会自己移除那条 ref"→ 跳过"会自己移除那条"）。在中文与英文词之间补逗号
- *     强制分片，让每个片段语言单一（实测把读出率提到 ~90%）。英文词须 ≥2 字符，
- *     避免误伤"C盘"这类单字母。反引号等无关字符清掉防干扰分句。
- *  注意：不要给叹词硬插逗号——实测会把句子切碎（某些 ref 下时长翻倍、听感断断续续）。 */
-function normalizeSpeakText(raw: string): string {
-  let t = String(raw).replace(/\r/g, '').trim()
-  if (!t) return t
-  t = t.replace(/[`′]/g, '')
-  // 情绪标签是控制标记、不是正文：断句/截断后可能残留（ICU 会切在 `【` 与 `serious` 之间），
-  // 必须在送去合成前剥干净，否则 GPT-SoVITS 会把"serious】"当文本念出来（用户实测听到过）
-  t = cleanSpeech(t)
-  t = t.replace(/([\u4e00-\u9fff])\s*([A-Za-z]{2,}[A-Za-z0-9'\-]*)/g, '$1，$2')
-  return endWithPeriod(t)
-}
-
-/** 解析 WAV（RIFF/WAVE，PCM 8/16/32 位，单/双声道），返回每 100ms 帧的 RMS 能量数组（失败返回 []） */
-function wavFrameRms(buf: Buffer): number[] {
-  try {
-    if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return []
-    let off = 12
-    let channels = 1
-    let sampleRate = 24000
-    let bits = 16
-    let dataOff = 0
-    let dataLen = 0
-    while (off + 8 <= buf.length) {
-      const id = buf.toString('ascii', off, off + 4)
-      const size = buf.readUInt32LE(off + 4)
-      if (id === 'fmt ') {
-        channels = Math.max(1, buf.readUInt16LE(off + 10))
-        sampleRate = buf.readUInt32LE(off + 12)
-        bits = buf.readUInt16LE(off + 22)
-      } else if (id === 'data') {
-        dataOff = off + 8
-        dataLen = size
-        break
-      }
-      off += 8 + size + (size % 2)
-    }
-    if (!dataLen) return []
-    const bytesPer = bits / 8
-    const frameN = Math.max(1, Math.floor(sampleRate * 0.1))
-    const stride = frameN * bytesPer * channels
-    const nFrames = Math.floor(dataLen / stride)
-    if (nFrames <= 0) return []
-    const rms: number[] = new Array(nFrames)
-    for (let f = 0; f < nFrames; f++) {
-      const base = dataOff + f * stride
-      let sum = 0
-      for (let i = 0; i < frameN; i++) {
-        const p = base + i * bytesPer * channels
-        let v: number
-        if (bits === 16) v = buf.readInt16LE(p) / 32768
-        else if (bits === 8) v = (buf.readUInt8(p) - 128) / 128 // 注意 `&` 优先级低于 `-`：旧写法 readInt8(p) & 0xff - 128 实为 & 127，负半周被抹平
-        else if (bits === 32) v = buf.readInt32LE(p) / 2147483648 // 32bit *整型* PCM（旧代码按 float 读 → 得到垃圾值）
-        else v = 0
-        sum += v * v
-      }
-      rms[f] = Math.sqrt(sum / frameN)
-    }
-    return rms
-  } catch {
-    return []
-  }
-}
-
-/** 最长连续语音时长（秒）。GPT-SoVITS AR 采样循环（如"嗯/唔"鼻音拖长）会形成 >3.5s 不间断长音 */
-function maxContiguousSpeech(buf: Buffer): number {
-  const rms = wavFrameRms(buf)
-  if (!rms.length) return 0
-  let mx = 0
-  let cur = 0
-  for (const r of rms) {
-    cur = r > 0.01 ? cur + 1 : 0
-    if (cur > mx) mx = cur
-  }
-  return mx * 0.1
-}
 /** 本地 Origin 主机白名单（WS / API 跨站防护；自定义访问来源用配置 allowedOrigins 扩展） */
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
 
@@ -293,68 +100,6 @@ interface PetClient {
   close(): void
 }
 
-// ─── WebSocket 迷你实现（只读 JSON 帧 + 服务端推送） ───────────────────────────
-function encodeFrame(payload: Buffer | string, opcode = 1): Buffer {
-  const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload
-  let head: Buffer
-  if (data.length < 126) {
-    head = Buffer.from([0x80 | opcode, data.length])
-  } else if (data.length < 65536) {
-    head = Buffer.alloc(4)
-    head[0] = 0x80 | opcode
-    head[1] = 126
-    head.writeUInt16BE(data.length, 2)
-  } else {
-    head = Buffer.alloc(10)
-    head[0] = 0x80 | opcode
-    head[1] = 127
-    head.writeUInt32BE(Math.floor(data.length / 0x100000000), 2)
-    head.writeUInt32BE(data.length & 0xffffffff, 6)
-  }
-  return Buffer.concat([head, data])
-}
-
-interface ParsedFrame {
-  opcode: number
-  payload: Buffer
-  consumed: number
-}
-
-function parseFrame(buf: Buffer): ParsedFrame | null {
-  if (buf.length < 2) return null
-  const b0 = buf[0]
-  const b1 = buf[1]
-  const fin = (b0 & 0x80) !== 0
-  const opcode = b0 & 0x0f
-  const masked = (b1 & 0x80) !== 0
-  let len = b1 & 0x7f
-  let off = 2
-  if (len === 126) {
-    if (buf.length < 4) return null
-    len = buf.readUInt16BE(2)
-    off = 4
-  } else if (len === 127) {
-    if (buf.length < 10) return null
-    const hi = buf.readUInt32BE(2)
-    const lo = buf.readUInt32BE(6)
-    len = hi * 0x100000000 + lo
-    off = 10
-  }
-  let maskKey: Buffer | null = null
-  if (masked) {
-    if (buf.length < off + 4) return null
-    maskKey = buf.subarray(off, off + 4)
-    off += 4
-  }
-  if (buf.length < off + len) return null
-  let payload = buf.subarray(off, off + len)
-  if (masked && maskKey) {
-    payload = Buffer.from(payload)
-    for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4]
-  }
-  return { opcode: fin ? opcode : opcode === 0 ? 0 : opcode, payload, consumed: off + len }
-}
-
 function extractText(content: unknown): string {
   if (typeof content === 'string') return content
   if (Array.isArray(content)) {
@@ -367,12 +112,7 @@ export function apply(ctx: AppContext, config: Config) {
   try {
     applyInner(ctx, config)
   } catch (e) {
-    try {
-      const logBase = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'logs', 'nori-pet')
-      try { mkdirSync(logBase, { recursive: true }) } catch { /* ignore */ }
-      const p = join(logBase, 'nori-pet-error.log')
-      appendFileSync(p, '[' + new Date().toISOString() + ']\n' + (e && (e as Error).stack ? (e as Error).stack : String(e)) + '\n')
-    } catch { /* ignore */ }
+    appendFatal(e) // apply 失败时插件作用域可能还没建起来：自带目录创建与上限裁剪
     throw e
   }
 }
@@ -756,7 +496,7 @@ function applyInner(ctx: AppContext, config: Config) {
         })
         if (!res.ok) {
           const errBody = await res.text().catch(() => '')
-          appendErr('reframe direct API HTTP ' + res.status + ' url=' + url + ' model=' + dedicatedModel + ': ' + errBody.slice(0, 200))
+          logs.appendErr('reframe direct API HTTP ' + res.status + ' url=' + url + ' model=' + dedicatedModel + ': ' + errBody.slice(0, 200))
           // 中转端点偶发 400/5xx（实测 "There was an error parsing the body" 后紧接一次就成功）
           // → 重试一次，仍失败才降级。重试比"直接播原文"便宜，也比再包一层容错简单。
           if (res.status >= 400) {
@@ -769,17 +509,17 @@ function applyInner(ctx: AppContext, config: Config) {
             if (retry && retry.ok) {
               const d2: any = await retry.json().catch(() => null)
               const t2 = ((d2?.choices?.[0]?.message?.content as string) ?? '').trim()
-              if (t2) { traceReframe(input, t2, Date.now() - t0, traceOn, mode); return t2 }
+              if (t2) { logs.trace(input, t2, Date.now() - t0, traceOn, mode); return t2 }
             }
-            appendErr('reframe direct API retry failed; status=' + (retry ? retry.status : 'network'))
+            logs.appendErr('reframe direct API retry failed; status=' + (retry ? retry.status : 'network'))
           }
           return null
         }
         const data: any = await res.json().catch(() => null)
         const out = (data?.choices?.[0]?.message?.content as string) ?? ''
         const trimmed = out.trim()
-        if (!trimmed) appendErr('reframe direct API EMPTY output; model=' + dedicatedModel + ' (推理模型思考链占满 max_tokens? 可调大 reframeMaxTokens)')
-        traceReframe(input, trimmed, Date.now() - t0, traceOn, mode)
+        if (!trimmed) logs.appendErr('reframe direct API EMPTY output; model=' + dedicatedModel + ' (推理模型思考链占满 max_tokens? 可调大 reframeMaxTokens)')
+        logs.trace(input, trimmed, Date.now() - t0, traceOn, mode)
         return trimmed || null
       }
       // 路径 2：dsh 内置 llm 服务
@@ -798,169 +538,25 @@ function applyInner(ctx: AppContext, config: Config) {
         if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') out += chunk.text
       }
       const trimmed = out.trim()
-      if (!trimmed) appendErr('reframe llm EMPTY output; provider=' + config.reframeProvider + ' model=' + config.reframeModel + ' (推理模型思考链占满 max_tokens? 可调大 reframeMaxTokens)')
-      traceReframe(input, trimmed, Date.now() - t0, traceOn, mode)
+      if (!trimmed) logs.appendErr('reframe llm EMPTY output; provider=' + config.reframeProvider + ' model=' + config.reframeModel + ' (推理模型思考链占满 max_tokens? 可调大 reframeMaxTokens)')
+      logs.trace(input, trimmed, Date.now() - t0, traceOn, mode)
       return trimmed || null
     } catch (e) {
       log('[dsh-nori-pet] reframe failed: ' + String(e))
-      appendErr('reframe failed: ' + String(e))
+      logs.appendErr('reframe failed: ' + String(e))
       return null
     } finally {
       clearTimeout(timer)
     }
   }
 
-  // 日志目录独立于注入器（~/.dsh/super-injector 是 dsh-super-injector 的地盘），
-  // 迁到 ~/.dsh/logs/nori-pet/（DSH_HOME 未设置则用 ~/.dsh）
-  const logDir = () => join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'logs', 'nori-pet')
-  try { mkdirSync(logDir(), { recursive: true }) } catch { /* ignore */ }
   /** 最近一次 reframeText 读到的 trace 开关（nori.config.json 可热改）：
    * traceSummary 在 reframeText 之后调用，用它跟主开关保持一致 */
   let lastTraceOn = config.reframeTrace
 
-  // ── 日志结构（详见 README「🔒 隐私：哪些东西留在磁盘上」）──
-  //   nori-pet-trace.log    改写层每轮的 IN/OUT 原文（各截 500 字）—— 排障主力
-  //   nori-pet-summary.log  原文→概括的压缩比与摘要样本
-  //   nori-pet-error.log    错误摘要（含 URL/模型名/堆栈片段）
-  // 三者各自**自带上限**（见 trimLogBySize），另有目录总预算 8MB。
-  //
-  // 历史教训（都是"看着有上限、其实没有"）：
-  //  1) trace 曾是 5 个 slot 轮转、按条数裁、总量无上限，且 slot 指针是模块级变量、
-  //     热重载即重置回 0 → 同一文件被反复续写，实测涨到 1MB。
-  //  2) error/summary 用的是"满 100 条裁到 50 条"，计数器同样活不过一次热重载 →
-  //     实测 error.log 涨到 677 条仍无人裁。故现在统一按**字节**判（每次 stat 一下即可，
-  //     不依赖任何跨实例状态）。字节阈值只保留下限、不做"裁到刚好"，避免在上限附近抖动。
-  const TRACE_FILE = 'nori-pet-trace.log'
-  const TRACE_MAX_BYTES = 1 << 20 // 单文件超 1MB 即裁剪
-  const TRACE_KEEP_BYTES = 512 << 10 // 裁到约 512KB（保留最新，按记录块切分）
-  const ERROR_MAX_BYTES = 512 << 10
-  const ERROR_KEEP_BYTES = 256 << 10
-  const SUMMARY_MAX_BYTES = 256 << 10
-  const SUMMARY_KEEP_BYTES = 128 << 10
-  const LOG_BUDGET = 8 << 20 // 日志目录总预算 8MB：超了就删最旧的文件
-  const tracePath = join(logDir(), TRACE_FILE)
-
-  /** 启动清理：收掉旧版多文件轮转留下的文件，并做一次目录预算检查 */
-  function initLogs(): void {
-    try {
-      // 旧版是「nori-pet-trace.1.log ~ .4.log + slot 文件」多文件轮转，总量无上限。
-      // 改成单文件后这些旧文件不会再被写入，留着只会让人分不清哪个是当前日志 → 顺手收掉。
-      try { unlinkSync(join(logDir(), 'nori-pet-trace.slot')) } catch { /* 可能不存在 */ }
-      for (let s = 1; s < 10; s++) {
-        try { unlinkSync(join(logDir(), `nori-pet-trace.${s}.log`)) } catch { /* 可能不存在 */ }
-      }
-      // 启动即把"已经超限的历史遗留文件"收进上限内：否则要等到下次写入才裁，
-      // 期间用户看到的就是个超标文件（本次就是这么发现 error.log 涨到 677 条的）。
-      traceTrim()
-      trimLogBySize(join(logDir(), 'nori-pet-error.log'), ERROR_MAX_BYTES, ERROR_KEEP_BYTES)
-      trimLogBySize(join(logDir(), 'nori-pet-summary.log'), SUMMARY_MAX_BYTES, SUMMARY_KEEP_BYTES)
-      enforceLogBudget()
-    } catch { /* ignore */ }
-  }
-
-  /**
-   * 单文件裁剪：超 TRACE_MAX_BYTES 就从最旧删到 TRACE_KEEP_BYTES 附近（保留最新）。
-   * 每次 stat 一下判是否超限，未超即返回（正常路径不读盘）。
-   */
-  function traceTrim(): void {
-    trimLogBySize(tracePath, TRACE_MAX_BYTES, TRACE_KEEP_BYTES)
-  }
-
-  /**
-   * 日志目录总预算：超过 LOG_BUDGET 时，从**最旧的文件**开始删。
-   * 为什么需要：单文件上限只约束单文件；轮转历史上会攒出多个文件（实测 2.4MB 一整个目录）。
-   * 用文件 mtime 排序，删到预算以内为止（只删本插件自己的 trace/error/summary 日志）。
-   */
-  function enforceLogBudget(): void {
-    try {
-      const files = readdirSync(logDir())
-        .filter((f) => f.startsWith('nori-pet-') && f.endsWith('.log'))
-        .map((f) => {
-          const p = join(logDir(), f)
-          const st = statSync(p)
-          return { f, p, size: st.size, mtime: st.mtimeMs }
-        })
-      let total = files.reduce((n, x) => n + x.size, 0)
-      if (total <= LOG_BUDGET) return
-      for (const x of files.sort((a, b) => a.mtime - b.mtime)) {
-        if (total <= LOG_BUDGET) break
-        try { unlinkSync(x.p) } catch { /* ignore */ }
-        total -= x.size
-        log(`[dsh-nori-pet] 日志超出预算，已删除最旧：${x.f}（${Math.round(x.size / 1024)}KB）`)
-      }
-    } catch { /* ignore */ }
-  }
-
-  initLogs()
-
-  /**
-   * 文本日志自动裁剪（trace / summary / error 共用）：**按字节上限**，超了就从最旧删到保留目标。
-   *
-   * 为什么不再按"条数"计：条数需要一个跨写入累加的计数器，而计数器活在插件实例里 ——
-   * 热重载/重启就归零，于是"满 100 条才裁"几乎永远不触发。实测 error.log 已涨到 677 条无上限。
-   * 字节上限每次 stat 一下就能判，不依赖任何跨实例状态，也不怕条目长短悬殊
-   *（error.log 里是堆栈，一条可能上千字节）。
-   */
-  function trimLogBySize(p: string, maxBytes: number, keepBytes: number): void {
-    try {
-      if (!existsSync(p) || statSync(p).size <= maxBytes) return
-      const raw = readFileSync(p, 'utf8')
-      const blocks = raw.split(/(?=^\[\d{4}-\d{2}-\d{2}T)/m).filter((b) => b.trim())
-      let kept = blocks.length
-      let total = 0
-      // 从后往前累计保留量：一直删到"累计不足 keepBytes"为止，且**至少留最后 1 条**。
-      // 注意不能写成"一超就 break"——那样遇到单条大于 keepBytes 的情况会只留极少条数，
-      // 体积仍贴着 max，于是下次写入又触发裁剪（既抖动又留不住历史）。实测就是这么翻车的。
-      for (let i = blocks.length - 1; i >= 0; i--) {
-        const len = blocks[i]!.length
-        if (total + len > keepBytes && i < blocks.length - 1) break
-        total += len
-        kept = i
-      }
-      const slice = blocks.slice(kept)
-      if (slice.length) writeFileSync(p, slice.join(''), 'utf8')
-    } catch { /* ignore */ }
-  }
-
-  function appendErr(line: string): void {
-    const p = join(logDir(), 'nori-pet-error.log')
-    try {
-      appendFileSync(p, '[' + new Date().toISOString() + '] ' + line + '\n')
-    } catch { /* ignore */ }
-    trimLogBySize(p, ERROR_MAX_BYTES, ERROR_KEEP_BYTES)
-  }
-
-  /**
-   * 改写层输入/输出追踪：材料→改写结果，两列记录（IN=当前块材料本体、OUT=改写输出）。
-   * 存储在单文件 `nori-pet-trace.log`，超 1MB 自动从最旧删到约 512KB（见 TRACE_MAX_BYTES）。
-   *
-   * ⚠ 这条日志写的是**对话原文**（各截 500 字），只在排障时有用；不想要就设
-   * `nori.config.json` 的 `reframe.trace = false`。
-   * 开关每次调用从 reframeText 传进来（`on`），所以配置改动立即生效、无需重装。
-   */
-  function traceReframe(input: string, output: string, ms: number, on: boolean, src = ''): void {
-    try {
-      if (!on) return
-      // 记录来源与长度：出现"同一段被改写两次"时，靠 src/len 一眼判断是投递重复还是模型重复
-      const tag = src ? ` src=${src} len=${input.length}` : ` len=${input.length}`
-      const fp = createHash('sha1').update(input).digest('hex').slice(0, 8)
-      const entry = `[${new Date().toISOString()}] (${ms}ms)${tag} fp=${fp}\nIN : ${input.slice(0, 500)}\nOUT: ${output.slice(0, 500)}\n────\n`
-      traceTrim() // 先裁后写：文件始终在上限内
-      appendFileSync(tracePath, entry)
-    } catch { /* ignore */ }
-  }
-
-  /** 概括层追踪：原文→概括输出，用"压缩比"验证是否真的省了朗读时间。
-   * 与 traceReframe 同开关（traceOn）：这里同样会写原文片段，默认随 reframe.trace 走。 */
-  function traceSummary(raw: string, out: string, ms: number, on: boolean): void {
-    try {
-      if (!on) return
-      const ratio = raw.length ? Math.round((out.length / raw.length) * 100) : 0
-      const p = join(logDir(), 'nori-pet-summary.log')
-      appendFileSync(p, `[${new Date().toISOString()}] (${ms}ms) 原文${raw.length}字 → 概括${out.length}字（压缩到 ${ratio}%）\nRAW: ${raw.slice(0, 300)}\nSUM: ${out.slice(0, 300)}\n────\n`)
-      trimLogBySize(p, SUMMARY_MAX_BYTES, SUMMARY_KEEP_BYTES)
-    } catch { /* ignore */ }
-  }
+  // 日志（trace / summary / error + 字节上限 + 目录预算）在 src/logs.ts：这里只注入 logger
+  const logs = createLogs({ log })
+  logs.init()
 
   /** 收集某 turn 的全部残留文本（reframe 模式的整轮文本） */
   function collectTurnText(sid: string, turn: number): string {
@@ -1078,13 +674,13 @@ function applyInner(ctx: AppContext, config: Config) {
       reframeHashes.set(turn, seen)
     }
     if (seen.has(fp)) {
-      appendErr(`[nori-pet] reframe dedup: 同一 turn(${turn}) 内重复投递已丢弃 fp=${fp} len=${body.length} head=${body.slice(0, 40)}`)
+      logs.appendErr(`[nori-pet] reframe dedup: 同一 turn(${turn}) 内重复投递已丢弃 fp=${fp} len=${body.length} head=${body.slice(0, 40)}`)
       return
     }
     seen.add(fp)
     if (reframeQueue.length >= REFRAME_QUEUE_MAX) {
       const dropped = reframeQueue.shift() // 防积压：丢最旧保最新
-      if (dropped) appendErr('[nori-pet] reframe queue overflow: dropped ' + dropped.text.slice(0, 40) + '…')
+      if (dropped) logs.appendErr('[nori-pet] reframe queue overflow: dropped ' + dropped.text.slice(0, 40) + '…')
     }
     reframeQueue.push({ sid, turn, text, mode })
     void pumpReframe()
@@ -1121,7 +717,7 @@ function applyInner(ctx: AppContext, config: Config) {
     if (!out) return
     // 长度硬兜底：prompt 约束实测会被超（3111 字原文曾概括出 262 字）→ 超长时按句截断
     const capped = capSpeech(out, 4, 150)
-    if (capped !== out) appendErr(`[nori-pet] summary truncated ${out.length}→${capped.length} chars (turn=${turn})`)
+    if (capped !== out) logs.appendErr(`[nori-pet] summary truncated ${out.length}→${capped.length} chars (turn=${turn})`)
     out = capped
     const ms = Date.now() - t0
     statAssistant += 1
@@ -1129,7 +725,7 @@ function applyInner(ctx: AppContext, config: Config) {
     // turn 用 `<N>-sum` 标记"这是概括"；widget 侧会把它归一成同一个逻辑 turn N
     // （同一轮回答的改写与概括应当排队朗读，不能互相抢断——否则前一句被腰斩、最后一句消失）
     broadcast({ type: 'assistant', session: sid, text: out, turn: `${turn}-sum` })
-    traceSummary(text, out, ms, lastTraceOn)
+    logs.traceSummary(text, out, ms, lastTraceOn)
     log(`[dsh-nori-pet] summary: turn=${turn} 原文${text.length}字 → 播报${out.length}字 (${ms}ms)`)
   }
 
@@ -1142,7 +738,7 @@ function applyInner(ctx: AppContext, config: Config) {
       if (f !== undefined && f !== turn) summarizedTurns.delete(f)
     }
     broadcast({ type: 'assistant', session: sid, text: '内容有点多，我先记下来，稍后说重点。', turn: `${turn}-sum` })
-    appendErr(`[nori-pet] summary fallback (${reason}) turn=${turn} chars=${(turnSummaryText.get(turn) ?? '').length}`)
+    logs.appendErr(`[nori-pet] summary fallback (${reason}) turn=${turn} chars=${(turnSummaryText.get(turn) ?? '').length}`)
   }
 
   // extractSpeakable 已抽到 src/speakable.ts（纯函数，便于单测）
@@ -1153,7 +749,7 @@ function applyInner(ctx: AppContext, config: Config) {
     const list = blocks.slice(0, MAX_BLOCKS)
     if (blocks.length > MAX_BLOCKS) {
       // 旧版静默丢弃第 11 块起的内容（长报告会被念掉大半且无任何痕迹）
-      appendErr('[nori-pet] reframe dropped ' + (blocks.length - MAX_BLOCKS) + ' blocks (turn=' + turn + ', over MAX_BLOCKS=' + MAX_BLOCKS + ')')
+      logs.appendErr('[nori-pet] reframe dropped ' + (blocks.length - MAX_BLOCKS) + ' blocks (turn=' + turn + ', over MAX_BLOCKS=' + MAX_BLOCKS + ')')
     }
     for (const block of list) {
       enqueueReframe(sid, turn, block)
@@ -1344,172 +940,15 @@ function applyInner(ctx: AppContext, config: Config) {
   // 延迟订阅的清理：宿主销毁时清掉定时器
   ;(ctx as any).effect(() => () => { try { clearTimeout(delayedSub) } catch { /* ignore */ } }, 'nori-pet-delayed-sub')
 
-  // ─── TTS 代理：POST { text, emotion? } → WAV ───────────────────
-  async function handleSpeak(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (!isTrustedRequest(req)) {
-      res.writeHead(403, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: 'forbidden' }))
-      return
-    }
-    // body 大小上限 16KB（防本地页面/进程灌大请求；超限继续排空流但不累积）
-    const MAX_BODY = 16 * 1024
-    let body = ''
-    let size = 0
-    try {
-      for await (const chunk of req) {
-        size += chunk.length
-        if (size <= MAX_BODY) body += chunk
-      }
-    } catch {
-      // 客户端中断（ECONNRESET/aborted）：迭代器会 reject，吞掉并结束该请求
-      res.writeHead(400, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: 'request aborted' }))
-      return
-    }
-    if (size > MAX_BODY) {
-      res.writeHead(413, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: 'payload too large' }))
-      return
-    }
-    let text = ''
-    try {
-      const parsed = JSON.parse(body || '{}')
-      text = String(parsed.text ?? '').slice(0, 512)
-      const budget = Number(parsed.budget)
-      const units = Number(parsed.units)
-      const lines = Number(parsed.lines)
-      if (text) noteSpeak(
-        text,
-        Number.isFinite(budget) && budget > 0 ? budget : undefined,
-        Number.isFinite(units) && units > 0 ? units : undefined,
-        Number.isFinite(lines) && lines > 0 ? lines : undefined,
-      )
-    } catch {
-      res.writeHead(400, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: 'invalid json' }))
-      return
-    }
-    if (!text) {
-      res.writeHead(400, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: 'empty text' }))
-      return
-    }
-    // 朗读文本清理：URL/路径/命令→可朗读说法、符号→读音、Markdown→剥。
-    // 必须在**合成之前**做：GPT-SoVITS 前端会把非汉字字符整段删掉，残句太短时 AR 会自由发挥
-    // （实测 URL 被念成"秒每每.米每每毫秒减减"、命令被念成"施行三批耳门斗都行啦" ）。
-    const speak = toSpeakable(normalizeSpeakText(text))
-    if (speak.dropped) {
-      // 没有可朗读内容（纯符号 / 纯语气词）：**宁可不出声**，也不让模型吐怪音。
-      // 返回 204 让面板当作"本段无需朗读"处理，而不是当成失败重试。
-      appendErr('[nori-pet] speak skipped（无可朗读内容）: ' + text.slice(0, 60))
-      res.writeHead(204, { 'content-type': 'application/json' })
-      res.end()
-      return
-    }
-    // TTS 配置以 nori.config.json 为运行时真相（注入器热重载不重读该文件，这里请求时即时读取，
-    // 改 refAudio/refPrompt/温度/top_k 无需重载插件即生效）
-    const fileCfg: Record<string, unknown> = {}
-    try {
-      Object.assign(fileCfg, JSON.parse(readFileSync(join(dirname(HOST_DIR), 'nori.config.json'), 'utf8')))
-    } catch { /* 文件缺失/损坏则回退注入配置 */ }
-    const tts = { ...config }
-    if (typeof fileCfg.ttsTemperature === 'number') tts.ttsTemperature = fileCfg.ttsTemperature
-    if (typeof fileCfg.ttsTopK === 'number') tts.ttsTopK = fileCfg.ttsTopK
-    if (typeof fileCfg.ttsSpeedFactor === 'number') tts.ttsSpeedFactor = fileCfg.ttsSpeedFactor
-    if (typeof fileCfg.refAudio === 'string' && fileCfg.refAudio) tts.refAudio = fileCfg.refAudio
-    if (typeof fileCfg.refPrompt === 'string' && fileCfg.refPrompt) tts.refPrompt = fileCfg.refPrompt
-    // ttsUrl 来自配置/注入 patch，缺协议头（`127.0.0.1:9880/tts`）时 new URL 会抛 TypeError；
-    // 这个 async 函数曾经没有兜底 → unhandledRejection → fail-loud 打死整台 dsh。
-    let url: URL
-    try {
-      url = new URL(tts.ttsUrl)
-    } catch {
-      appendErr('[nori-pet] ttsUrl 非法（需形如 http://127.0.0.1:9880/tts）：' + String(tts.ttsUrl))
-      res.writeHead(503, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: 'tts url invalid', ttsUrl: String(tts.ttsUrl) }))
-      return
-    }
-    url.searchParams.set('text', speak.text)
-    url.searchParams.set('text_lang', 'zh')
-    url.searchParams.set('prompt_lang', 'zh')
-    url.searchParams.set('media_type', 'wav')
-    url.searchParams.set('temperature', String(tts.ttsTemperature))
-    url.searchParams.set('top_k', String(tts.ttsTopK))
-    url.searchParams.set('speed_factor', String(tts.ttsSpeedFactor))
-    // ref 兜底：配置未设 refAudio 时回退到插件自带 voice/nori.wav（否则上游 400 → /speak 502 静音）
-    const refPath = tts.refAudio ? resolveConfigPath(tts.refAudio) : join(dirname(HOST_DIR), 'voice', 'nori.wav')
-    if (existsSync(refPath)) url.searchParams.set('ref_audio_path', refPath)
-    if (tts.refPrompt) url.searchParams.set('prompt_text', tts.refPrompt)
-    try {
-      // 上游偶发推理 400（GPT-SoVITS Windows 热路径偶发 "tts failed"）：对 4xx/5xx 单次重试
-      let lastStatus = 0
-      let upBody = ''
-      let buf: Buffer | null = null
-      let ct = 'audio/wav'
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const ctrl = new AbortController()
-        const timer = setTimeout(() => ctrl.abort(), 30000)
-        let tts: Response
-        try {
-          tts = await fetch(url, { signal: ctrl.signal })
-        } catch (e) {
-          clearTimeout(timer)
-          throw e
-        }
-        lastStatus = tts.status
-        if (tts.ok) {
-          // 超时定时器必须覆盖到响应体读完：上游"先回头再卡住流"时 await arrayBuffer 会永不返回，
-          // 面板 pumping 永久占用 → 之后所有朗读排队卡死（用户观感"桌宠哑了"）。
-          buf = Buffer.from(await Promise.race([
-            tts.arrayBuffer(),
-            new Promise<never>((_, rej) => setTimeout(() => { try { ctrl.abort() } catch { /* ignore */ } ; rej(new Error('tts response body timeout')) }, 30000)),
-          ]))
-          clearTimeout(timer)
-          ct = tts.headers.get('content-type') || 'audio/wav'
-          break
-        }
-        clearTimeout(timer)
-        upBody = (await tts.text()).slice(0, 200)
-        if (attempt === 0) await new Promise((r) => setTimeout(r, 800))
-      }
-      if (!buf) {
-        // TTS 失败此前只回前端气泡、不落任何日志 → 线上"没声音"完全不可观测
-        appendErr('[nori-pet] tts http ' + lastStatus + ' ref=' + refPath + ' upstream=' + upBody.slice(0, 120))
-        res.writeHead(502, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ error: 'tts http ' + lastStatus, ref: !!tts.refAudio, refPath, upstream: upBody }))
-        return
-      }
-      // 安全网：最长连续语音 >3.5s 判定为 AR 采样循环拖长（"嗯/唔"等鼻音叹词偶发），
-      // 用更高随机性参数（0.95/15）重生成替换，最多 3 次；仅当结果更短才采用。
-      let guardLoops = 0
-      while (buf && maxContiguousSpeech(buf) > 3.5 && guardLoops < 3) {
-        guardLoops++
-        const warm = new URL(url)
-        warm.searchParams.set('temperature', '0.95')
-        warm.searchParams.set('top_k', '15')
-        const ctrl = new AbortController()
-        const timer = setTimeout(() => ctrl.abort(), 30000)
-        try {
-          const w = await fetch(warm, { signal: ctrl.signal })
-          if (w.ok) {
-            const nb = Buffer.from(await w.arrayBuffer())
-            clearTimeout(timer)
-            if (maxContiguousSpeech(nb) <= maxContiguousSpeech(buf)) buf = nb
-            else break
-          } else { clearTimeout(timer); break }
-        } catch {
-          break
-        } finally {
-          clearTimeout(timer)
-        }
-      }
-      res.writeHead(200, { 'content-type': ct, 'content-length': buf.length, 'cache-control': 'no-store' })
-      res.end(buf)
-    } catch (e: any) {
-      res.writeHead(503, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: 'tts offline: ' + String(e?.message ?? e).slice(0, 120) }))
-    }
-  }
+  // ─── TTS 代理：POST { text, budget, units, lines } → WAV（实现在 src/tts.ts） ──
+  const handleSpeak = createSpeakHandler({
+    config,
+    repoRoot: dirname(HOST_DIR),
+    isTrusted: isTrustedRequest,
+    noteSpeak,
+    appendErr: (line) => logs.appendErr(line),
+    resolveConfigPath,
+  })
 
   // ─── 静态资源：Nori Live2D 模型 + core ─────────────────────────
   const MIME: Record<string, string> = {
@@ -1577,7 +1016,7 @@ function applyInner(ctx: AppContext, config: Config) {
       // stat→open 之间文件被删/权限变化会让流异步 emit 'error'；无监听者 → uncaughtException 打死宿主
       const rs = createReadStream(file)
       rs.on('error', (e: any) => {
-        appendErr('[nori-pet] assets read error ' + file + ': ' + String(e?.message ?? e))
+        logs.appendErr('[nori-pet] assets read error ' + file + ': ' + String(e?.message ?? e))
         if (!res.headersSent) { try { res.writeHead(404); res.end('not found') } catch { /* ignore */ } }
         else try { res.destroy() } catch { /* ignore */ }
       })
@@ -1615,7 +1054,7 @@ function applyInner(ctx: AppContext, config: Config) {
     }
     const key = (req.headers['sec-websocket-key'] as string) || ''
     if (!key) { socket.destroy(); return }
-    const accept = createHash('sha1').update(key + WS_GUID).digest('base64')
+    const accept = acceptKey(key)
     socket.write(
       'HTTP/1.1 101 Switching Protocols\r\n' +
       'Upgrade: websocket\r\n' +
@@ -1848,7 +1287,7 @@ function applyInner(ctx: AppContext, config: Config) {
     return (req: IncomingMessage, res: ServerResponse): void => {
       void fn(req, res).catch((e: any) => {
         const where = req.method + ' ' + req.url
-        appendErr('[nori-pet] ' + tag + ' handler error @ ' + where + ': ' + String(e?.stack ?? e).slice(0, 400))
+        logs.appendErr('[nori-pet] ' + tag + ' handler error @ ' + where + ': ' + String(e?.stack ?? e).slice(0, 400))
         log('[dsh-nori-pet] ' + tag + ' handler error @ ' + where + ': ' + String(e?.message ?? e))
         try {
           if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' })
