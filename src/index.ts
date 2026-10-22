@@ -410,12 +410,30 @@ function applyInner(ctx: AppContext, config: Config) {
   // ─── widget 注入（whale 插件同款机制：普通 <script>，不走 client-modules） ──
   const WIDGET_PATH = join(HOST_DIR, 'widget.js')
   let widgetJs = ''
-  try { widgetJs = readFileSync(WIDGET_PATH, 'utf8') } catch (e) { log('[dsh-nori-pet] widget.js missing: ' + WIDGET_PATH + ' ' + String(e)) }
+  /* 见下方 readWidget()：按需读取，避免整个进程复用旧 bundle */
   // 版本戳 = widget.js 的 mtime：每次重建后 URL 变化，浏览器不会拿旧缓存里的 bundle
   // （否则改了前端还得靠"硬刷 Ctrl+F5"，实测踩过好几次：改了代码、页面还在跑上一版）
   let widgetStamp = '0'
-  try { widgetStamp = String(Math.round(statSync(WIDGET_PATH).mtimeMs)) } catch { /* ignore */ }
-  const WIDGET_TAG = '<script defer src="' + PREFIX + '/widget.js?v=' + widgetStamp + '"></script>'
+// 不能在这里就填当前 mtime：readWidget 会以为"没变过"而永不读盘（实测 → 返回空 bundle 200）
+  function readWidget(): string {
+  try {
+    const stamp = String(Math.round(statSync(WIDGET_PATH).mtimeMs))
+    if (stamp !== widgetStamp) {
+      widgetJs = readFileSync(WIDGET_PATH, 'utf8')
+      widgetStamp = stamp
+    }
+  } catch (e) {
+    if (!widgetJs) log('[dsh-nori-pet] widget.js missing: ' + WIDGET_PATH + ' ' + String(e))
+  }
+  return widgetJs
+}
+// 之前 widgetJs 是 apply() 时读一次、进程复用，版本戳也只在启动时算 —— rebuild 之后
+// 路由一直发旧 bundle（实测磁盘 2047172、服务端 2034497，页面怎么刷都是上一版）。
+// 现在按 mtime 失效：重建后刷页面即新代码，不必重载插件。
+const widgetTag = (): string => {
+  readWidget()
+  return '<script defer src="' + PREFIX + '/widget.js?v=' + widgetStamp + '"></script>'
+}
 
   // ─── api_v2 守护：定时探测 9880，掉了自动拉起（tts_infer.yaml 已指向新权重，重启即新声线） ──
   // 判活原则：只要能拿到 HTTP 响应（含 4xx/5xx）就说明服务活着——api_v2 缺 ref_audio_path 时
@@ -584,13 +602,13 @@ function applyInner(ctx: AppContext, config: Config) {
     path: PREFIX + '/widget.js',
     handler: (_req, res) => {
       res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8', 'cache-control': 'no-store' })
-      res.end(widgetJs)
+      res.end(readWidget())
     },
   }), 'nori-pet-widget')
   ctx.effect(() => ctx.webServer.tapIndex((html: string) => {
     if (html.includes(PREFIX + '/widget.js')) return html
-    if (html.includes('</body>')) return html.replace('</body>', WIDGET_TAG + '</body>')
-    return html + WIDGET_TAG
+    if (html.includes('</body>')) return html.replace('</body>', widgetTag() + '</body>')
+    return html + widgetTag()
   }), 'nori-pet-widget-tap')
 
   log('[dsh-nori-pet] host ready: tts=' + config.ttsUrl + ' assets=' + resolveAssetsDir() + ' core=' + resolveCoreFile())
