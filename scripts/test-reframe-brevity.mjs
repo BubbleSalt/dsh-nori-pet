@@ -98,7 +98,9 @@ const stats = (text, src) => {
 async function reframe(system, text) {
   const res = await fetch(rf.reframeBaseUrl.replace(/\/+$/, '') + '/chat/completions', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + rf.apiKey },
+    // Connection: close：不留 keep-alive socket。Windows 上 process.exit() 撞见正在关闭的
+    // socket 会触发 libuv 断言（uv_async.c UV_HANDLE_CLOSING）——表现是"评测 PASS 却崩在收尾"。
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + rf.apiKey, connection: 'close' },
     body: JSON.stringify({
       model: rf.reframeModel,
       messages: [{ role: 'system', content: system }, { role: 'user', content: text }],
@@ -170,8 +172,8 @@ if (argv.includes('--long')) {
     console.log(`  ${gone.length ? '★' : '✅'} ${src.slice(0, 26)}…  覆盖 ${covered}/${keys.length}${gone.length ? '  丢失: ' + gone.map((a) => a[0]).join('/') : ''}`)
   }
   console.log(`\n判定（长材料）：${miss === 0 ? 'PASS — 要点无丢失' : `FAIL — ${miss} 条丢要点`}`)
-  process.exit(miss === 0 ? 0 : 1)
+  process.exitCode = miss === 0 ? 0 : 1
 }
 
 console.log(`\n判定（短材料）：${fail === 0 ? 'PASS — 全部 ≤2 句、无注水句（膨胀上限只对 ≥20 字材料生效）' : `FAIL — ${fail}/${cases.length} 条不合格`}`)
-process.exit(fail === 0 ? 0 : 1)
+process.exitCode = fail === 0 ? 0 : 1
