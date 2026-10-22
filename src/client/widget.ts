@@ -7,7 +7,7 @@
  * 依赖：bundle banner 内联的 live2dcubismcore.js（真实 core，先于本代码执行）。
  */
 import * as PIXI from 'pixi.js'
-import { cleanSpeech, spokenUnits } from '../segmentation.js'
+import { cleanSpeech, SPEAK_MAX, spokenUnits, widthOf } from '../segmentation.js'
 import { Live2DModel } from 'pixi-live2d-display/cubism4'
 ;(window as any).PIXI = PIXI
 
@@ -258,11 +258,23 @@ dragHandle.addEventListener('wheel', onWheel, { passive: false })
 
 // ─── 气泡（每条独立气泡 + 各自 10 秒后独立淡出） ────────────────
 const MAX_BUBBLES = 6
+/** 上一条气泡实际渲染了几行（真机反馈，随 /api/speak 上报供对账） */
+let lastBubbleLines = 0
 function showBubble(text: string): void {
   const bub = document.createElement('div')
   bub.className = 'bub'
   bub.textContent = text
   bubble.appendChild(bub)
+  // 数一下这条气泡实际占了几行：断句预算（SPEAK_MAX=34）是按"一行 17 个汉字"定的，
+  // 行数是唯一能验证它的真机信号，报给宿主就能在 /api/status 里看到 34 是不是刚好两行。
+  try {
+    const rect = bub.getBoundingClientRect()
+    const cs = getComputedStyle(bub)
+    const lh = parseFloat(cs.lineHeight) || (parseFloat(cs.fontSize) || 13) * 1.4
+    const innerH = rect.height - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0)
+      - (parseFloat(cs.borderTopWidth) || 0) - (parseFloat(cs.borderBottomWidth) || 0)
+    lastBubbleLines = Math.max(1, Math.round(innerH / lh))
+  } catch { /* ignore */ }
   // 普通 column：DOM 第一个在顶部（最旧）—— 超出上限时移除顶部最旧
   while (bubble.children.length > MAX_BUBBLES) bubble.removeChild(bubble.firstChild!)
   // 每条独立淡出：10 秒后淡出并收起，不影响其他气泡
@@ -309,18 +321,41 @@ let defaultHeadTop = -1
 
 /**
  * 句子切分：统一走 src/segmentation.ts 的 spokenUnits（宿主与 widget 同一份实现，避免两套规则打架）。
- * 目标长度 34 字、词感知断点（绝不在英文词/路径中间切）、允许 ≤4 字溢出贴合自然断点。
+ * 长度上限 = `SPEAK_MAX`（一行 17 个汉字 → 两行 34，用户实测给的精确值），词感知断点
+ * （绝不在英文词/路径中间切），允许 ≤4 字溢出贴合自然断点。
  */
 function splitSentences(text: string): string[] {
-  return spokenUnits(text, 34).map((s) => s.trim()).filter((s) => s.length > 0)
+  return spokenUnits(text, SPEAK_MAX).map((s) => s.trim()).filter((s) => s.length > 0)
 }
 
-/** 向宿主合成一句音频；返回 ArrayBuffer（被打断/失败返回 null）。不打断当前播放。 */
+/** 合成结果缓存：文本 → WAV。打断时**先合成新首句**再切旧音频，靠它做到无缝衔接，
+ *  否则切断的瞬间是静音、还要等 TTS 好几秒（实测"停顿了一会才说话"）。上限 16 条。 */
+const ttsCache = new Map<string, ArrayBuffer>()
+const TTS_CACHE_MAX = 16
+function cacheTts(text: string, buf: ArrayBuffer): void {
+  if (ttsCache.size >= TTS_CACHE_MAX) {
+    const firstKey = ttsCache.keys().next().value
+    if (firstKey !== undefined) ttsCache.delete(firstKey)
+  }
+  ttsCache.set(text, buf)
+}
+
+/** 向宿主合成一句音频；返回 ArrayBuffer（被打断/失败返回 null）。不打断当前播放。
+ *  顺带把这条文本占的"汉字宽"报给宿主：/api/status 里能直接看到断句是否贴着预算。 */
 function fetchTts(text: string, token: number): Promise<ArrayBuffer | null> {
+  const hit = ttsCache.get(text)
+  if (hit) return Promise.resolve(token === playToken ? hit : null)
   return fetch(PREFIX + '/api/speak', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({
+      text,
+      budget: SPEAK_MAX,
+      units: widthOf(text),
+      // 行数是真机反馈：气泡实际占了几行，/api/status 里可以核对 34 这个数到底贴不贴两行
+      lines: lastBubbleLines,
+      dropped: droppedSpeakCount,
+    }),
   })
     .then(async (res) => {
       // 204 = 宿主判定"这段没有可朗读内容"（纯符号/纯语气词）→ 静默跳过，不弹气泡、不重试。
@@ -330,6 +365,7 @@ function fetchTts(text: string, token: number): Promise<ArrayBuffer | null> {
       if (res.status === 503) { showBubble('（sovits 未上线）'); return null }
       if (!res.ok) { showBubble('（TTS 未就绪：' + res.status + '）'); return null }
       const buf = await res.arrayBuffer()
+      cacheTts(text, buf) // 打断时预合成的结果，下次直接命中
       return token === playToken ? buf : null
     })
     .catch(() => { showBubble('（sovits 未上线）'); return null })
@@ -406,7 +442,7 @@ async function speakText(text: string, token: number): Promise<void> {
     // 标签行逐句；超长行按同一份断句规则子切（情绪沿用）
     sentences = []
     for (const t of tagged) {
-      for (const unit of spokenUnits(t.text, 34)) sentences.push({ text: unit, emo: t.emo })
+      for (const unit of spokenUnits(t.text, SPEAK_MAX)) sentences.push({ text: unit, emo: t.emo })
     }
   } else {
     sentences = splitSentences(text).map((s) => ({ text: s, emo: null }))
@@ -449,7 +485,7 @@ async function speakText(text: string, token: number): Promise<void> {
 }
 
 // ─── 朗读队列：同 turn 的文本排队顺序读完，跨 turn 才打断 ───────
-let activeTurn: number | null = null
+let activeTurn: string | null = null // 归一后的逻辑 turn（`12` 与 `12-sum` 视为同一轮）
 const pendingTexts: string[] = []
 let pumping = false
 
@@ -468,15 +504,47 @@ function notePlayed(text: string): void {
   if (playHashes.length > PLAY_HASH_MAX) playHashes.shift()
 }
 
-/** 新 turn：打断当前朗读，重排为最新文本 */
+/** 打断时被丢弃（改以气泡呈现）的文本条数——随 /api/speak 上报，便于核对"有没有话被吞" */
+let droppedSpeakCount = 0
+/** 打断预合成期间挂住队列：避免旧 speakText 循环把新文本当自己的句子播掉（会二次打断） */
+let interruptHold = 0
+
+/** 新 turn：打断当前朗读，重排为最新文本。
+ *
+ *  打断的两个体验问题都在这里治：
+ *  1) **不要先掐断再说**——先帮新文本的首句合成好（进 ttsCache），再切旧音频。
+ *     否则切断瞬间静音，还要等 TTS 好几秒才出声（实测："停顿了一会才说话"）。
+ *  2) 打断**不等于丢掉内容**——队列里还没读的句子，声音停掉，但用气泡补出来。
+ *     否则用户既听不到也看不到，只会怀疑"是不是没读出来"。 */
 function speakInterrupt(text: string): void {
   notePlayed(text)
   wakeUp() // 朗读唤醒
-  playToken += 1
-  if (currentSrc) { try { currentSrc.stop() } catch { /* ignore */ } currentSrc = null }
-  pendingTexts.length = 0
+  // 队列里没读的句子 → 气泡补齐（只补前两句，避免刷屏）
+  if (pendingTexts.length) {
+    const dropped = pendingTexts.splice(0, pendingTexts.length)
+    droppedSpeakCount += dropped.length
+    if (!muted) {
+      for (const t of dropped) {
+        const plain = cleanSpeech(t)
+        for (const u of spokenUnits(plain, SPEAK_MAX).slice(0, 2)) showBubble(u)
+      }
+    }
+    console.info(`[nori] interrupt: ${dropped.length} 条未读文本改以气泡呈现`)
+  }
   pendingTexts.push(text)
-  void pumpQueue()
+  interruptHold += 1 // 预合成期间挂住队列，防止旧的 speakText 循环把新文本当自己的句子先播一遍
+  const switchNow = (): void => {
+    playToken += 1
+    if (currentSrc) { try { currentSrc.stop() } catch { /* ignore */ } currentSrc = null }
+    interruptHold = Math.max(0, interruptHold - 1)
+    void pumpQueue()
+  }
+  // 首句预合成：命中缓存就立刻切；否则等合成好再切（旧音频继续说完，不留空白）
+  const firstUnit = spokenUnits(cleanSpeech(parseTagged(text)[0]?.text ?? text), SPEAK_MAX)[0]
+  if (muted || !firstUnit || ttsCache.has(firstUnit)) { switchNow(); return }
+  void fetchTts(firstUnit, playToken)
+    .then(() => switchNow())
+    .catch(() => switchNow())
 }
 
 /** 同 turn 追加：加入队列尾部，不打断当前（读完上一段再接） */
@@ -496,7 +564,7 @@ async function pumpQueue(): Promise<void> {
   if (pumping) return
   pumping = true
   try {
-    while (pendingTexts.length) {
+    while (pendingTexts.length && interruptHold === 0) {
       const text = pendingTexts.shift()!
       await speakText(text, playToken)
     }
@@ -856,13 +924,19 @@ function connect(): void {
         const c = classifyEmotion(msg.text)
         if (c !== 'default') setEmotion(c)
       }
-      const t = typeof msg.turn === 'number' ? msg.turn : null
-      if (t !== null) {
-        if (activeTurn === null || t === activeTurn) {
-          if (activeTurn === null) activeTurn = t
+      // turn 身份：改写路径给的是**数字** `12`，概括路径给的是**字符串** `12-sum`。
+      // 早先这里只认数字，于是概括那批拿到 null → 落到 speakInterrupt（打断）→
+      // playToken += 1 → 正在读的那句被腰斩、队列里剩下的句子作废（实测："第一句读了一半…
+      // 第二句气泡出现并打断朗读"，最后一句凭空消失）。改成统一按字符串比较，
+      // 并把 `N-sum` 归一到同一个逻辑 turn `N`（都是同一轮回答的话，应当排队而不是抢断）。
+      const t = msg.turn === undefined || msg.turn === null ? null : String(msg.turn)
+      const base = t === null ? null : t.replace(/-sum$/, '')
+      if (base !== null) {
+        if (activeTurn === null || base === activeTurn) {
+          activeTurn = base
           speakAppend(msg.text)
         } else {
-          activeTurn = t
+          activeTurn = base
           speakInterrupt(msg.text)
         }
       } else {
