@@ -375,17 +375,6 @@ function applyInner(ctx: AppContext, config: Config) {
             snap.config[k] = o
           }
         }
-        // 同义字段取生效值：nori.config.json 的 reframe 段里若写了 reframeModel/reframeBaseUrl 等，
-        // 覆盖的是**顶层同名键**（reframe.ts 的读取逻辑如此）。界面必须显示真正生效的那个值，
-        // 否则用户看到 deepseek-chat、实际跑 DeepSeek-Flash —— 这套两处定义就是坑。
-        const rf = snap.config.reframeEnabled
-        if (rf && typeof rf === 'object') {
-          for (const [k, v] of Object.entries(rf as Record<string, unknown>)) {
-            if (k.startsWith('reframe') && k !== 'reframe' && v !== undefined && v !== null) {
-              snap.config[k] = v
-            }
-          }
-        }
         res.end(JSON.stringify(snap))
         return
       }
@@ -409,6 +398,7 @@ function applyInner(ctx: AppContext, config: Config) {
         }
         // 校验：交给 zod Schema（与启动时同一套规则），失败不落盘
         const result = configStore.apply(patch, validateConfigShape)
+        // 绝不记录请求体：里面可能含 apiKey。只记结果与键名级别的错误说明
         log('[dsh-nori-pet] config POST ' + (result.ok ? 'ok' : 'rejected: ' + (result.errors ?? []).join('; ')))
         res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
         res.end(JSON.stringify(result))

@@ -98,57 +98,18 @@ btnCfg.textContent = '⚙'
 btnCfg.title = '设置'
 controls.append(btnZoomOut, btnZoomIn, btnMute, btnCfg, btnClose)
 
-// 体型面板（可开关）：Param158 少女体型 + Param117 Q版，各自 0..1 滑槽
-const figureWrap = document.createElement('div')
-figureWrap.id = 'nori-pet-figure'
-figureWrap.style.cssText = 'position:absolute;left:50%;bottom:44px;transform:translateX(-50%);display:none;flex-direction:column;gap:5px;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.16);border-radius:12px;padding:7px 12px;font:11px/1 system-ui,"Microsoft YaHei",sans-serif;color:#fff;user-select:none;pointer-events:auto;box-shadow:0 2px 10px rgba(0,0,0,.35)'
-const mkRow = (label: string, val: number): HTMLDivElement => {
-  const row = document.createElement('div')
-  row.style.cssText = 'display:flex;align-items:center;gap:6px;white-space:nowrap'
-  const lab = document.createElement('span')
-  lab.style.cssText = 'width:52px;color:rgba(255,255,255,.85)'
-  lab.textContent = label
-  const rg = document.createElement('input')
-  rg.type = 'range'
-  rg.min = '0'; rg.max = '1'; rg.step = '0.01'
-  rg.value = String(val)
-  rg.style.cssText = 'width:110px;accent-color:#7ab8ff;margin:0;cursor:pointer;height:14px'
-  const v = document.createElement('span')
-  v.style.cssText = 'min-width:32px;text-align:right;font-family:ui-monospace,Consolas,monospace;opacity:.9'
-  v.textContent = Math.round(val * 100) + '%'
-  row.append(lab, rg, v)
-  ;(row as any).userData = { rg, v }
-  return row
-}
-const row158 = mkRow('少女体型', 0)
-const row117 = mkRow('Q版', 0)
-figureWrap.append(row158, row117)
-figureWrap.addEventListener('mouseenter', () => { figureWrap.style.opacity = '1' })
-figureWrap.addEventListener('mouseleave', () => { figureWrap.style.opacity = '.92' })
-
-const bindRow = (row: HTMLDivElement, setter: (v: number) => void): void => {
-  const u = (row as any).userData as { rg: HTMLInputElement; v: HTMLSpanElement }
-  u.rg.addEventListener('input', () => {
-    const v = parseFloat(u.rg.value)
-    u.v.textContent = Math.round(v * 100) + '%'
-    setter(v)
-  })
-}
-bindRow(row158, (v) => { figureValue = v })
-bindRow(row117, (v) => { qfigureValue = v })
 
 // 摸头热区层：在 canvas 之上、但只占头部区域（20%~80% 宽、0~42% 高），
 // root/canvas 本身 pointer-events:none 穿透 → 透明区域不挡文字选取
 const hitZone = document.createElement('div')
 hitZone.id = 'nori-pet-hit'
-root.append(dragHandle, bubble, canvas, hitZone, controls, figureWrap)
+root.append(dragHandle, bubble, canvas, hitZone, controls)
 // 层级：拖动条/按钮/面板浮于交互层之上，气泡中间
 canvas.style.zIndex = '10'
 hitZone.style.zIndex = '11'
 dragHandle.style.zIndex = '10'
 bubble.style.zIndex = '15'
 controls.style.zIndex = '20'
-figureWrap.style.zIndex = '20'
 dragHandle.style.pointerEvents = 'auto'
 // 必须有 position:absolute —— 静态定位下 top/bottom 全部无效，元素退化成 0 高度空块（实测 rect.height=0）
 dragHandle.style.position = 'absolute'
@@ -177,7 +138,6 @@ dragHandle.style.left = '0'
 dragHandle.style.right = '0'
 dragHandle.style.background = 'transparent'
 controls.style.pointerEvents = 'auto'
-figureWrap.style.pointerEvents = 'auto'
 document.body.appendChild(root)
 
 // ─── 位置：localStorage 记忆 + 拖动 ──────────────────────────────
@@ -696,8 +656,6 @@ async function startModel(): Promise<void> {
           // 气泡：bottom 锚定在头顶上方 —— 新气泡贴头、旧气泡被顶向上（远离脸）
           bubble.style.top = 'auto'
           bubble.style.bottom = String(ht + 60 * k) + 'px'
-          figureWrap.style.bottom = ''
-          figureWrap.style.top = String(Math.round(topY - 68 * k)) + 'px'
           // 摸头热区跟随体型：顶 = 头顶上方 6% 画布高（模型变矮 → 热区同步下移）
           hitZone.style.top = Math.round(Math.max(0, topY - 0.06 * hPx)) + 'px'
         syncDragBox(hPx, topY)

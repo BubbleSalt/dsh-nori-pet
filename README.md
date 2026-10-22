@@ -121,10 +121,13 @@ git clone <仓库地址>
 ## ⚙️ 配置
 
 所有配置外置在 `nori.config.json`（复制 `nori.config.example.json` 得到；本机文件不进 git）。
+
+**不想改文件？** 点桌宠浮动工具栏的 ⚙ 打开设置面板：字段由 schema 自动生成（一项不漏）、
+每项带说明与默认值、支持模型与情绪映射的可视化编辑；保存即写回 `nori.config.json`（原子写 + `.bak` 备份，密钥不回传明文）。
 **留空 = 走默认约定**（探测仓库内资产）。
-- **热生效**（改完即生效，无需重跑安装）：`reframe.apiKey`、`reframe.reframeBaseUrl`、`reframe.reframeModel`、`reframe.reframeMaxTokens`、`reframe.reframeTimeoutMs`、`ttsTemperature`、`ttsTopK`、`ttsSpeedFactor`、`refAudio`、`refPrompt`、`sovits.t2sWeights`、`sovits.vitsWeights`——这些键宿主每次请求/每次守护周期直读该文件。
+- **热生效**（改完即生效，无需重跑安装）：`reframe.apiKey`、`reframe.baseUrl`、`reframe.model`、`reframe.maxTokens`、`reframe.reframeTimeoutMs`、`ttsTemperature`、`ttsTopK`、`ttsSpeedFactor`、`refAudio`、`refPrompt`、`sovits.t2sWeights`、`sovits.vitsWeights`——这些键宿主每次请求/每次守护周期直读该文件。
 - **需重跑 `.\install.ps1`**：其余键（如改写层开关 `reframe.reframe`、`maxSentence`、`ttsUrl`、`gsvBase`、`persona*`、`ttsWatch*`、`allowedOrigins`）会被写进 profile 的 `cordis.patch.yml`，只有重装才更新。
-- 安装前**先检测 `Nori_web` 模型**（`Nori.model3.json`）——缺失直接拒绝安装；
+- 安装前**检测 `Nori_web` 模型**（`Nori.model3.json`）——缺失只警告，装完进入**纸片人模式**（气泡+语音正常，表情/动作不可用）；
 - 首次若没有 `nori.config.json`（或为空），`install.ps1` 会**交互式引导**逐项询问：声线 wav、转写文本、**是否安装 GPT-SoVITS**（约 2~3GB，可选默认权重另约 1GB+，同意则顺手调用 `install-sovits.ps1` 部署并写配置）、**改写层开关**、改写层 apiKey，并自动生成该文件；非交互环境（如 CI）自动跳过询问、全部走默认约定。
 
 | 键 | 默认 | 说明 |
@@ -136,7 +139,7 @@ git clone <仓库地址>
 | `sovits.t2sWeights` / `sovits.vitsWeights` | 空 / 空 | 推理权重路径（GPT 模型 s1 / SoVITS 模型 s2；见[GPT-SoVITS 章节](#gpt-sovits可选)） |
 | `personaPrompt` / `personaReframe` | 空（探测 `persona/`） | 人设文件路径覆盖 |
 | `maxSentence` / `ttsTemperature` / `ttsTopK` / `ttsSpeedFactor` | 140 / 0.9 / 12 / 1.0 | 断句与合成参数，多数无需改动（0.9/12 为防 AR 循环卡顿的推荐值，勿降回低温低 top_k） |
-| `detailMaxChars` / `summaryEnabled` / `summaryWaitMs` | 400 / true / 8000 | **超长内容概括**（见[朗读策略](#朗读策略超长内容怎么处理)）：一段连续输出超过 `detailMaxChars` 字就不再逐句念，改为整轮播一次概括 |
+| `detailMaxChars` / `summaryEnabled` / `summaryWaitMs` / `reframeDelayMs` | 120 / true / 2000 / 800 | **超长内容概括**（见[朗读策略](#朗读策略超长内容怎么处理)）：一段连续输出超过 `detailMaxChars` 字就不再逐句念，改为整轮播一次概括 |
 | `ttsWatch` / `ttsWatchIntervalMs` | true / 30000 | 9880 掉线守护：探测到服务不可达才自动拉起 api_v2（探测间隔下限 5000ms；判断依据是"能否拿到 HTTP 响应"，4xx/5xx 均视为存活） |
 | `allowedOrigins` | 空数组 | 非本机来源访问 WS/API 时的放行主机名（见[安全边界](#安全边界本地服务)） |
 
@@ -148,11 +151,15 @@ dsh 输出很快（约 300 token/s ≈ 450 字/秒），而中文朗读只有约
 
 | 情形 | 行为 |
 |---|---|
-| 一段连续输出 ≤ `detailMaxChars`（默认 400 字） | **全文逐句详读**（含"文本 → 工具 → 思考 → 再文本"的短段冲刺，反馈即时） |
-| 一段连续输出 > `detailMaxChars` | **这一段的正文一个字都不念**，整轮结束后播一次概括（≤4 句 / ≤150 字） |
+| 一段连续输出 ≤ `detailMaxChars`（默认 120 字，约两句） | **逐句详读**（含"文本 → 工具 → 思考 → 再文本"的短段冲刺，反馈即时） |
+| 一段连续输出 > `detailMaxChars` | 读到这个长度就**停止逐句**，把剩下的积压文本攒起来，静默 `summaryWaitMs`（默认 2 秒）后播一次概括 |
 
-为什么必须整段判断：逐句判断会出现"前半念得详细、后半突然快进"的口径断层。400 字在 450 字/秒下约
-0.9 秒即可判定，所以长内容几乎没有判定等待。
+也就是**接力**而不是二选一：先读两句，剩下的压成结论。概括的输入只包含**还没读的部分**，所以不会把开头再讲一遍。
+
+两处配套机制：
+
+- 切概括时会取消尚未发出的改写请求（`reframeDelayMs`，默认 800ms；首块不延时，保证开场响应），避免"请求刚发出就被作废"
+- 这一轮的概括帧走 `append`，接在已读内容之后，不打断正在念的那句
 
 概括的硬约束（写在概括提示词里）：保留文件名/路径、数字、命令、结论、阻塞原因、待你确认的事；
 丢掉中间过程与重复叙述；不复述已读过的开头；严禁编造，不确定就说"细节在屏幕上"。

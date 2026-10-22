@@ -509,37 +509,55 @@ if ($Origins -is [array] -and $Origins.Count -gt 0) {
   foreach ($o in $Origins) { if ([string]$o -ne '') { $cfg += "      - $(Y ([string]$o))" } }
 }
 
-# 改写层配置（可选）：nori.config.json 的 reframe 段 → patch 键。
-# 值类型按 Config schema（src/index.ts）：字符串加引号，布尔/数字裸写（数字加引号会被 z.number 拒绝）。
-# 未填的键跳过 → 插件用源码默认（默认：reframeApiKeyRef=DEEPSEEK_NORI_API_KEY，解析到即直连官方 API，否则回退 dsh llm）。
+# 改写层配置（可选）：nori.config.json 的 reframe 段 → patch 里的 `reframe` **对象**。
+# ⚠ schema 已把 reframe 从"一串顶层 reframeXxx 键"改成单个对象（src/config.ts 的 z.object）：
+#   顶层再写 reframeModel 之类属于未知键，会让整份 config 校验失败、插件根本挂不上。
+# ⚠ 旧配置文件用 reframeBaseUrl/reframeModel 这种带前缀的名字，这里两种都认（新名优先）。
 $ReframeCfg = $cfgFile.reframe
 if ($ReframeCfg) {
-  # ⚠ reframeMaxTokens 必须在这个白名单里：Config schema 有它（z.number().default(2048)）且
-  #   src 里真的用它当 max_tokens（"思考链占满 max_tokens" 那条报错就指着它）。此前漏出名单 →
-  #   用户明明在 nori.config.json 里写了 4096，会被**静默丢弃**、退回 2048。
-  foreach ($k in @('reframe', 'reframeProvider', 'reframeModel', 'reframeApiKeyRef', 'reframeBaseUrl', 'reframeTimeoutMs', 'reframeMaxInput', 'reframeMaxTokens', 'reframeTrace')) {
+  $ReframeAlias = [ordered]@{
+    baseUrl   = 'reframeBaseUrl'
+    model     = 'reframeModel'
+    maxTokens = 'reframeMaxTokens'
+    timeoutMs = 'reframeTimeoutMs'
+    maxInput  = 'reframeMaxInput'
+    trace     = 'reframeTrace'
+    provider  = 'reframeProvider'
+    apiKeyRef = 'reframeApiKeyRef'
+  }
+  $rfLines = @()
+  foreach ($k in $ReframeAlias.Keys) {
+    $oldName = $ReframeAlias[$k]
     $v = $ReframeCfg.$k
+    if ($null -eq $v) { $v = $ReframeCfg.$oldName }
     if ($null -eq $v) { continue }
-    if ($v -is [bool]) { $cfg += "    ${k}: $(if ($v) { 'true' } else { 'false' })"; continue }
-    # ⚠ 数值判定**不能**只认 [int]/[double]：pwsh 7 的 ConvertFrom-Json 把 60000 反序列化成
-    #   **Int64**（PS 5.1 是 Int32），于是 `-is [int]` / `-is [double]` / "是数字就跳过" 三条全 False，
-    #   直接掉到下面的字符串分支 → 写出 `reframeTimeoutMs: '60000'`。宿主 schema 是 z.number()，
-    #   字符串会让**整份 config 校验失败 → cordis 把该条目置为 INACTIVE → Nori 根本不挂载**，
-    #   而脚本照样打印 Install done（真实 nori.config.json 里就是 60000，下一次 pwsh 安装即触发）。
-    #   实测：PS5.1 Int32/Decimal，pwsh Int64/Double，大整数两边都是 Int64。
+    if ($v -is [bool]) {
+      $rfLines += "      ${k}: $(if ($v) { 'true' } else { 'false' })"
+      continue
+    }
+    # ⚠ 数值判定要覆盖 Int64（pwsh 的 ConvertFrom-Json 产物）：只认 [int]/[double] 会掉进字符串分支，
+    #   写出 `timeoutMs: '60000'` → z.number 拒绝 → 整份 config 校验失败（历史坑）
     if ($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [single] -or $v -is [decimal]) {
       $d = [double]$v
-      # 只接受正数：z.number() 收 0/负数也合法，但 0 在这里意味着"没配"，语义上跳过更安全。
-      if ($d -gt 0) {
-        if ([math]::Abs($d - [math]::Round($d)) -lt 1e-9) { $cfg += "    ${k}: $([long][math]::Round($d))"; continue }
-        # 非整数正数：不写（旧的 [double] 分支同样是"跳过"）——避免小数点在不同区域设置下写成逗号
+      if ($d -gt 0 -and [math]::Abs($d - [math]::Round($d)) -lt 1e-9) {
+        $rfLines += "      ${k}: $([long][math]::Round($d))"
       }
       continue
     }
-    $s = [string]$v
-    if ($s -eq '') { continue }
-    $cfg += "    ${k}: $(Y $s)"
+    $sv = [string]$v
+    if ($sv -eq '') { continue }
+    $rfLines += "      ${k}: $(Y $sv)"
   }
+  if ($rfLines.Count -gt 0) {
+    $cfg += '    reframe:'
+    $cfg += $rfLines
+  }
+}
+
+# 改写开关独立字段（schema: reframeEnabled）。旧配置可能把布尔写在 reframe 里吗？
+# 不会——配置文件的 reframe 一直是对象；布尔只在 patch 层。这里支持显式写 reframeEnabled。
+if ($null -ne $cfgFile.reframeEnabled) {
+  $cfg += "    reframeEnabled: $(if ($cfgFile.reframeEnabled) { 'true' } else { 'false' })"
 }
 
 # 改写层专用 key（可选）：nori.config.json 的 reframe.apiKey → 写入 dsh credentials 的
