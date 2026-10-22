@@ -11,11 +11,17 @@ import { SPEAK_MAX, spokenUnits, widthOf } from '../segmentation.js'
 import { PREFIX } from '../protocol.js'
 import { Live2DModel } from 'pixi-live2d-display/cubism4'
 import type { Emotion } from '../emotions.js'
-import { classifyEmotion } from '../emotions.js'
 import { parseTaggedSentences } from '../speakText.js'
 import type { TaggedSentence } from '../speakText.js'
 import { createSpeakQueue } from '../speakQueue.js'
 import { createTtsClient } from '../ttsClient.js'
+import { emotionForAssistantText } from '../speakText.js'
+import { planAssistantRoute } from '../turns.js'
+import { createSleepTimer } from '../sleepTimer.js'
+import { PAT_REPLIES, createPatDetector, inHeadZone } from '../patStroke.js'
+import { SCALE_STEP, canvasSize as sizeFor, clampPos as clampPosTo, clampScale, defaultPos, stepScale, wheelScale } from '../clientLayout.js'
+import { createWsClient } from '../wsClient.js'
+import type { WsLike } from '../wsClient.js'
 ;(window as any).PIXI = PIXI
 
 // 路由前缀来自 protocol.ts（与宿主、smoke-test 同一份）；宿主 hello 帧下发的 prefix 与之同源
@@ -144,12 +150,7 @@ document.body.appendChild(root)
 
 // ─── 位置：localStorage 记忆 + 拖动 ──────────────────────────────
 const POS_KEY = 'nori-pet-pos'
-function clampPos(x: number, y: number): [number, number] {
-  // 收边用：保留边缘 12px 可抓回（松手时才执行，拖动中不受限）
-  const maxX = Math.max(0, window.innerWidth - 12)
-  const maxY = Math.max(0, window.innerHeight - 12)
-  return [Math.min(Math.max(-80, x), maxX), Math.min(Math.max(-80, y), maxY)]
-}
+const clampPos = (x: number, y: number): [number, number] => clampPosTo(x, y, window.innerWidth, window.innerHeight)
 function applyPos(x: number, y: number): void {
   const [cx, cy] = clampPos(x, y)
   root.style.right = ''
@@ -167,34 +168,28 @@ function restorePos(): void {
   // 拖动的整个生命周期都在 left/top 坐标系里（垂直拖动不会再被 bottom 竞争钉死）
   try {
     const r = root.getBoundingClientRect()
-    applyPos(Math.max(0, window.innerWidth - r.width - 12), Math.max(0, window.innerHeight - r.height - 12))
+    const [dx, dy] = defaultPos(r.width, r.height, window.innerWidth, window.innerHeight)
+    applyPos(dx, dy)
   } catch { /* ignore */ }
 }
 restorePos()
 
 // ─── 缩放：＋/－按钮 + 滚轮，模型与面板同步缩放并记忆 ────────────
 const SCALE_KEY = 'nori-pet-scale'
-const MIN_SCALE = 0.4
-const MAX_SCALE = 4.0
 let scaleFactor = 1
 try {
   const v = parseFloat(localStorage.getItem(SCALE_KEY) || '1')
-  if (isFinite(v)) scaleFactor = Math.min(MAX_SCALE, Math.max(MIN_SCALE, v))
+  if (isFinite(v)) scaleFactor = clampScale(v)
 } catch { /* ignore */ }
 let baseScale = 0
 let modelRatio = 1 // 模型原生宽高比（加载时一次性记录，避免运行时读取 0/NaN）
 function curH(): number { return root.offsetHeight || LOGICAL_H }
 /** 画布尺寸：高度按 LOGICAL_H×f（不随体型/Q版参数变化）；宽度 = 原贴合宽的 60%（更窄、去两侧空白） */
 function canvasSize(): [number, number] {
-  const f = scaleFactor
-  const h = Math.max(48, Math.round(LOGICAL_H * f))
-  const wFull = Math.max(48, Math.round(h * modelRatio))
-  const wMax = Math.max(48, Math.round(LOGICAL_W * f))
-  const w0 = Math.min(wFull, wMax)
-  return [w0, h]
+  return sizeFor(scaleFactor, modelRatio, LOGICAL_W, LOGICAL_H)
 }
 function applyScale(f: number): void {
-  scaleFactor = Math.min(MAX_SCALE, Math.max(MIN_SCALE, f))
+  scaleFactor = clampScale(f)
   const [w, h] = canvasSize()
   root.style.width = w + 'px'
   if (app) {
@@ -215,12 +210,12 @@ function applyScale(f: number): void {
   const r = root.getBoundingClientRect()
   if (r.left !== 0 || r.top !== 0) applyPos(r.left, r.top)
 }
-btnZoomIn.addEventListener('click', () => applyScale(scaleFactor + 0.15))
-btnZoomOut.addEventListener('click', () => applyScale(scaleFactor - 0.15))
+btnZoomIn.addEventListener('click', () => applyScale(stepScale(scaleFactor, SCALE_STEP)))
+btnZoomOut.addEventListener('click', () => applyScale(stepScale(scaleFactor, -SCALE_STEP)))
 // 滚轮缩放：绑在摸头热区 + 拖动条上（canvas 已穿透，不再接收事件）
 const onWheel = (e: WheelEvent): void => {
   e.preventDefault()
-  applyScale(scaleFactor * (e.deltaY < 0 ? 1.1 : 0.9))
+  applyScale(wheelScale(scaleFactor, e.deltaY))
 }
 hitZone.addEventListener('wheel', onWheel, { passive: false })
 dragHandle.addEventListener('wheel', onWheel, { passive: false })
@@ -432,7 +427,7 @@ async function speakText(text: string, token: number): Promise<void> {
     if (token !== playToken) break
     ensureFetches(i + MAX_INFLIGHT) // 播放到 i 时，窗口推进预取到 i+4
     const emo = sentences[i].emo
-    if (emo && !sleeping) setEmotion(emo) // LLM 情绪标签 → 逐句激活表情
+    if (emo && !sleep.isSleeping()) setEmotion(emo) // LLM 情绪标签 → 逐句激活表情
     // 句首清场：表情切换可能残留嘴部参数，先归零再开播（保证口型从 0 跟随音量）
     try { (model as any).internalModel.coreModel.setParameterValueById(MOUTH_ID, 0, 1.0) } catch { /* ignore */ }
     showBubble(sentences[i].text)
@@ -521,7 +516,7 @@ function scheduleEmotionReset(ms: number): void {
  */
 function setEmotion(e: Emotion, opts?: { force?: boolean; forceReaction?: boolean; noReaction?: boolean }): void {
   if (!model) return
-  if (sleeping) return // 睡觉不动表情（闭眼状态归睡觉逻辑管）
+  if (sleep.isSleeping()) return // 睡觉不动表情（闭眼状态归睡觉逻辑管）
   if (e === 'default') {
     currentEmotion = 'default'
     lastExprApplied = '' // 清门控：下一个表情无条件生效（"无表情在位"语义）
@@ -531,7 +526,7 @@ function setEmotion(e: Emotion, opts?: { force?: boolean; forceReaction?: boolea
       const em = (model as any).internalModel.motionManager.expressionManager
       if (em?.resetExpression) em.resetExpression()
     } catch { /* ignore */ }
-    if (!stroke) { try { model.motion('Idle', 0) } catch { /* ignore */ } } // 回待机动作
+    if (!pat.active()) { try { model.motion('Idle', 0) } catch { /* ignore */ } } // 回待机动作
     return
   }
   const changed = currentEmotion !== e
@@ -548,7 +543,7 @@ function setEmotion(e: Emotion, opts?: { force?: boolean; forceReaction?: boolea
     }
   }
   // noReaction：摸头等需要保持头部跟随的场景禁用 reaction 动作；揉头中（stroke）也一律不播，防头部曲线回盖
-  if (typeof cfg.reaction === 'number' && !stroke && !opts?.noReaction && (opts?.forceReaction || (changed && !currentSrc))) {
+  if (typeof cfg.reaction === 'number' && !pat.active() && !opts?.noReaction && (opts?.forceReaction || (changed && !currentSrc))) {
     try { model.motion('Reactions', cfg.reaction) } catch { /* ignore */ }
   }
   scheduleEmotionReset(cfg.holdMs ?? 8000)
@@ -667,15 +662,15 @@ async function startModel(): Promise<void> {
       try {
         const core = (model as any).internalModel.coreModel
         // 摸头反馈（被揉感加强）：头部大幅跟随鼠标、跟手更快；松手/睡觉回中
-        strokeSX += ((stroke ? strokeHeadX : 0) - strokeSX) * 0.25
-        strokeSY += ((stroke ? strokeHeadY : 0) - strokeSY) * 0.25
-        const sc = sleeping ? 0 : 1
-        core.setParameterValueById('ParamAngleX', strokeSX * 24 * sc, 1.0) // 转头 ±24°
-        core.setParameterValueById('ParamAngleY', strokeSY * 18 * sc, 1.0) // 点头 ±18°
-        core.setParameterValueById('ParamAngleZ', strokeSX * 14 * sc, 1.0) // 歪头 ±14°
+        strokeHead.sx += ((pat.active() ? strokeHead.x : 0) - strokeHead.sx) * 0.25
+        strokeHead.sy += ((pat.active() ? strokeHead.y : 0) - strokeHead.sy) * 0.25
+        const sc = sleep.isSleeping() ? 0 : 1
+        core.setParameterValueById('ParamAngleX', strokeHead.sx * 24 * sc, 1.0) // 转头 ±24°
+        core.setParameterValueById('ParamAngleY', strokeHead.sy * 18 * sc, 1.0) // 点头 ±18°
+        core.setParameterValueById('ParamAngleZ', strokeHead.sx * 14 * sc, 1.0) // 歪头 ±14°
         // 兜底：揉头期间每帧无条件停掉一切动作（idle/reaction 的头部曲线任何时刻都会被清掉，
         // 不依赖偏差检测——快速连续揉动也不会被 fade 中的动作拽走头部）
-        if (stroke && performance.now() - strokeDownT > 120) {
+        if (pat.active() && performance.now() - strokeDownAt > 120) {
           try { ;(model as any).internalModel.motionManager.stopAllMotions() } catch { /* ignore */ }
         }
         // UI 锚定模型头顶（纯比例，无扫描无浮动）；相对 canvas 顶部（top 坐标系）+ 气泡 bottom 定位：
@@ -704,7 +699,7 @@ async function startModel(): Promise<void> {
     }
     tick()
     // ── 苏醒流程：初始呈现睡眠（Sleep 组 00_Sleep）→ 首次点击页面后醒来打招呼（手势解锁音频，语音才能出声）→ 微笑驻留超时回落纯 idle ──
-    sleeping = true // 初始睡眠态（不启动入睡计时，唤醒后 resetSleepTimer 自然接管）
+    sleep.markSleeping() // 初始睡眠态（不排入睡计时，唤醒后 reset 自然接管）
     playSleepMotion() // 00_Sleep（原版 Idle 组内成员：指定 index 播放 + 置永续 loop）
     const GREETING = '你回来啦！Nori真的等你好久了呀......这里一下子又暖起来了。'
     let greetingDone = false
@@ -735,114 +730,82 @@ function initLive2D(): void {
   void startModel()
 }
 
-// ─── WebSocket 订阅（agent 输出 → 气泡 + 朗读） ─────────────────
-let ws: WebSocket | null = null
-let wsRetry = 0
-let lastMsg = ''
-let lastSpeak = ''
-function connect(): void {
-  try {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    ws = new WebSocket(proto + '://' + location.host + PREFIX + '/ws')
-  } catch {
-    ws = null
+/** 协议分发：agent 输出 → 气泡 + 朗读；turn/情绪/权限申请都在这里路由 */
+function handleWsMessage(raw: string, reply: (data: string) => void): void {
+  let msg: any
+  try { msg = JSON.parse(raw) } catch { return }
+  lastMsg = raw.slice(0, 120)
+  reply(JSON.stringify({ type: 'ack' }))
+  if (msg.type === 'approval' && typeof msg.text === 'string' && msg.text) {
+    // 权限申请提醒：打断当前朗读优先播报（原文，提醒用户回来处理）
+    lastSpeak = msg.text.slice(0, 60)
+    activeTurn = null
+    setThinking(false)
+    setEmotion('surprised') // 惊一下：权限申请需要用户注意
+    speakInterrupt(msg.text)
+    return
   }
-  if (!ws) { showBubble('（无法连接宿主）'); return }
-  ws.onopen = () => {
-    wsRetry = 0
-    ws!.send(JSON.stringify({ type: 'hello', sessionId: '' }))
+  if (msg.type === 'assistant' && typeof msg.text === 'string' && msg.text) {
+    lastSpeak = msg.text.slice(0, 60)
+    setThinking(false) // 有输出了，思考态结束
+    // 情绪联动：优先 LLM 情绪标签（首句）；普通句只有命中关键词才切情绪——无情绪句
+    // 不打断当前表情（驻留由 scheduleEmotionReset 统一管理，避免逐句推流把表情秒打回 default）
+    const emo = emotionForAssistantText(msg.text)
+    if (emo) setEmotion(emo)
+    // turn 身份：改写路径给的是**数字** `12`，概括路径给的是**字符串** `12-sum`。
+    // 早先这里只认数字，于是概括那批拿到 null → 落到 speakInterrupt（打断）→
+    // playToken += 1 → 正在读的那句被腰斩、队列里剩下的句子作废（实测："第一句读了一半…
+    // 第二句气泡出现并打断朗读"，最后一句凭空消失）。改成统一按字符串比较，
+    // 并把 `N-sum` 归一到同一个逻辑 turn `N`（都是同一轮回答的话，应当排队而不是抢断）。
+    const route = planAssistantRoute(activeTurn, msg.turn)
+    activeTurn = route.base
+    if (route.action === 'append') speakAppend(msg.text)
+    else speakInterrupt(msg.text)
+    return
   }
-  ws.onmessage = (ev) => {
-    let msg: any
-    try { msg = JSON.parse(ev.data as string) } catch { return }
-    lastMsg = String(ev.data).slice(0, 120)
-    try { ws!.send(JSON.stringify({ type: 'ack' })) } catch { /* ignore */ }
-    if (msg.type === 'approval' && typeof msg.text === 'string' && msg.text) {
-      // 权限申请提醒：打断当前朗读优先播报（原文，提醒用户回来处理）
-      lastSpeak = msg.text.slice(0, 60)
-      activeTurn = null
-      setThinking(false)
-      setEmotion('surprised') // 惊一下：权限申请需要用户注意
-      speakInterrupt(msg.text)
-      return
-    }
-    if (msg.type === 'assistant' && typeof msg.text === 'string' && msg.text) {
-      lastSpeak = msg.text.slice(0, 60)
-      setThinking(false) // 有输出了，思考态结束
-      // 情绪联动：优先 LLM 情绪标签（首句）；普通句只有命中关键词才切情绪——无情绪句
-      // 不打断当前表情（驻留由 scheduleEmotionReset 统一管理，避免逐句推流把表情秒打回 default）
-      const firstTag = parseTaggedSentences(msg.text).find((t) => t.emo)
-      if (firstTag && firstTag.emo) setEmotion(firstTag.emo)
-      else {
-        const c = classifyEmotion(msg.text)
-        if (c !== 'default') setEmotion(c)
-      }
-      // turn 身份：改写路径给的是**数字** `12`，概括路径给的是**字符串** `12-sum`。
-      // 早先这里只认数字，于是概括那批拿到 null → 落到 speakInterrupt（打断）→
-      // playToken += 1 → 正在读的那句被腰斩、队列里剩下的句子作废（实测："第一句读了一半…
-      // 第二句气泡出现并打断朗读"，最后一句凭空消失）。改成统一按字符串比较，
-      // 并把 `N-sum` 归一到同一个逻辑 turn `N`（都是同一轮回答的话，应当排队而不是抢断）。
-      const t = msg.turn === undefined || msg.turn === null ? null : String(msg.turn)
-      const base = t === null ? null : t.replace(/-sum$/, '')
-      if (base !== null) {
-        if (activeTurn === null || base === activeTurn) {
-          activeTurn = base
-          speakAppend(msg.text)
-        } else {
-          activeTurn = base
-          speakInterrupt(msg.text)
-        }
-      } else {
-        activeTurn = null
-        speakInterrupt(msg.text)
-      }
-      return
-    }
-    // 思考表情：agent 工作中（用户发言 / 工具调用）→ 沉思；turn 结束回收
-    if (msg.type === 'user') {
-      turnActive = true // turn 激活：清晰睡计时器（turn 未结束不入睡）
-      if (sleepTimer) { window.clearTimeout(sleepTimer); sleepTimer = null }
-      wakeUp() // 用户开口即唤醒，不等到第一句回答
-      setThinking(true)
-      return
-    }
-    if (msg.type === 'tool') { setThinking(true); return }
-    if (msg.type === 'turn-end') {
-      turnActive = false // turn 结束：睡眠计时此刻才开始
-      setThinking(false)
-      resetSleepTimer()
-      return
-    }
-    // emote：宿主 /api/emote 手动触发（验证情绪联动用）
-    if (msg.type === 'emote') {
-      const e = String(msg.e ?? '')
-      if (e in EMOTION_TABLE) { setThinking(false); setEmotion(e as Emotion) }
-      if (typeof msg.text === 'string' && msg.text) { activeTurn = null; speakInterrupt(msg.text) }
-      return
-    }
+  // 思考表情：agent 工作中（用户发言 / 工具调用）→ 沉思；turn 结束回收
+  if (msg.type === 'user') {
+    sleep.setTurnActive(true) // turn 激活：清入睡计时（turn 未结束不入睡）
+    sleep.setTurnActive(true)
+    wakeUp() // 用户开口即唤醒，不等到第一句回答
+    setThinking(true)
+    return
   }
-  ws.onclose = () => {
-    ws = null
-    if (!document.hidden && wsRetry < 10) {
-      wsRetry += 1
-      setTimeout(connect, Math.min(10000, 1000 * wsRetry))
-    }
+  if (msg.type === 'tool') { setThinking(true); return }
+  if (msg.type === 'turn-end') {
+    sleep.setTurnActive(false) // turn 结束：入睡计时此刻才开始
+    setThinking(false)
+    resetSleepTimer()
+    return
   }
-  ws.onerror = () => { try { ws!.close() } catch { /* ignore */ } }
+  // emote：宿主 /api/emote 手动触发（验证情绪联动用）
+  if (msg.type === 'emote') {
+    const e = String(msg.e ?? '')
+    if (e in EMOTION_TABLE) { setThinking(false); setEmotion(e as Emotion) }
+    if (typeof msg.text === 'string' && msg.text) { activeTurn = null; speakInterrupt(msg.text) }
+    return
+  }
 }
 
-// ─── WS 自愈：长时间后台（document.hidden，onclose 不重连）或宿主重启后，WebSocket 会永久
-//      挂起 → 新消息收不到 → Nori 永远醒不来。恢复可见时立即唤醒 + 重连；另加周期兜底。 ──
-function ensureWs(): void {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return
-  if (!ws) connect()
-}
+// ─── WebSocket：传输/重连/自愈在 src/wsClient.ts（后台不重连、回前台补连、周期兜底都有断言）──
+let lastMsg = ''
+let lastSpeak = ''
+const ws = createWsClient({
+  url: () => (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + PREFIX + '/ws',
+  create: (url) => new WebSocket(url) as unknown as WsLike,
+  hello: () => JSON.stringify({ type: 'hello', sessionId: '' }),
+  onMessage: (raw, reply) => handleWsMessage(raw, reply),
+  isHidden: () => document.hidden,
+  onConnectError: () => showBubble('（无法连接宿主）'),
+  log: (m) => console.warn(m),
+})
+ws.connect()
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) return
   wakeUp() // 回到桌面先醒（用户回来看到的就是待机态）
-  ensureWs() // hidden 期间断掉的连接在此补上
+  ws.ensure() // hidden 期间断掉的连接在此补上
 })
-setInterval(ensureWs, 15000) // 周期自愈：宿主重启 / 长连接被服务端回收等兜底
+setInterval(() => ws.ensure(), 15000) // 周期自愈：宿主重启 / 长连接被服务端回收等兜底
 
 let hidden = false
 btnClose.addEventListener('click', () => {
@@ -854,111 +817,62 @@ btnClose.addEventListener('click', () => {
 
 // ─── 摸头（按住+拖动摩擦触发）：长按摩擦一小会才说台词（台词绑定情绪）；
 //      摩擦途中头部轻微跟随（被揉反馈）；音效接口留占位（找到音源后接入）。
-const PAT_REPLIES: Array<{ text: string; emo: Emotion }> = [
-  { text: '头发都被你揉乱啦。', emo: 'shy' },
-  { text: '再摸就要收费啦。', emo: 'happy' },
-  { text: 'Nori不是小狗啦。', emo: 'speechless' },
-  { text: '你是不是把Nori当宠物了？', emo: 'doubt' },
-  { text: '为什么摸我的头呀。', emo: 'doubt' },
-  { text: '摸完要负责陪我玩游戏哦。', emo: 'happy' },
-  { text: '你摸Nori，Nori也不会掉毛的。', emo: 'speechless' },
-  { text: '好乖....啊，说反了，是你在摸我。', emo: 'shy' },
-  { text: '只有Nori有摸头待遇吗？', emo: 'doubt' },
-  { text: '嘿嘿，摸摸头很舒服，感觉芯片都要开心得发热了。', emo: 'happy' },
-  { text: '这算是表扬吗？那我记下来了。', emo: 'shy' },
-]
-const HEAD_ZONE = { x0: 0.2, x1: 0.8, y1: 0.42 } // 头部区域（画布归一化）
-let stroke = false // 是否正在摸头摩擦
-let strokeDownT = 0 // 按下时刻
-let strokeDist = 0 // 累计拖动距离（px）
-let strokeLastX = 0
-let strokeLastY = 0
-let strokeTriggered = false
-let strokeHeadX = 0 // 摩擦中鼠标相对画布中心偏移（-1..1，头部跟随目标）
-let strokeHeadY = 0
-let strokeSX = 0 // 平滑跟踪（tick 里 lerp，松手回中）
-let strokeSY = 0
+// ─── 摸头：触发判定与台词表在 src/patStroke.ts（按住时长/拖动距离/冷却都有断言）──
+const pat = createPatDetector()
+const strokeHead = { x: 0, y: 0, sx: 0, sy: 0 } // 目标 + 平滑跟踪（tick 里 lerp，松手回中）
+let strokeDownAt = 0
 
 function canvasPos(e: PointerEvent): [number, number] {
   const rect = canvas.getBoundingClientRect()
   return rect.width ? [(e.clientX - rect.left) / rect.width, (e.clientY - rect.top) / rect.height] : [0.5, 1]
 }
-function inHeadZone(x: number, y: number): boolean {
-  return x >= HEAD_ZONE.x0 && x <= HEAD_ZONE.x1 && y <= HEAD_ZONE.y1
-}
-// 摸头台词冷却：触发台词后此时间内再摸只跟随反馈、不说话（防连续刷屏）
-const PAT_COOLDOWN_MS = 6000
-let patCooldownUntil = 0
 
-function triggerPat(): void {
-  if (strokeTriggered) return
-  strokeTriggered = true
+/** 触发摸头台词：切表情（不播 reaction 动作，否则头部曲线会覆盖揉头跟随）+ 优先插播 */
+function sayPat(): void {
   wakeUp()
-  // 冷却中：摸头反馈始终是"被揉"（头部跟随一直在 tick 里），只在冷却到点后加台词/表情
-  const now = Date.now()
-  if (now < patCooldownUntil) return
-  patCooldownUntil = now + PAT_COOLDOWN_MS
-  const pat = PAT_REPLIES[Math.floor(Math.random() * PAT_REPLIES.length)]
-  // 只切表情、不播 reaction 动作（动作含头部曲线会覆盖揉头跟随）
-  setEmotion(pat.emo, { force: true, noReaction: true })
-  // speak 内部会显示气泡并朗读 —— 这里不再单独 showBubble，避免重复显示
-  speakPriority(pat.text) // 摸头台词优先插入：不截断正在排队等待的朗读文本
+  const p2 = PAT_REPLIES[Math.floor(Math.random() * PAT_REPLIES.length)]
+  setEmotion(p2.emo, { force: true, noReaction: true })
+  speakPriority(p2.text) // 摸头台词优先插入：不截断正在排队等待的朗读文本
 }
+
+/** 摩擦开始：停掉待机动作（00_Idle 的曲线每帧覆盖 ParamAngleX/Y/Z，头部交给揉头参数驱动） */
 function startStroke(): void {
-  stroke = true
-  strokeDownT = performance.now()
-  strokeDist = 0
-  strokeTriggered = false
-  // ── 摩擦音效接口占位：找到音源后在这里循环播放（音量 ~0.2），endStroke() 里停止 ──
-  // 关键：停掉待机动作（00_Idle 的曲线每帧覆盖 ParamAngleX/Y/Z），头部完全交给揉头参数驱动
-  try { ;(model as any).internalModel.motionManager.stopAllMotions() } catch { /* ignore */ }
+  strokeDownAt = performance.now() // 揉头 120ms 后再每帧强停动作（见 tick）
+  try { (model as any).internalModel.motionManager.stopAllMotions() } catch { /* ignore */ }
 }
+
 function endStroke(): void {
-  if (!stroke) return
-  stroke = false
-  // ── 摩擦音效停止占位 ──
+  if (!pat.active()) return
+  pat.end()
   // 恢复待机动作（idle 或睡眠闭眼），头部控制权交还原动作；睡眠恢复用 FORCE（同 NORMAL 守卫）
-  if (sleeping) {
+  if (sleep.isSleeping()) {
     const t = sleepMotionTarget()
     if (t && model) { try { model.motion(t.group, t.index, 3) } catch { /* ignore */ } }
     ensureSleepLoop()
   } else if (model) { try { model.motion('Idle', 0) } catch { /* ignore */ } }
 }
-
 hitZone.addEventListener('pointerdown', (e) => {
-  if (e.button !== 0 || stroke) return
+  if (e.button !== 0 || pat.active()) return
   const [x, y] = canvasPos(e)
   if (!inHeadZone(x, y)) return
   startStroke()
-  strokeLastX = e.clientX
-  strokeLastY = e.clientY
+  pat.start(performance.now(), e.clientX, e.clientY)
   try { hitZone.setPointerCapture(e.pointerId) } catch { /* ignore */ }
   wakeUp()
 })
 window.addEventListener('pointermove', (e) => {
-  if (!stroke) return
+  if (!pat.active()) return
   const [x, y] = canvasPos(e)
-  // 摩擦中：累计拖动距离 + 头部跟随目标
-  const dx = e.clientX - strokeLastX
-  const dy = e.clientY - strokeLastY
-  strokeDist += Math.sqrt(dx * dx + dy * dy)
-  strokeLastX = e.clientX
-  strokeLastY = e.clientY
-  strokeHeadX = Math.max(-1, Math.min(1, (x - 0.5) * 2))
-  strokeHeadY = Math.max(-1, Math.min(1, (y - 0.5) * 2))
-  // 触发：按住 ≥2000ms + 拖动 ≥20px（长按摩擦才触发台词；动效反馈在 startStroke 后即有头部跟随）
-  const held = performance.now() - strokeDownT
-  if (!strokeTriggered && held > 2000 && strokeDist > 20) triggerPat()
+  const r = pat.move(x, y, e.clientX, e.clientY, performance.now())
+  strokeHead.x = r.headX
+  strokeHead.y = r.headY
+  if (r.speaks) sayPat()
 })
 const endStrokeP = (): void => endStroke()
 window.addEventListener('pointerup', endStrokeP)
 window.addEventListener('pointercancel', endStrokeP)
 
 // ─── 睡觉状态机：N 分钟无交互 → 播 Sleep 组 00_Sleep；任何交互/朗读 → 唤醒 ──
-const SLEEP_AFTER_MS = 90000 // 90 秒无交互入睡（原 180s 减半）
-let sleeping = false
-let sleepTimer: number | null = null
-let turnActive = false // turn 生命周期：user→turn-end 之间活跃；活跃期不启动入睡计时
 let lastMoveActivity = 0
 let lastMoveX = -1
 let lastMoveY = -1
@@ -967,7 +881,7 @@ root.addEventListener('pointerdown', () => wakeUp())
 root.addEventListener('wheel', () => wakeUp(), { passive: true })
 root.addEventListener('pointermove', (e) => {
   // 睡眠中悬停不算交互唤醒（仅点击/滚轮/朗读唤醒）——否则鼠标路过/停在头部区域就会误唤醒睁眼
-  if (sleeping) return
+  if (sleep.isSleeping()) return
   const now = Date.now()
   if (now - lastMoveActivity <= 5000) {
     lastMoveX = e.clientX
@@ -984,11 +898,6 @@ root.addEventListener('pointermove', (e) => {
   }
 })
 
-function resetSleepTimer(): void {
-  if (turnActive) { if (sleepTimer) { window.clearTimeout(sleepTimer); sleepTimer = null }; return } // turn 未结束不入睡
-  if (sleepTimer) window.clearTimeout(sleepTimer)
-  sleepTimer = window.setTimeout(goSleep, SLEEP_AFTER_MS)
-}
 
 /** 让睡眠动作真正循环（Sleep 组或 Idle 组内的睡眠动作）：这版 pixi 库不消费 motion3.json 的
  * Loop 字段（_isLoop 恒 false）→ 播 3 秒即 finished → 库会自动随机重播 idle 池（睁眼）。
@@ -1036,7 +945,7 @@ function playSleepMotion(): void {
         const t2 = sleepMotionTarget()
         const mm = (model as any)?.internalModel?.motionManager
         const active = !!t2 && !!mm?.state && mm.state.currentGroup === t2.group
-        if (sleeping && t2 && model && !active) {
+        if (sleep.isSleeping() && t2 && model && !active) {
           const p2 = model.motion(t2.group, t2.index, 3)
           if ((p2 as any)?.then) (p2 as any).then(ensureSleepLoop)
         }
@@ -1045,50 +954,45 @@ function playSleepMotion(): void {
   } catch { /* ignore */ }
 }
 
-function goSleep(): void {
-  if (!model) { resetSleepTimer(); return }
-  if (sleeping) return
-  // 朗读中不入睡：长回复逐句播放可能超过 90s，播放完后的完整空闲再重新计时
-  if (currentSrc || queue.busy()) { resetSleepTimer(); return }
-  if (currentEmotion !== 'default') setEmotion('default') // 睡前清表情，防止带嘴/带眼表情残留睁眼
-  sleeping = true
-  playSleepMotion()
-  showBubble('唔……Nori要睡着了。')
-}
-
-function wakeUp(): void {
-  if (!sleeping) {
-    // 假醒防御：逻辑已醒，但画面可能仍卡在睡眠动作（FORCE 循环未被清掉）→ 强制切回待机
-    try {
+// 入睡计时与状态在 src/sleepTimer.ts（turn 未结束不睡、朗读中不睡、假醒防御都在那里有断言）。
+// 这里只提供"怎么睡、怎么醒"的模型动作。
+const sleep = createSleepTimer({
+  canSleep: () => !!model && !currentSrc && !queue.busy(),
+  onSleep: () => {
+    if (currentEmotion !== 'default') setEmotion('default') // 睡前清表情，防带嘴/带眼的残留睁眼
+    playSleepMotion()
+    showBubble('唔……Nori要睡着了。')
+  },
+  onWake: (wasSleeping) => {
+    if (!model) return
+    if (!wasSleeping) {
+      // 假醒防御：逻辑已醒，但画面可能仍卡在睡眠动作（FORCE 循环未被清掉）→ 强制切回待机
       const t = sleepMotionTarget()
-      const mm = (model as any)?.internalModel?.motionManager
-      if (model && t && mm?.state && mm.state.currentGroup === t.group) {
+      const mm = (model as any).internalModel.motionManager
+      if (t && mm?.state && mm.state.currentGroup === t.group) {
         try { mm.stopAllMotions() } catch { /* ignore */ }
         try { model.motion('Idle', 0) } catch { /* ignore */ }
       }
-    } catch { /* ignore */ }
-    resetSleepTimer()
-    return
-  }
-  sleeping = false
-  if (model) {
-    // 必须先清空动作队列：00_Sleep 已被置为永续 loop（NORMAL 优先级永不 finished），
-    // 直接 motion('Idle',0)（同为 NORMAL）会被库的同级覆盖检查拒绝 → 动作永远卡在睡姿。
-    // stopAllMotions 清掉 Sleep 条目与 currentPriority → Idle 0 才能正常启动。
+      return
+    }
+    // 真醒：必须先清空动作队列 —— 00_Sleep 被置为永续 loop，直接 motion('Idle',0) 会被同级
+    // 覆盖检查拒绝 → 动作永远卡在睡姿
     try { (model as any).internalModel.motionManager.stopAllMotions() } catch { /* ignore */ }
-    try { model.motion('Idle', 0) } catch { /* ignore */ } // 回待机
-  }
-  resetSleepTimer()
-  setEmotion('default') // 睡醒回纯 idle（无表情）
-}
+    try { model.motion('Idle', 0) } catch { /* ignore */ }
+    setEmotion('default') // 睡醒回纯 idle
+  },
+})
+const resetSleepTimer = (): void => sleep.reset()
+const wakeUp = (): void => sleep.wake()
+
+
 
 initLive2D()
-connect()
 
 ;(window as any).__noriPetWidget = {
   root, showBubble, speak,
   get model() { return model },
-  diag: () => ({ wsState: ws?.readyState ?? -1, wsRetry, muted, lastMsg, lastSpeak, scale: scaleFactor,
+  diag: () => ({ wsState: ws.healthy() ? 1 : -1, wsRetry: ws.retries(), muted, lastMsg, lastSpeak, scale: scaleFactor,
     pos: root.style.left || root.style.right, top: root.style.top || root.style.bottom }),
   // 调试：让 Nori 说一段带标签的句子（完整走朗读 + 情绪标签链路）。
   // 用法：__noriPetWidget.say('【happy】晚饭吃什么好呀~\n【think】嗯……想想')
@@ -1119,7 +1023,7 @@ connect()
         motion: cur,        // 当前播放动作（group = Idle[0,2,3] / Sleep[0] / Reactions[0..12]）
         reserved: reserve,  // 排队待播的下一动作（如有）
         expression: ex && ex.File ? { file: ex.File, name: ex.Name ?? null } : null,
-        sleeping, stroke, thinking, emotion: currentEmotion,
+        sleeping: sleep.isSleeping(), stroke: pat.active(), thinking, emotion: currentEmotion,
         figure: { girl: +figureValue.toFixed(2), q: +qfigureValue.toFixed(2) },
         speaking: !!(currentSrc || queue.busy()),
       }

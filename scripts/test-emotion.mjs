@@ -6,7 +6,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EMOTIONS, EMOTION_KEYWORDS, classifyEmotion, VALID_EMO_TAGS } from '../lib/emotions.js'
-import { parseTaggedSentences } from '../lib/speakText.js'
+import { emotionForAssistantText, parseTaggedSentences } from '../lib/speakText.js'
 import { hashText } from '../lib/util.js'
 
 test('关键词表只使用词表内的情绪（拼错一个词就永远匹配不到）', () => {
@@ -76,4 +76,17 @@ test('hashText：同文本同指纹，异文本不同（djb2 base36，宿主与 
   assert.equal(hashText('同一段话'), hashText('同一段话'))
   assert.notEqual(hashText('同一段话'), hashText('同一段话。'))
   assert.equal(/^[0-9a-z]+$/.test(hashText('abc')), true)
+})
+
+test('emotionForAssistantText：LLM 标签优先于关键词', () => {
+  // 文本里同时含 shy 关键词「谢谢」和显式 happy 标签 → 听标签的
+  assert.equal(emotionForAssistantText('【happy】谢谢你'), 'happy')
+})
+
+test('emotionForAssistantText：无标签时按关键词兜底', () => {
+  assert.equal(emotionForAssistantText('太难过了，想哭'), 'sad')
+})
+
+test('emotionForAssistantText：都没有 → null（不切换，让当前表情继续驻留）', () => {
+  assert.equal(emotionForAssistantText('这里是 ls 的输出，共三行'), null)
 })

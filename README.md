@@ -422,6 +422,9 @@ src/modelPreset.ts     从 tts_infer.yaml 生成运行时权重配置（sovits �
 src/emotions.ts        情绪词表 + Emotion 类型 + 关键词分类器（宿主清洗与前端表情共用唯一真相）
 src/textPatterns.ts    CJK 字符类 + 三种代码围栏语义（曾四处/三处各抄一份）
 src/speakQueue.ts      朗读队列：打断/追加/优先插入的排队策略（可单测，widget 注入依赖）
+src/ttsClient.ts       TTS 客户端：合成缓存 + 单句请求 + 204/503/超时话术（可单测）
+src/turns.ts           turn 路由：一条 assistant 文本该排队还是打断（`12` 与 `12-sum` 同一轮）
+src/sleepTimer.ts      入睡计时器：turn 未结束不睡、朗读中不睡、假醒防御（可单测）
 src/client/widget.ts   浏览器 widget：Live2D 渲染、情绪、睡眠、摸头、UI 锚定（单独打包，不经宿主 tsc）
 src/client/url-shim.ts widget 打包用的浏览器安全 url 垫片（pixi 依赖 Node url 的替代）
 tsconfig.json          宿主编译配置（严格模式，含未使用检查）

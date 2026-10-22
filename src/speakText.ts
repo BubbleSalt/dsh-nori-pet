@@ -27,6 +27,7 @@
 
 import { VALID_EMO_TAGS } from './emotions.js'
 import type { Emotion } from './emotions.js'
+import { classifyEmotion } from './emotions.js'
 import { cleanSpeech } from './segmentation.js'
 
 import { CJK_ALNUM, codeFence } from './textPatterns.js'
@@ -253,4 +254,13 @@ export function parseTaggedSentences(text: string): TaggedSentence[] {
 /** 剥掉残留的情绪标签与残骸（含 ICU 切分留下的 `…【` / `serious】…`） */
 export function stripTags(text: string): string {
   return cleanSpeech(text)
+}
+
+/** 助手一段话该摆什么表情：优先 LLM 情绪标签（首句带标签的那一行），否则退回关键词分类；
+ *  都没有 → null（**不切换**，让当前表情继续驻留，避免逐句推流把表情秒打回 default）。 */
+export function emotionForAssistantText(text: string): Emotion | null {
+  const tag = parseTaggedSentences(text).find((t) => t.emo)
+  if (tag && tag.emo) return tag.emo
+  const c = classifyEmotion(text)
+  return c === 'default' ? null : c
 }
