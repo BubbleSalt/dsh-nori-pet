@@ -26,6 +26,7 @@ import { buildRuntimeTtsConfig } from './modelPreset.js'
 import type { Config } from './config.js'
 import { appendFatal, createLogs } from './logs.js'
 import { createSpeakHandler } from './tts.js'
+import { addBounded, dropByPrefix, errMsg, evictOldest } from './util.js'
 import { PREFIX } from './protocol.js'
 import { acceptKey, encodeFrame, parseFrame } from './ws.js'
 import type { ParsedFrame } from './ws.js'
@@ -83,7 +84,7 @@ const SUMMARY_RULES = [
 ].join('\n')
 
 /** 本地 Origin 主机白名单（WS / API 跨站防护；自定义访问来源用配置 allowedOrigins 扩展） */
-const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']) // IPv6 只可能是带方括号的 '[::1]'（URL.hostname 实测）
 
 type AppContext = Context & {
   llm: any
@@ -283,7 +284,7 @@ function applyInner(ctx: AppContext, config: Config) {
   function noteTurnChar(turn: number, n: number): void {
     const v = (turnChars.get(turn) ?? 0) + n
     turnChars.set(turn, v)
-    if (turnChars.size > 32) { const f = turnChars.keys().next().value; if (f !== undefined && f !== turn) turnChars.delete(f) }
+    evictOldest(turnChars, 32, turn)
   }
 
   /** 锁定某段为"概括轨"：停止一切细粒度播报，丢弃该 turn 尚未播出的琐碎内容。
@@ -327,10 +328,10 @@ function applyInner(ctx: AppContext, config: Config) {
     if (band === 'detail') {
       const acc = (stepChars.get(key) ?? 0) + delta.length
       stepChars.set(key, acc)
-      if (stepChars.size > 64) { const f = stepChars.keys().next().value; if (f !== undefined && f !== key) stepChars.delete(f) }
+      evictOldest(stepChars, 64, key)
       if (config.summaryEnabled && acc > config.detailMaxChars) {
         stepBand.set(key, 'sum')
-        if (stepBand.size > 64) { const f = stepBand.keys().next().value; if (f !== undefined && f !== key) stepBand.delete(f) }
+        evictOldest(stepBand, 64, key)
         lockSummaryBand(sid, turn, key, `本段 ${acc} 字 > ${config.detailMaxChars}`)
         band = 'sum'
       }
@@ -339,7 +340,7 @@ function applyInner(ctx: AppContext, config: Config) {
     if (band === 'sum') {
       // 概括轨：只累积原文，不做断句/改写/广播（概括会一次覆盖整段）
       turnSummaryText.set(turn, (turnSummaryText.get(turn) ?? '') + delta)
-      if (turnSummaryText.size > 8) { const f = turnSummaryText.keys().next().value; if (f !== undefined && f !== turn) turnSummaryText.delete(f) }
+      evictOldest(turnSummaryText, 8, turn)
       return
     }
 
@@ -436,7 +437,6 @@ function applyInner(ctx: AppContext, config: Config) {
     if (!persona) return text // 人设缺失：不改写，直接以原文朗读（保持链路通）
     const t0 = Date.now()
     const input = text.length > config.reframeMaxInput ? text.slice(0, config.reframeMaxInput) + '……' : text
-    const userContent = input
     const system = persona.prompt + '\n\n' + readReframeHot(personaPaths.reframePath, persona.reframe) + (mode === 'summary' ? '\n\n' + SUMMARY_RULES : '')
 
     // 运行时直读 nori.config.json reframe 段（明文，可随时改无需重装）：
@@ -482,7 +482,7 @@ function applyInner(ctx: AppContext, config: Config) {
           model: dedicatedModel,
           messages: [
             { role: 'system', content: system },
-            { role: 'user', content: userContent },
+            { role: 'user', content: input },
           ],
           temperature: 0.8,
           max_tokens: dedicatedMaxTokens,
@@ -529,7 +529,7 @@ function applyInner(ctx: AppContext, config: Config) {
       for await (const chunk of llm.stream({
         provider: config.reframeProvider,
         model: config.reframeModel,
-        messages: [{ role: 'user', content: [{ type: 'text', text: userContent }] }],
+        messages: [{ role: 'user', content: [{ type: 'text', text: input }] }],
         system,
         temperature: 0.8,
         maxTokens: config.reframeMaxTokens,
@@ -706,11 +706,7 @@ function applyInner(ctx: AppContext, config: Config) {
    */
   async function summarizeAndBroadcast(sid: string, turn: number, text: string): Promise<void> {
     if (summarizedTurns.has(turn)) return
-    summarizedTurns.add(turn)
-    if (summarizedTurns.size > 32) { // 防无界增长：只需覆盖仍在等待判定的 turn
-      const f = summarizedTurns.values().next().value
-      if (f !== undefined && f !== turn) summarizedTurns.delete(f)
-    }
+    addBounded(summarizedTurns, turn, 32) // 防无界增长：只需覆盖仍在等待判定的 turn
     const t0 = Date.now()
     let out = await reframeText(text, 'summary')
     if (!out) out = extractSpeakable(text) // 概括失败 → 播精简后的原文（跳过代码/日志/清单），仍好过念全文
@@ -732,11 +728,7 @@ function applyInner(ctx: AppContext, config: Config) {
   /** 概括播报的兜底提示：等待超时/概括失败时，至少让用户知道"内容多、别干等" */
   function broadcastSummaryFallback(sid: string, turn: number, reason: string): void {
     if (summarizedTurns.has(turn)) return
-    summarizedTurns.add(turn)
-    if (summarizedTurns.size > 32) {
-      const f = summarizedTurns.values().next().value
-      if (f !== undefined && f !== turn) summarizedTurns.delete(f)
-    }
+    addBounded(summarizedTurns, turn, 32) // 防无界增长：只需覆盖仍在等待判定的 turn
     broadcast({ type: 'assistant', session: sid, text: '内容有点多，我先记下来，稍后说重点。', turn: `${turn}-sum` })
     logs.appendErr(`[nori-pet] summary fallback (${reason}) turn=${turn} chars=${(turnSummaryText.get(turn) ?? '').length}`)
   }
@@ -782,10 +774,7 @@ function applyInner(ctx: AppContext, config: Config) {
     if (!sid) return
     if (frame.type === 'start') {
       attemptTurn.set(String(frame.attemptId), { turn: Number(frame.turn ?? 0), step: Number(frame.step ?? 0) })
-      if (attemptTurn.size > 64) { // 防无界增长（异常结束的 attempt 会残留）
-        const first = attemptTurn.keys().next().value
-        if (first !== undefined) attemptTurn.delete(first)
-      }
+      evictOldest(attemptTurn, 64) // 防无界增长（异常结束的 attempt 会残留）
       return
     }
     if (frame.type === 'end') { attemptTurn.delete(String(frame.attemptId)); return }
@@ -863,7 +852,7 @@ function applyInner(ctx: AppContext, config: Config) {
         // 清理该 turn 的流式标记与失声超时器，防无限增长（旧版 reframe 分支关闭时不清
         // chunkedSteps → 该 Set 只增不减，且 turn/step 复用会误跳过 message 兜底）
         const prefix = `${sid}/${data.turn}/`
-        for (const k of [...chunkedSteps]) if (k.startsWith(prefix)) chunkedSteps.delete(k)
+        dropByPrefix(chunkedSteps, prefix) // Set 只增不减：turn 回收时一并清
         clearRestFlush(prefix)
         if (config.reframe) {
           // 收尾批次（低延迟流式改写的剩余句子），再 collect 未断句残留
@@ -893,8 +882,8 @@ function applyInner(ctx: AppContext, config: Config) {
           turnBand.delete(data.turn)
           turnChars.delete(data.turn)
           turnSummaryText.delete(data.turn)
-          for (const k of [...stepBand.keys()]) if (k.startsWith(prefix)) stepBand.delete(k)
-          for (const k of [...stepChars.keys()]) if (k.startsWith(prefix)) stepChars.delete(k)
+          dropByPrefix(stepBand, prefix)
+          dropByPrefix(stepChars, prefix)
           clearFeedByPrefix(fedBlocks, prefix) // 块投喂水位随 turn 回收，防无界增长
           broadcast({ type: 'turn-end', session: sid, turn: data.turn, reason: data.reason?.kind })
           break
@@ -919,10 +908,7 @@ function applyInner(ctx: AppContext, config: Config) {
         // toolCallId, content, isError }，既无 name 也无顶层 callId（旧代码取 message.name
         // ?? message.callId 恒得空串，广播出来是 name:""）
         if (data.callId) toolCallNames.set(String(data.callId), String(data.name ?? ''))
-        if (toolCallNames.size > 200) { // 防无界增长：会话异常结束时会残留
-          const first = toolCallNames.keys().next().value
-          if (first !== undefined) toolCallNames.delete(first)
-        }
+        evictOldest(toolCallNames, 200) // 防无界增长：会话异常结束时会残留
         break
       }
       case 'tool/result': {
@@ -969,7 +955,7 @@ function applyInner(ctx: AppContext, config: Config) {
   function resolveConfigPath(v: string): string {
     if (!v) return ''
     if (isAbsolute(v)) return v
-    try { return resolve(dirname(HOST_DIR), v) } catch { return v }
+    return resolve(dirname(HOST_DIR), v)
   }
   function resolveAssetsDir(): string {
     if (config.assetsDir) return resolveConfigPath(config.assetsDir)
@@ -1016,7 +1002,7 @@ function applyInner(ctx: AppContext, config: Config) {
       // stat→open 之间文件被删/权限变化会让流异步 emit 'error'；无监听者 → uncaughtException 打死宿主
       const rs = createReadStream(file)
       rs.on('error', (e: any) => {
-        logs.appendErr('[nori-pet] assets read error ' + file + ': ' + String(e?.message ?? e))
+        logs.appendErr('[nori-pet] assets read error ' + file + ': ' + errMsg(e))
         if (!res.headersSent) { try { res.writeHead(404); res.end('not found') } catch { /* ignore */ } }
         else try { res.destroy() } catch { /* ignore */ }
       })
@@ -1242,7 +1228,7 @@ function applyInner(ctx: AppContext, config: Config) {
               } else if (!result.ok) log('[dsh-nori-pet] tts model preset: ' + result.message)
             }
           }
-        } catch (e) { log('[dsh-nori-pet] tts model preset 读取配置失败: ' + String((e as Error)?.message ?? e)) }
+        } catch (e) { log('[dsh-nori-pet] tts model preset 读取配置失败: ' + errMsg(e)) }
         try {
           const { spawn } = await import('node:child_process')
           const child = spawn(VENV_PY, ['api_v2.py', '-a', '127.0.0.1', '-p', '9880', '-c', ttsCfgArg], {
@@ -1262,7 +1248,7 @@ function applyInner(ctx: AppContext, config: Config) {
           spawnWaitUntil.set(child, Date.now() + SPAWN_GRACE_MS)
           child.on('error', (e: any) => {
             spawnWaitUntil.delete(child)
-            log('[dsh-nori-pet] api_v2 spawn error: ' + String(e?.message ?? e) + '（路径或权限有问题：VENV_PY=' + VENV_PY + '）')
+            log('[dsh-nori-pet] api_v2 spawn error: ' + errMsg(e) + '（路径或权限有问题：VENV_PY=' + VENV_PY + '）')
           })
           child.on('exit', (code) => {
             spawnWaitUntil.delete(child)
@@ -1288,7 +1274,7 @@ function applyInner(ctx: AppContext, config: Config) {
       void fn(req, res).catch((e: any) => {
         const where = req.method + ' ' + req.url
         logs.appendErr('[nori-pet] ' + tag + ' handler error @ ' + where + ': ' + String(e?.stack ?? e).slice(0, 400))
-        log('[dsh-nori-pet] ' + tag + ' handler error @ ' + where + ': ' + String(e?.message ?? e))
+        log('[dsh-nori-pet] ' + tag + ' handler error @ ' + where + ': ' + errMsg(e))
         try {
           if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ error: 'internal error' }))
