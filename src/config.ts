@@ -33,7 +33,7 @@ const schema = z.object({
   /** 超长内容概括总开关（关闭 = 完全保持逐句详读的旧行为） */
   summaryEnabled: z.boolean().default(true),
   /** 概括等待上限（毫秒）：超过则先播一句提示，避免长静默（LLM 慢/超时兜底） */
-  summaryWaitMs: z.number().min(500).default(2000),
+  summaryWaitMs: z.number().min(1000).default(8000),
   /** 每块改写请求发出前的等待。首块不延时；积压切换时取消的请求越少越好，800ms 体感不明显 */
   reframeDelayMs: z.number().min(0).default(800),
   /**
@@ -134,7 +134,7 @@ export const CONFIG_DESCRIPTIONS: Record<string, string> = {
   maxSentence: '单句最大字数。超过就断句，影响一句话多长要读完',
   detailMaxChars: '细节轨道上限（字符）。一轮里细节读到这个长度就转概括（默认 120，约两句）',
   summaryEnabled: '是否在长回复后追加概括播报',
-  summaryWaitMs: '等待多久无新内容才触发概括（毫秒）',
+  summaryWaitMs: '等待概括结果的上限（毫秒）。超时则降级播一句提示——它**不是**触发概括的静默期（实测概括本身要 2~3 秒，设太小会每次都超时）',
   reframeDelayMs: '改写请求发出前的等待（毫秒）。首块不延时，用于避免请求刚发出就被积压切换取消',
   ttsTemperature: '合成温度。越高越随机、越有起伏，也越容易跑调',
   ttsTopK: '采样候选数。越大越发散',
