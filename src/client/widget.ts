@@ -27,7 +27,7 @@ import { createBubbleQueue } from '../bubbleQueue.js'
 import { createPlayback } from '../playback.js'
 import type { AudioCtxLike } from '../playback.js'
 import { createEmotionDriver } from '../emotionDriver.js'
-import { parseClientEvent } from '../clientProtocol.js'
+import { EMOTION_TABLE } from '../emotionDriver.js'
 ;(window as any).PIXI = PIXI
 
 // 路由前缀来自 protocol.ts（与宿主、smoke-test 同一份）；宿主 hello 帧下发的 prefix 与之同源
@@ -658,54 +658,60 @@ function initLive2D(): void {
   void startModel()
 }
 
-/** 协议分发：字段解析在 src/clientProtocol.ts（turn 两形态/emote 白名单/空文本都有断言） */
+/** 协议分发：agent 输出 → 气泡 + 朗读；turn/情绪/权限申请都在这里路由 */
 function handleWsMessage(raw: string, reply: (data: string) => void): void {
-  const ev = parseClientEvent(raw)
-  if (!ev) return
+  let msg: any
+  try { msg = JSON.parse(raw) } catch { return }
   lastMsg = raw.slice(0, 120)
   reply(JSON.stringify({ type: 'ack' }))
-  switch (ev.kind) {
-    case 'approval':
-      // 权限申请提醒：打断当前朗读优先播报（原文，提醒用户回来处理）
-      lastSpeak = ev.text.slice(0, 60)
-      activeTurn = null
-      setThinking(false)
-      setEmotion('surprised') // 惊一下：权限申请需要用户注意
-      speakInterrupt(ev.text)
-      return
-    case 'assistant': {
-      lastSpeak = ev.text.slice(0, 60)
-      setThinking(false) // 有输出了，思考态结束
-      // 情绪联动：优先 LLM 情绪标签（首句）；普通句只有命中关键词才切情绪——无情绪句
-      // 不打断当前表情（驻留由 emotionDriver 统一管理，避免逐句推流把表情秒打回 default）
-      const emo = emotionForAssistantText(ev.text)
-      if (emo) setEmotion(emo)
-      // turn 身份：改写路径给数字 12，概括路径给字符串 12-sum —— 归一化在 planAssistantRoute 里，
-      // 同一轮的话排队而不是抢断（早先按 typeof number 判断，概括那批会打断自己）
-      const route = planAssistantRoute(activeTurn, ev.turn)
-      activeTurn = route.base
-      if (route.action === 'append') speakAppend(ev.text)
-      else speakInterrupt(ev.text)
-      return
-    }
-    // 思考表情：agent 工作中（用户发言 / 工具调用）→ 沉思；turn 结束回收
-    case 'user':
-      sleep.setTurnActive(true) // turn 激活：清入睡计时（turn 未结束不入睡）
-      wakeUp() // 用户开口即唤醒，不等到第一句回答
-      setThinking(true)
-      return
-    case 'tool': setThinking(true); return
-    case 'turn-end':
-      sleep.setTurnActive(false) // turn 结束：入睡计时此刻才开始
-      setThinking(false)
-      resetSleepTimer()
-      return
-    // emote：宿主 /api/emote 手动触发（验证情绪联动用）
-    case 'emote':
-      if (ev.emotion) { setThinking(false); setEmotion(ev.emotion) }
-      if (ev.text) { activeTurn = null; speakInterrupt(ev.text) }
-      return
-    default: return
+  if (msg.type === 'approval' && typeof msg.text === 'string' && msg.text) {
+    // 权限申请提醒：打断当前朗读优先播报（原文，提醒用户回来处理）
+    lastSpeak = msg.text.slice(0, 60)
+    activeTurn = null
+    setThinking(false)
+    setEmotion('surprised') // 惊一下：权限申请需要用户注意
+    speakInterrupt(msg.text)
+    return
+  }
+  if (msg.type === 'assistant' && typeof msg.text === 'string' && msg.text) {
+    lastSpeak = msg.text.slice(0, 60)
+    setThinking(false) // 有输出了，思考态结束
+    // 情绪联动：优先 LLM 情绪标签（首句）；普通句只有命中关键词才切情绪——无情绪句
+    // 不打断当前表情（驻留由 scheduleEmotionReset 统一管理，避免逐句推流把表情秒打回 default）
+    const emo = emotionForAssistantText(msg.text)
+    if (emo) setEmotion(emo)
+    // turn 身份：改写路径给的是**数字** `12`，概括路径给的是**字符串** `12-sum`。
+    // 早先这里只认数字，于是概括那批拿到 null → 落到 speakInterrupt（打断）→
+    // playToken += 1 → 正在读的那句被腰斩、队列里剩下的句子作废（实测："第一句读了一半…
+    // 第二句气泡出现并打断朗读"，最后一句凭空消失）。改成统一按字符串比较，
+    // 并把 `N-sum` 归一到同一个逻辑 turn `N`（都是同一轮回答的话，应当排队而不是抢断）。
+    const route = planAssistantRoute(activeTurn, msg.turn)
+    activeTurn = route.base
+    if (route.action === 'append') speakAppend(msg.text)
+    else speakInterrupt(msg.text)
+    return
+  }
+  // 思考表情：agent 工作中（用户发言 / 工具调用）→ 沉思；turn 结束回收
+  if (msg.type === 'user') {
+    sleep.setTurnActive(true) // turn 激活：清入睡计时（turn 未结束不入睡）
+    sleep.setTurnActive(true)
+    wakeUp() // 用户开口即唤醒，不等到第一句回答
+    setThinking(true)
+    return
+  }
+  if (msg.type === 'tool') { setThinking(true); return }
+  if (msg.type === 'turn-end') {
+    sleep.setTurnActive(false) // turn 结束：入睡计时此刻才开始
+    setThinking(false)
+    resetSleepTimer()
+    return
+  }
+  // emote：宿主 /api/emote 手动触发（验证情绪联动用）
+  if (msg.type === 'emote') {
+    const e = String(msg.e ?? '')
+    if (e in EMOTION_TABLE) { setThinking(false); setEmotion(e as Emotion) }
+    if (typeof msg.text === 'string' && msg.text) { activeTurn = null; speakInterrupt(msg.text) }
+    return
   }
 }
 
