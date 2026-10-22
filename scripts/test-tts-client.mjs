@@ -44,6 +44,16 @@ test('正常合成：返回音频、入缓存、上报 budget/units/lines/droppe
   assert.deepEqual(calls.bodies[0], { text: '你好呀', budget: 34, units: 3, lines: 2, dropped: 3 })
 })
 
+test('缓存命中返回副本：decodeAudioData 会 detach 原 buffer，第二次播放不能拿到同一实例', async () => {
+  const { client } = makeClient({ responses: [ok(new ArrayBuffer(8))] })
+  const a = await client.get('同一句', 1)
+  const b = await client.get('同一句', 1)
+  assert.notEqual(a, b) // 两次取到的必须是不同实例
+  structuredClone(a, { transfer: [a] }) // 模拟 decodeAudioData 的转移语义
+  assert.equal(a.byteLength, 0) // a 已 detach
+  assert.equal(b.byteLength, 8) // b 仍可用
+})
+
 test('缓存命中：不打第二次请求（打断前预合成就靠它无缝衔接）', async () => {
   const { client, calls } = makeClient({ responses: [ok(new ArrayBuffer(4))] })
   await client.get('同一句', 1)

@@ -56,8 +56,11 @@ export function createTtsClient(deps: TtsClientDeps): TtsClient {
   }
 
   async function get(text: string, token: number): Promise<ArrayBuffer | null> {
+    // ⚠ 必须返回**副本**：decodeAudioData 会把传入的 ArrayBuffer 转移掉（detach），
+    // 缓存里那份若被直接交出去，同一句第二次播放就拿到 detached buffer →
+    // Chrome 抛 "DataCloneError: Cannot decode detached ArrayBuffer"（实测踩到）
     const hit = cache.get(text)
-    if (hit) return token === deps.currentToken() ? hit : null
+    if (hit) return token === deps.currentToken() ? hit.slice(0) : null
     try {
       const res = await doFetch(deps.basePath + '/api/speak', {
         method: 'POST',
@@ -76,7 +79,7 @@ export function createTtsClient(deps: TtsClientDeps): TtsClient {
       if (res.status === 503) { deps.onNotice('（sovits 未上线）'); return null }
       if (!res.ok) { deps.onNotice('（TTS 未就绪：' + res.status + '）'); return null }
       const buf = await res.arrayBuffer()
-      put(text, buf) // 打断时预合成的结果，下次直接命中
+      put(text, buf.slice(0)) // 缓存留底（不交出原实例），打断时预合成的结果下次直接命中
       return token === deps.currentToken() ? buf : null
     } catch (e: any) {
       // 超时与"连不上"要分开说：前者是服务端还（在跑），后者是 sovits 没起来
