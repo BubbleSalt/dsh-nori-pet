@@ -29,11 +29,13 @@ const schema = z.object({
    * 超过 → 这一段一个字都不详读，整轮只播一次概括 —— 两者互斥，避免"前半详细、中间快进"的口径不一。
    * 输出速度约 300 token/s 时，400 字约 0.9 秒即可判定，所以长内容判定几乎不产生等待。
    */
-  detailMaxChars: z.number().min(20).default(400),
+  detailMaxChars: z.number().min(20).default(120),
   /** 超长内容概括总开关（关闭 = 完全保持逐句详读的旧行为） */
   summaryEnabled: z.boolean().default(true),
   /** 概括等待上限（毫秒）：超过则先播一句提示，避免长静默（LLM 慢/超时兜底） */
-  summaryWaitMs: z.number().min(1000).default(8000),
+  summaryWaitMs: z.number().min(500).default(2000),
+  /** 每块改写请求发出前的等待。首块不延时；积压切换时取消的请求越少越好，800ms 体感不明显 */
+  reframeDelayMs: z.number().min(0).default(800),
   /**
    * TTS 推理参数。低温度更稳更收敛（避免采样噪声导致电音感），但温度过低 + top_k 过小
    * 会让 AR 模型在"嗯/唔"等鼻音叹词上进入采样循环：某个字无限拖长、随后吞掉句尾一小段。
@@ -50,7 +52,17 @@ const schema = z.object({
    * 字段：apiKey / baseUrl / model / maxTokens / timeoutMs / maxInput / trace / provider / apiKeyRef
    * 注意：不提供内置模型名默认值（厂商会废弃旧型号），model 留空则由 provider 决定。
    */
-  reframe: z.any().default({}),
+  reframe: z.object({
+    apiKey: z.string().default('').description('API Key。留空则用环境变量或 dsh 凭据'),
+    baseUrl: z.string().default('').description('改写服务的 API 地址，留空用默认'),
+    model: z.string().default('').description('模型名，留空由 provider 决定（不内置型号名）'),
+    maxTokens: z.number().default(2048).description('改写结果最大 token 数'),
+    timeoutMs: z.number().default(60000).description('改写超时（毫秒），超时降级朗读原文'),
+    maxInput: z.number().default(4000).description('送改写的最大输入字符数'),
+    trace: z.boolean().default(true).description('是否落盘改写前后文本便于排查'),
+    provider: z.string().default('').description('模型提供方，留空用默认'),
+    apiKeyRef: z.string().default('DEEPSEEK_NORI_API_KEY').description('API Key 的环境变量名'),
+  }),
   /** 改写 LLM 的 provider（dsh-llm 注册名） */
   /** 改写 LLM 的模型 */
   /** 改写单次调用的超时（毫秒）。实测真实负载（11.9K 人设 system + 材料）约 10s，
@@ -120,9 +132,10 @@ export const CONFIG_DESCRIPTIONS: Record<string, string> = {
   refAudio: '参考音频路径。决定音色；换音频等于换声线',
   refPrompt: '参考音频对应的文字，需与音频内容一致，否则音色不稳',
   maxSentence: '单句最大字数。超过就断句，影响一句话多长要读完',
-  detailMaxChars: '细节保留上限（字符）。长输出里超过这个长度的细节会被压缩',
+  detailMaxChars: '细节轨道上限（字符）。一轮里细节读到这个长度就转概括（默认 120，约两句）',
   summaryEnabled: '是否在长回复后追加概括播报',
   summaryWaitMs: '等待多久无新内容才触发概括（毫秒）',
+  reframeDelayMs: '改写请求发出前的等待（毫秒）。首块不延时，用于避免请求刚发出就被积压切换取消',
   ttsTemperature: '合成温度。越高越随机、越有起伏，也越容易跑调',
   ttsTopK: '采样候选数。越大越发散',
   ttsSpeedFactor: '语速倍率。1 为原速',

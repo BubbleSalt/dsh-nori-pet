@@ -267,7 +267,10 @@ export function createConfigPanel(prefix: string): { open(): void; close(): void
     table.style.cssText = 'display:grid;grid-template-columns:110px 1fr 90px;gap:6px 10px;align-items:center'
     const hdr = (t: string): HTMLElement => { const s = el('span', '', t); s.style.cssText = 'color:var(--cfg-fg-dim);font-size:11px'; return s }
     table.append(hdr('情绪'), hdr('表情'), hdr('动作下标'))
-    const emotions = (model.emotions ?? {}) as Record<string, { expr?: string; reaction?: number }>
+    // 配置里没有 model 段时，用宿主下发的生效契约（/api/model-map）预填，
+    // 否则表格是空的、连表情候选都没有，等于"没法改"
+    const fallback = (window as unknown as { __noriModelMap?: { emotions?: Record<string, { expr?: string; reaction?: number }> } }).__noriModelMap
+    const emotions = ((model.emotions ?? fallback?.emotions) ?? {}) as Record<string, { expr?: string; reaction?: number }>
     const options = Array.from(new Set([
       ...draftExpressions,
       ...(Object.values(emotions).map((v) => v?.expr).filter(Boolean) as string[]),

@@ -544,6 +544,8 @@ async function loadModelMap(): Promise<void> {
     console.warn('[nori-pet] 读取模型映射失败，沿用默认（Nori）', err)
   }
   MOUTH_ID = MAP.mouthParam
+  // 供设置面板预填情绪映射（面板用它兜底，避免配置里没有 model 段时表格全空）
+  ;(window as unknown as { __noriModelMap?: unknown }).__noriModelMap = MAP
   const gaps = modelGaps(MAP)
   if (gaps.length) {
     // 缺资源不是错误：这些情绪只会没有表情/动作，气泡与声音照常
@@ -712,6 +714,8 @@ async function startModel(): Promise<void> {
     function greetOnce(): void {
       if (greetingDone) return
       greetingDone = true
+  // 正在播报 turn 时不打招呼：打招呼是"见面第一句"，插进播报里既打断内容又重复
+  if (currentSrc || queue.busy()) { wakeUp(); return }
       speak(GREETING) // → speakInterrupt → wakeUp：转 Idle[0] + resetSleepTimer（90s 入睡计时从这里起算）
       setEmotion('happy') // 醒来转微笑（happy 驻留 ~8s，超时 scheduleEmotionReset 回落纯 idle）
     }

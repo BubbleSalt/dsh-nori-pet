@@ -87,7 +87,9 @@ export function createPipeline(deps: PipelineDeps): {
   let batchTurn = -1
   let batchText = ''
   let batchTimer: ReturnType<typeof setTimeout> | null = null
-  const BATCH_MAX = 500 // 流式攒批上限：调大后超长文本改写请求更少（实时性略降，换来话少/请求少）
+  // 攒批上限与 detailMaxChars 同量级：攒太大等于把"一整段"塞进一次改写，
+// 而超出细节轨的部分反正会被概括覆盖
+const BATCH_MAX = 150
   const BATCH_IDLE_MS = 1200
 
   function flushBatch(): void {
@@ -98,7 +100,7 @@ export function createPipeline(deps: PipelineDeps): {
     batchText = ''
     batchSid = ''
     batchTurn = -1
-    if (text && sid) enqueueReframe(sid, turn, text)
+    if (text && sid) scheduleReframe(sid, turn, text)
   }
 
   function addToBatch(sid: string, turn: number, sentence: string): void {
@@ -159,7 +161,32 @@ export function createPipeline(deps: PipelineDeps): {
   type Band = 'detail' | 'sum'
   const stepBand = new Map<string, Band>() // key -> 该段轨道
   const stepChars = new Map<string, number>() // key -> 该段累计字数
-  const turnBand = new Map<number, Band>() // turn -> 轨道（sum 优先）
+  const turnBand = new Map<number, Band>()
+  // 改写延时：首块立即发（开场不能慢），后续块等 reframeDelayMs —— 积累多时下一块往往直接进概括，
+  // 不延时的话请求已经发出去又被取消，白烧一次调用
+  const reframeSentOnce = new Set<number>()
+  const delayTimers = new Map<number, ReturnType<typeof setTimeout>[]>()
+  function cancelDelayedReframe(turn: number): number {
+    const list = delayTimers.get(turn)
+    if (!list) return 0
+    for (const t of list) clearTimeout(t)
+    delayTimers.delete(turn)
+    return list.length
+  }
+  function scheduleReframe(sid: string, turn: number, text: string): void {
+    const delay = config.reframeDelayMs ?? 0
+    if (!reframeSentOnce.has(turn) || delay <= 0) {
+      reframeSentOnce.add(turn)
+      enqueueReframe(sid, turn, text)
+      return
+    }
+    const timer = setTimeout(() => {
+      const list = delayTimers.get(turn)
+      if (list) delayTimers.set(turn, list.filter((t) => t !== timer))
+      enqueueReframe(sid, turn, text)
+    }, delay)
+    delayTimers.set(turn, [...(delayTimers.get(turn) ?? []), timer])
+  } // turn -> 轨道（sum 优先）
   const turnSummaryText = new Map<number, string>() // turn -> 被抑制的原文（供概括）
   const turnChars = new Map<number, number>() // turn -> 累计输出字数（判断整轮是否够长）
 
@@ -178,12 +205,13 @@ export function createPipeline(deps: PipelineDeps): {
     if (!keepPending) {
       clearRestFlush(key)
       const dropped = dropQueuedReframe(turn)
+    const cancelled = cancelDelayedReframe(turn)
       const prefix = `${sid}/${turn}/`
       let droppedPending = 0
       for (const [k, v] of [...pending]) {
         if (k.startsWith(prefix)) { droppedPending += v.length; pending.delete(k) }
       }
-      log(`[dsh-nori-pet] summary band lock: ${reason} turn=${turn} 丢弃改写${dropped}条/待断句${droppedPending}字`)
+      log(`[dsh-nori-pet] summary band lock: ${reason} turn=${turn} 丢弃改写${dropped}条/取消未发${cancelled}条/待断句${droppedPending}字`)
     } else {
       log(`[dsh-nori-pet] summary band lock(end): ${reason} turn=${turn}`)
     }

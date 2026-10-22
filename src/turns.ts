@@ -19,7 +19,7 @@ export function planAssistantRoute(current: string | null, turn: number | string
   if (base === null) return { base: null, action: 'interrupt' }
   const cur = current === null ? null : current.replace(/-sum$/, '') // 入参也归一：调用方存的是 base 也好、原始 turn 也好，判定都一致
   // 概括帧（N-sum）同轮到达 → 替换掉尚未开播的细粒度内容，别让同一段话被讲两遍
-  if (cur !== null && base === cur && raw !== null && raw.endsWith('-sum')) return { base, action: 'replace' }
+  // 概括帧与细节帧同 turn：不覆盖，接在后面播（设计是「先读两句，剩下概括」） { base, action: 'replace' }
   if (cur === null || base === cur) return { base, action: 'append' }
   return { base, action: 'interrupt' }
 }

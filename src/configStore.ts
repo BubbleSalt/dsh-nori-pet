@@ -108,6 +108,7 @@ export function createConfigStore(filePath: string, log: (msg: string) => void =
       }
       return parsed as Record<string, unknown>
     } catch (err) {
+      // 写盘失败：清理临时文件后把原因返回给调用方（面板会显示），不是静默吞掉
       log(`配置解析失败，按空配置处理：${filePath} — ${String(err)}`)
       return {}
     }
@@ -152,6 +153,7 @@ export function createConfigStore(filePath: string, log: (msg: string) => void =
         renameSync(tmp, filePath)
         return { ok: true }
       } catch (err) {
+        // 写盘失败：清理临时文件并把原因回给调用方（面板可见），非静默吞掉
         try { if (existsSync(`${filePath}.tmp`)) unlinkSync(`${filePath}.tmp`) } catch { /* 清理失败不影响主流程 */ }
         return { ok: false, errors: [`写盘失败：${String(err)}`] }
       }

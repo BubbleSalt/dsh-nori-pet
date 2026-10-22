@@ -402,6 +402,7 @@ function applyInner(ctx: AppContext, config: Config) {
           patch = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>
           if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('需要 JSON 对象')
         } catch (err) {
+          // 请求体坏了：以 400 明确告知调用方，不落盘
           res.writeHead(400, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ ok: false, errors: ['请求体不是合法 JSON：' + String(err)] }))
           return
@@ -443,7 +444,9 @@ function applyInner(ctx: AppContext, config: Config) {
       const chunks: Buffer[] = []
       for await (const chunk of req) chunks.push(chunk as Buffer)
       let body: { file?: unknown }
-      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { file?: unknown } } catch { body = {} }
+      // 请求体为空或非 JSON 时按空对象处理：后面统一走"缺少 file"的 400 分支
+      // 解析失败属于预期路径（空体/坏 JSON），落到下面"缺少 file"的 400 分支
+      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { file?: unknown } } catch { /* 见上行：交给缺少 file 的分支 */ body = {} }
       const file = typeof body.file === 'string' ? body.file.trim() : ''
       if (!file) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: '缺少 file' })); return }
       // 路径安全：只允许仓库内相对路径（绝对路径放行但要存在），拒绝 .. 逃逸
@@ -474,6 +477,7 @@ function applyInner(ctx: AppContext, config: Config) {
           lipSyncId: lipSync?.Ids?.[0] ?? null,
         }))
       } catch (err) {
+        // 模型文件读不了（不存在/JSON 坏）：以 400 回给界面显示，不是静默忽略
         res.writeHead(400, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: false, error: '读不了这个模型文件：' + String(err) }))
       }
