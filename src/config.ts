@@ -108,3 +108,43 @@ export const Config = schema
  * schemastery 没有 `z.infer` 那种命名空间助手（`infer` 是 zod 的），`ReturnType` 等价且更直接。
  */
 export type Config = ReturnType<typeof schema>
+
+/**
+ * 每个配置项的说明（界面用来显示）。与 schema 同文件维护，改字段时顺手改说明；
+ * scripts/test-config-desc.mjs 会断言"schema 里的每项都有说明"，防止漏写。
+ */
+export const CONFIG_DESCRIPTIONS: Record<string, string> = {
+  enabled: '总开关。关掉后桌宠不再出声、不再弹气泡',
+  assetsDir: 'Live2D 资产根目录（含模型文件）。留空则自动探测仓库内 Nori_web/',
+  coreFile: 'live2dcubismcore.js 的路径。留空则用 cubism_sdk/Core/ 下的',
+  ttsUrl: 'GPT-SoVITS api_v2 的合成地址，默认本机 9880',
+  refAudio: '参考音频路径。决定音色；换音频等于换声线',
+  refPrompt: '参考音频对应的文字，需与音频内容一致，否则音色不稳',
+  maxSentence: '单句最大字数。超过就断句，影响一句话多长要读完',
+  detailMaxChars: '细节保留上限（字符）。长输出里超过这个长度的细节会被压缩',
+  summaryEnabled: '是否在长回复后追加概括播报',
+  summaryWaitMs: '等待多久无新内容才触发概括（毫秒）',
+  ttsTemperature: '合成温度。越高越随机、越有起伏，也越容易跑调',
+  ttsTopK: '采样候选数。越大越发散',
+  ttsSpeedFactor: '语速倍率。1 为原速',
+  reframe: '改写开关。把长输出改写成适合朗读的口语，关掉则直接读原文',
+  reframeProvider: '改写所用的模型提供方',
+  reframeModel: '改写所用模型名',
+  reframeTimeoutMs: '改写请求超时（毫秒）。超时则降级为朗读原文',
+  reframeMaxInput: '送去改写的最大输入字符数',
+  reframeMaxTokens: '改写结果的最大 token 数',
+  reframeApiKeyRef: 'API Key 的环境变量名（不写明文密钥时用它）',
+  reframeBaseUrl: '改写服务的 API 地址',
+  reframeTrace: '是否把每次改写的前后文本落盘，便于排查',
+  ttsWatch: '是否守护 GPT-SoVITS 服务：掉线时自动尝试拉起',
+  ttsWatchIntervalMs: '守护探测间隔（毫秒）',
+  gsvBase: 'GPT-SoVITS 安装目录（用于拉起服务）',
+  venvPy: 'GPT-SoVITS 所用虚拟环境的 python.exe 路径',
+  personaPrompt: '人设文本路径。留空则不使用人设（授权文本需自备）',
+  personaReframe: '改写规则文本路径',
+  personaSummary: '概括规则文本路径',
+  allowedOrigins: '允许跨域访问的来源列表，每行一个',
+  modelDir: 'Live2D 模型目录（旧字段，优先用 model.file）',
+  model: '模型契约：模型文件、口型参数、待机组、情绪到表情/动作的映射',
+  sovits: 'GPT-SoVITS 训练相关路径与参数',
+}

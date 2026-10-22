@@ -20,6 +20,7 @@ import { emotionForAssistantText } from '../speakText.js'
 import { planAssistantRoute } from '../turns.js'
 import { createSleepTimer } from '../sleepTimer.js'
 import { PAT_REPLIES, createPatDetector, inHeadZone } from '../patStroke.js'
+import { createConfigPanel } from './configPanel.js'
 import { SCALE_STEP, canvasSize as sizeFor, clampPos as clampPosTo, clampScale, defaultPos, stepScale, wheelScale } from '../clientLayout.js'
 import { createWsClient } from '../wsClient.js'
 import type { WsLike } from '../wsClient.js'
@@ -62,9 +63,12 @@ document.head.appendChild(styleEl)
 const root = document.createElement('div')
 root.id = 'nori-pet-root'
 
+// 拖动改为"抓本体"：整块画布可拖，**但头部热区在它上面**（z-index 更高）→ 摸头优先，
+// 头区域不算拖动区。原来的头顶小条会随身高移动、还能被推出屏幕，换掉。
 const dragHandle = document.createElement('div')
-dragHandle.id = 'nori-pet-drag'
-dragHandle.title = '拖动移动'
+dragHandle.id = 'nori-pet-body'
+dragHandle.title = '拖动移动（双击归位）'
+dragHandle.style.cursor = 'grab'
 
 const bubble = document.createElement('div')
 bubble.id = 'nori-pet-bubble'
@@ -88,12 +92,13 @@ btnMute.title = '静音'
 const btnClose = document.createElement('button')
 btnClose.textContent = '✕'
 btnClose.title = '隐藏/显示'
-controls.append(btnZoomOut, btnZoomIn, btnMute, btnClose)
+// 设置入口放浮动栏（与缩放/静音同一排）：右下角再挂一个齿轮会和浮栏抢位置
+const btnCfg = document.createElement('button')
+btnCfg.textContent = '⚙'
+btnCfg.title = '设置'
+controls.append(btnZoomOut, btnZoomIn, btnMute, btnCfg, btnClose)
 
 // 体型面板（可开关）：Param158 少女体型 + Param117 Q版，各自 0..1 滑槽
-const btnFigure = document.createElement('button')
-btnFigure.textContent = '🪆'
-btnFigure.title = '体型（少女/Q版）'
 const figureWrap = document.createElement('div')
 figureWrap.id = 'nori-pet-figure'
 figureWrap.style.cssText = 'position:absolute;left:50%;bottom:44px;transform:translateX(-50%);display:none;flex-direction:column;gap:5px;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.16);border-radius:12px;padding:7px 12px;font:11px/1 system-ui,"Microsoft YaHei",sans-serif;color:#fff;user-select:none;pointer-events:auto;box-shadow:0 2px 10px rgba(0,0,0,.35)'
@@ -131,13 +136,7 @@ const bindRow = (row: HTMLDivElement, setter: (v: number) => void): void => {
 }
 bindRow(row158, (v) => { figureValue = v })
 bindRow(row117, (v) => { qfigureValue = v })
-btnFigure.addEventListener('click', () => {
-  const show = figureWrap.style.display === 'none'
-  figureWrap.style.display = show ? 'flex' : 'none'
-  btnFigure.style.background = show ? 'rgba(122,184,255,.4)' : ''
-})
 
-controls.insertBefore(btnFigure, btnClose)
 // 摸头热区层：在 canvas 之上、但只占头部区域（20%~80% 宽、0~42% 高），
 // root/canvas 本身 pointer-events:none 穿透 → 透明区域不挡文字选取
 const hitZone = document.createElement('div')
@@ -146,11 +145,37 @@ root.append(dragHandle, bubble, canvas, hitZone, controls, figureWrap)
 // 层级：拖动条/按钮/面板浮于交互层之上，气泡中间
 canvas.style.zIndex = '10'
 hitZone.style.zIndex = '11'
-dragHandle.style.zIndex = '20'
+dragHandle.style.zIndex = '10'
 bubble.style.zIndex = '15'
 controls.style.zIndex = '20'
 figureWrap.style.zIndex = '20'
 dragHandle.style.pointerEvents = 'auto'
+// 必须有 position:absolute —— 静态定位下 top/bottom 全部无效，元素退化成 0 高度空块（实测 rect.height=0）
+dragHandle.style.position = 'absolute'
+// 拖动区必须撑满画布宽度：只有 top/bottom 没有 left/right 的话宽度为 0，等于抓不到（实测就是这个）
+dragHandle.style.top = '0'
+dragHandle.style.height = curH() + 'px'
+
+/**
+ * 拖动区几何：高度按画布，**宽度收窄到模型实测占位**（画布比模型宽，
+ * 整块可拖会把大片透明区域也变成拦截层，挡文字选取）。
+ */
+function syncDragBox(hPx: number, topY: number): void {
+  // 关键：画布可能比视口高得多（实测 756px 画布 / 只有 292px 在视口内）。
+  // 按整块画布算高度 → 三分之二在屏幕外，能抓的只剩胸口到腰那一窄条。
+  // 这里把拖动区裁到"画布的可见部分"：上沿取头顶，下沿取视口底。
+  const rr = root.getBoundingClientRect()
+  const topRel = Math.round(Math.min(Math.max(0, topY - 0.06 * hPx), hPx - 1))
+  const visibleH = Math.max(0, Math.min(hPx, window.innerHeight - rr.top))
+  dragHandle.style.top = topRel + 'px'
+  dragHandle.style.height = Math.max(0, visibleH - topRel) + 'px'
+  dragHandle.style.left = '25%'
+  dragHandle.style.right = 'auto'
+  dragHandle.style.width = '50%'
+}
+dragHandle.style.left = '0'
+dragHandle.style.right = '0'
+dragHandle.style.background = 'transparent'
 controls.style.pointerEvents = 'auto'
 figureWrap.style.pointerEvents = 'auto'
 document.body.appendChild(root)
@@ -196,6 +221,8 @@ function canvasSize(): [number, number] {
   return sizeFor(scaleFactor, modelRatio, LOGICAL_W, LOGICAL_H)
 }
 function applyScale(f: number): void {
+  // 通知外部（配置面板滑杆）同步；浮动 +/- 与滑杆必须是同一个值的两个入口
+  try { window.dispatchEvent(new CustomEvent('nori-scale', { detail: scaleFactor })) } catch { /* 环境不支持事件 */ }
   scaleFactor = clampScale(f)
   const [w, h] = canvasSize()
   root.style.width = w + 'px'
@@ -256,8 +283,18 @@ dragHandle.addEventListener('wheel', onWheel, { passive: false })
     root.style.left = (r.left + dx) + 'px'
     root.style.top = (r.top + dy) + 'px'
   })
-  window.addEventListener('pointerup', () => {
-    if (!dragging) return
+  // 双击本体 = 归位：拖到屏幕外时的保险，比再去找一根拖条可靠
+dragHandle.addEventListener('dblclick', () => {
+  // 不能靠清空内联样式"归位"：清掉后没有 right/bottom 兜底，元素会掉到 (0,0) 之外（实测跑到左下角外）
+  // 正确做法是算出默认右下角坐标，再走 applyPos（它自带收边，效果与首次加载一致）
+  const r = root.getBoundingClientRect()
+  const w = r.width || canvasSize()[0]
+  const h = r.height || curH()
+  applyPos(Math.max(0, window.innerWidth - w - 12), Math.max(0, window.innerHeight - h - 12))
+  try { localStorage.removeItem(POS_KEY) } catch { /* 存不了不影响归位 */ }
+})
+window.addEventListener('pointerup', () => {
+  if (!dragging) return
     dragging = false
     // 松手时收边一次：把位置收进屏幕（含本地保存）
     const r = root.getBoundingClientRect()
@@ -333,6 +370,8 @@ let figureValue = 0
 let qfigureValue = 0
 // 默认（体型 0/0）时模型头顶到 root 底部的距离，加载后一次性测量；气泡高度 = 此值 × 比例
 let defaultHeadTop = -1
+// 量 defaultHeadTop 当时的缩放：缩放变化后头顶距底要按比例重算，否则锚点还停在旧尺寸上（实测：缩放后按钮/拖动条/摸头热区全失位，刷新才对——刷新会重新量一次）
+let headTopAtScale = 1
 
 /**
  * 句子切分：统一走 src/segmentation.ts 的 spokenUnits（宿主与 widget 同一份实现，避免两套规则打架）。
@@ -604,17 +643,23 @@ async function startModel(): Promise<void> {
       const cm2 = im.coreModel
       const n = cm2.getDrawableCount()
       let minY = Infinity
+        let minX = Infinity
+        let maxX = -Infinity
       for (let i = 0; i < n; i++) {
         if ((cm2.getDrawableOpacity(i) ?? 1) < 0.02) continue
         const vs = im.getDrawableVertices(i)
         for (let j = 1; j < vs.length; j += 2) {
           const y = vs[j]
           if (y < minY) minY = y
+          const x = vs[j - 1]
+          if (x < minX) minX = x
+          if (x > maxX) maxX = x
         }
       }
       if (isFinite(minY)) defaultHeadTop = curH() - minY
     } catch { /* ignore */ }
     if (defaultHeadTop < 0) defaultHeadTop = Math.round(0.9 * curH())
+      headTopAtScale = scaleFactor
     // 统一动画帧：摸头摩擦头部跟随（被揉反馈） + UI 贴头定位
     const tick = (): void => {
       if (stopRender) return
@@ -637,7 +682,8 @@ async function startModel(): Promise<void> {
         // 气泡 bottom = 头顶距底 + 60k（新气泡贴头、旧话向上推）；热区顶 = 头顶上方 6% 画布高
         if (defaultHeadTop > 0) {
           const ratio = Math.max(0.6, 1 - 0.05 * figureValue - 0.30 * qfigureValue)
-          const ht = Math.round(defaultHeadTop * ratio)
+          // 头顶距底随整体缩放线性变化：以测量时的缩放为基准换算
+      const ht = Math.round(defaultHeadTop * (scaleFactor / headTopAtScale) * ratio)
           const k = 1 / Math.max(0.4, scaleFactor)
           const hPx = root.offsetHeight || curH()
           const topY = hPx - ht // 模型头顶离画布顶（随体型变矮而下移）
@@ -652,6 +698,7 @@ async function startModel(): Promise<void> {
           figureWrap.style.top = String(Math.round(topY - 68 * k)) + 'px'
           // 摸头热区跟随体型：顶 = 头顶上方 6% 画布高（模型变矮 → 热区同步下移）
           hitZone.style.top = Math.round(Math.max(0, topY - 0.06 * hPx)) + 'px'
+        syncDragBox(hPx, topY)
         }
       } catch { /* ignore */ }
       requestAnimationFrame(tick)
@@ -945,6 +992,20 @@ initLive2D()
 ;(window as any).__noriPetWidget = {
   /** 诊断：当前生效的模型契约（换模型没反应时先看这个） */
   modelMap: () => ({ path: MAP.modelPath, mouth: MAP.mouthParam, idle: MAP.idleGroup, gaps: modelGaps(MAP), loaded: !!model }),
+  /** 配置面板的即时预览入口（松手才写配置，见 configPanel） */
+  setScale: (f: number) => applyScale(f),
+  /** 体型（少女 Param158 / Q版 Param117）读写：设置面板里的滑杆直接用 */
+  getFigure: () => ({ girl: figureValue, chibi: qfigureValue }),
+  setFigure: (kind: "girl" | "chibi", v: number) => {
+    const clamped = Math.max(0, Math.min(1, v))
+    if (kind === 'girl') figureValue = clamped
+    else qfigureValue = clamped
+  },
+  /** 当前缩放：面板滑杆要跟浮动按钮共用同一个值，不能各存一份 */
+  getScale: () => scaleFactor,
+  setVolume: (v: number) => { (window as any).__noriPetVolume = Math.max(0, Math.min(1, v)) },
+  /** 打开设置面板（齿轮按钮同款） */
+  openConfig: () => configPanel.open(),
   root, showBubble, speak,
   get model() { return model },
   diag: () => ({ speak: { ...speakStats }, wsState: ws.healthy() ? 1 : -1, wsRetry: ws.retries(), muted, lastMsg, lastSpeak, scale: scaleFactor,
@@ -985,3 +1046,7 @@ initLive2D()
     } catch (e) { return { loaded: true, error: String(e) } }
   },
 }
+
+/** 齿轮 + 设置面板：宿主后端已就绪（GET/POST /api/config、/api/model/probe） */
+const configPanel = createConfigPanel(PREFIX)
+btnCfg.addEventListener('click', () => configPanel.toggle())

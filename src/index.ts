@@ -11,16 +11,17 @@
 import type { Context } from 'cordis'
 import { createReadStream, readFileSync, writeFileSync, existsSync, statSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
-import { join, dirname, normalize, extname, resolve, isAbsolute } from 'node:path'
+import { join, dirname, normalize, extname, resolve, isAbsolute, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Socket } from 'node:net'
 import { buildRuntimeTtsConfig } from './modelPreset.js'
-import type { Config } from './config.js'
+import { Config, CONFIG_DESCRIPTIONS } from './config.js'
 import { appendFatal, createLogs } from './logs.js'
 import { errMsg, hashText } from './util.js'
 import { createSpeakHandler } from './tts.js'
 import { mergeModelMap, modelGaps } from './modelMap.js'
+import { createConfigStore } from './configStore.js'
 import { createReframe } from './reframe.js'
 import { createPipeline } from './pipeline.js'
 import { installEvents } from './events.js'
@@ -358,6 +359,116 @@ function applyInner(ctx: AppContext, config: Config) {
     }
     const url = new URL(req.url ?? '/', 'http://localhost')
     const path = url.pathname.slice(PREFIX.length)
+    // ─── 配置 UI 后端：读/写 nori.config.json（字段见 src/configStore.ts 的白名单） ───
+    if (path === '/api/config') {
+      if (req.method === 'GET') {
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+        // 配置文件只含用户写过的键；把插件 Config（已带默认值）并进来，
+        // 界面才能看到**全部**可配项，而不是只有手动写过的那几个。
+        const snap = configStore.snapshot()
+        snap.config = { ...(config as unknown as Record<string, unknown>), ...snap.config }
+        // 任何 apiKey 形态的字段都脱敏（只留是否已配置）
+        for (const [k, v] of Object.entries(snap.config)) {
+          if (typeof v === 'object' && v !== null) {
+            const o = { ...(v as Record<string, unknown>) }
+            if ('apiKey' in o) o.apiKey = null
+            snap.config[k] = o
+          }
+        }
+        res.end(JSON.stringify(snap))
+        return
+      }
+      if (req.method === 'POST') {
+        const chunks: Buffer[] = []
+        let size = 0
+        for await (const chunk of req) {
+          size += (chunk as Buffer).length
+          if (size > 256 * 1024) { res.writeHead(413); res.end('payload too large'); return }
+          chunks.push(chunk as Buffer)
+        }
+        let patch: Record<string, unknown>
+        try {
+          patch = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>
+          if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('需要 JSON 对象')
+        } catch (err) {
+          res.writeHead(400, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, errors: ['请求体不是合法 JSON：' + String(err)] }))
+          return
+        }
+        // 校验：交给 zod Schema（与启动时同一套规则），失败不落盘
+        const result = configStore.apply(patch, validateConfigShape)
+        log('[dsh-nori-pet] config POST ' + (result.ok ? 'ok' : 'rejected: ' + (result.errors ?? []).join('; ')))
+        res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(result))
+        return
+      }
+      res.writeHead(405); res.end('method not allowed'); return
+    }
+
+    // ─── 配置 schema：界面据此生成表单（唯一真相是 config.ts，不手写字段清单） ───
+    if (path === '/api/config/schema' && req.method === 'GET') {
+      type Node = { type?: string; meta?: { default?: unknown }; dict?: Record<string, Node> }
+      const walk = (node: Node, prefix: string, out: Array<{ path: string; type: string; default: unknown }>): void => {
+        if (node?.type === 'object' && node.dict) {
+          for (const [k, child] of Object.entries(node.dict)) walk(child, prefix ? prefix + '.' + k : k, out)
+          return
+        }
+        out.push({ path: prefix, type: String(node?.type ?? 'any'), default: node?.meta?.default })
+      }
+      const fields: Array<{ path: string; type: string; default: unknown }> = []
+      walk(Config as unknown as Node, '', fields)
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+      // 每项附说明：优先用 CONFIG_DESCRIPTIONS（config.ts 内维护），否则取 schema 的 meta.description
+      const withDesc = fields.map((f) => ({
+        ...f,
+        description: CONFIG_DESCRIPTIONS[f.path] ?? (f as { description?: string }).description ?? '',
+      }))
+      res.end(JSON.stringify({ fields: withDesc }))
+      return
+    }
+
+    // ─── 模型探测：列出表达式/动作组，并给出契约草稿（UI 的「自动识别」按钮） ───
+    if (path === '/api/model/probe' && req.method === 'POST') {
+      const chunks: Buffer[] = []
+      for await (const chunk of req) chunks.push(chunk as Buffer)
+      let body: { file?: unknown }
+      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { file?: unknown } } catch { body = {} }
+      const file = typeof body.file === 'string' ? body.file.trim() : ''
+      if (!file) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: '缺少 file' })); return }
+      // 路径安全：只允许仓库内相对路径（绝对路径放行但要存在），拒绝 .. 逃逸
+      const abs = isAbsolute(file) ? file : resolve(dirname(HOST_DIR), file)
+      const root = resolve(dirname(HOST_DIR))
+      if (!isAbsolute(file) && !resolve(abs).startsWith(root + sep) && resolve(abs) !== root) {
+        res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: '路径越界' })); return
+      }
+      try {
+        const spec = JSON.parse(readFileSync(abs, 'utf8')) as {
+          FileReferences?: { Expressions?: Array<{ Name?: string; File?: string }>; Motions?: Record<string, unknown> }
+          Groups?: Array<{ Name?: string; Ids?: string[] }>
+        }
+        const expressions = (spec.FileReferences?.Expressions ?? [])
+          .map((e) => String(e?.Name ?? ''))
+          .filter(Boolean)
+        const motionGroups: Record<string, number> = {}
+        for (const [g, list] of Object.entries(spec.FileReferences?.Motions ?? {})) {
+          motionGroups[g] = Array.isArray(list) ? list.length : 0
+        }
+        const lipSync = (spec.Groups ?? []).find((g) => String(g?.Name ?? '').toLowerCase() === 'lipsync')
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+        res.end(JSON.stringify({
+          ok: true,
+          file,
+          expressions,
+          motionGroups,
+          lipSyncId: lipSync?.Ids?.[0] ?? null,
+        }))
+      } catch (err) {
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: '读不了这个模型文件：' + String(err) }))
+      }
+      return
+    }
+
     // 模型契约：前端据此决定模型路径/口型参数/情绪映射（换模型不用重编译 widget）
     if (path === '/api/model-map' && req.method === 'GET') {
       // 模型契约属于**运行时配置**（nori.config.json 的 model 段，热读），不是 dsh 插件 Config：
@@ -408,7 +519,40 @@ function applyInner(ctx: AppContext, config: Config) {
   }
 
   // ─── widget 注入（whale 插件同款机制：普通 <script>，不走 client-modules） ──
-  const WIDGET_PATH = join(HOST_DIR, 'widget.js')
+  /**
+ * 写配置前的最小校验：只查"类型错/明显越界"，不做业务规则。
+ * 为什么不用 Config.parse：本仓库的 zod 由 cordis 包装，类型上只有 Schema 没有 parse/safeParse，
+ * 拿不到真正的校验器；而 UI 侧改的是同一批键，类型挡一下足够，越界值交给运行时（有默认值与兜底）。
+ */
+function validateConfigShape(merged: Record<string, unknown>): string[] {
+  const errs: string[] = []
+  const num = (k: string, min: number, max = Number.MAX_SAFE_INTEGER) => {
+    const v = merged[k]
+    if (v === undefined) return
+    if (typeof v !== 'number' || !Number.isFinite(v)) errs.push(`${k}: 需要数字`)
+    else if (v < min || v > max) errs.push(`${k}: 需要在 ${min}~${max} 之间`)
+  }
+  const str = (k: string) => {
+    const v = merged[k]
+    if (v === undefined) return
+    if (typeof v !== 'string') errs.push(`${k}: 需要字符串`)
+  }
+  num('maxSentence', 1, 500)
+  num('volume', 0, 1)
+  num('rate', 0.25, 4)
+  num('scale', 0.3, 3)
+  num('ttsTemperature', 0, 2)
+  num('ttsTopK', 1, 100)
+  str('ttsUrl'); str('refAudio'); str('refPrompt'); str('assetsDir'); str('modelDir')
+  const model = merged.model
+  if (model !== undefined && (typeof model !== 'object' || model === null || Array.isArray(model))) {
+    errs.push('model: 需要对象')
+  }
+  return errs
+}
+
+const configStore = createConfigStore(join(dirname(HOST_DIR), 'nori.config.json'), (m) => log('[dsh-nori-pet] ' + m))
+const WIDGET_PATH = join(HOST_DIR, 'widget.js')
   let widgetJs = ''
   /* 见下方 readWidget()：按需读取，避免整个进程复用旧 bundle */
   // 版本戳 = widget.js 的 mtime：每次重建后 URL 变化，浏览器不会拿旧缓存里的 bundle
