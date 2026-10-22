@@ -27,6 +27,8 @@
 
 import { cleanSpeech } from './segmentation.js'
 
+import { CJK_ALNUM, codeFence } from './textPatterns.js'
+
 export interface SpeakTextOptions {
   /** 是否朗读 URL（false = 直接删掉；默认 true，读作"某个链接"） */
   readUrls?: boolean
@@ -40,7 +42,7 @@ export const MIN_SPEAKABLE_CHARS = 2
 /** 统计"真正会被念出来的字数"（汉字/字母/数字） */
 export function speakableLength(text: string): number {
   let n = 0
-  for (const ch of text) if (/[\u3400-\u4dbf\u4e00-\u9fffA-Za-z0-9]/.test(ch)) n++
+  for (const ch of text) if (CJK_ALNUM.test(ch)) n++
   return n
 }
 
@@ -120,7 +122,7 @@ const RE_MD_MARKS = /[`*^#>\\]/g
  */
 const RE_LIST_MARK = /(^|[\n。！？；，,、])\s*(?:[0-9１-９]{1,2}[.．、)）]\s+|[-•·*+]\s+)/g
 /** 代码块围栏整段丢弃 */
-const RE_CODE_FENCE = /```[\s\S]*?```|~~~[\s\S]*?~~~/g
+const RE_CODE_FENCE = codeFence()
 /**
  * 纯语气词/顿挫文本（"嗯……唔……那个……"这类）：剥掉标点后基本不剩内容。
  * 实测这类文本会被 AR 唱成「嗯~~~n-n-n-n-n-n-n-n」——**宁可不出声**。

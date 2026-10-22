@@ -10,6 +10,16 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { join, resolve, isAbsolute } from 'node:path'
 
+/** 剥 BOM：PowerShell 5.1 写出的 UTF-8 常带 BOM，留着会让首行指令失效 */
+const stripBom = (t: string): string => (t.charCodeAt(0) === 0xfeff ? t.slice(1) : t)
+
+/** 解析一个人设资产路径：配置覆盖优先（绝对路径或相对仓库根），否则回退到默认文件名 */
+function locate(repoRoot: string, v: string | undefined, fallback: string): string {
+  if (v) return isAbsolute(v) ? v : resolve(repoRoot, v)
+  const p = join(repoRoot, fallback)
+  return existsSync(p) ? p : ''
+}
+
 export interface Persona {
   /** 人设 system prompt（persona/prompt.txt 内容） */
   prompt: string
@@ -27,14 +37,9 @@ export interface PersonaConfig {
  * 供"启动加载 + 请求时热读"两处共用：规则改一句就能听出来，不必重载插件。
  */
 export function resolvePersonaPaths(repoRoot: string, cfg: PersonaConfig = {}): { promptPath: string; reframePath: string } {
-  const locate = (v: string | undefined, fallback: string): string => {
-    if (v) return isAbsolute(v) ? v : resolve(repoRoot, v)
-    const p = join(repoRoot, fallback)
-    return existsSync(p) ? p : ''
-  }
   return {
-    promptPath: locate(cfg.personaPrompt, join('persona', 'prompt.txt')),
-    reframePath: locate(cfg.personaReframe, join('persona', 'reframe.txt')),
+    promptPath: locate(repoRoot, cfg.personaPrompt, join('persona', 'prompt.txt')),
+    reframePath: locate(repoRoot, cfg.personaReframe, join('persona', 'reframe.txt')),
   }
 }
 
@@ -50,7 +55,6 @@ export function readReframeHot(reframePath: string, cached: string): string {
   if (!reframePath) return cached
   try {
     const s = readFileSync(reframePath, 'utf8')
-    const stripBom = (t: string) => (t.charCodeAt(0) === 0xfeff ? t.slice(1) : t)
     const t = stripBom(s)
     return t.trim() ? t : cached
   } catch {
@@ -59,16 +63,10 @@ export function readReframeHot(reframePath: string, cached: string): string {
 }
 
 export function loadPersona(repoRoot: string, cfg: PersonaConfig = {}): Persona | null {
-  const locate = (v: string | undefined, fallback: string): string => {
-    if (v) return isAbsolute(v) ? v : resolve(repoRoot, v)
-    const p = join(repoRoot, fallback)
-    return existsSync(p) ? p : ''
-  }
-  const promptPath = locate(cfg.personaPrompt, join('persona', 'prompt.txt'))
-  const reframePath = locate(cfg.personaReframe, join('persona', 'reframe.txt'))
+  const promptPath = locate(repoRoot, cfg.personaPrompt, join('persona', 'prompt.txt'))
+  const reframePath = locate(repoRoot, cfg.personaReframe, join('persona', 'reframe.txt'))
   if (!promptPath || !reframePath) return null
   try {
-    const stripBom = (s: string) => (s.charCodeAt(0) === 0xfeff ? s.slice(1) : s)
     const prompt = stripBom(readFileSync(promptPath, 'utf8'))
     const reframe = stripBom(readFileSync(reframePath, 'utf8'))
     if (!prompt.trim() || !reframe.trim()) return null

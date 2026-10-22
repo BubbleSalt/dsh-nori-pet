@@ -14,8 +14,9 @@
  * 行为由 scripts/test-segmentation.mjs 锁定（含 "access 被切成 acces+s" 等真实踩坑用例）。
  */
 
-/** CJK 表意文字（含扩展区） */
-const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/
+import { VALID_EMO_TAGS } from './emotions.js'
+import { CJK, codeFenceAny } from './textPatterns.js'
+
 const isCjk = (ch: string): boolean => CJK.test(ch)
 /** 全角标点：本身即句读边界 */
 const FULLWIDTH = /[，。！？；：、（）【】《》“”‘’…—～]/
@@ -50,7 +51,7 @@ const HTML_TAG = /<\s*(?:br|p|div|span|b|i|em|strong|u|s)\s*\/?\s*>/gi
  *     也不要把代码当正文念出来
  *  3) 只剩围栏标记 ```` ``` ```` 本身
  */
-const RE_FENCE = /```[\s\S]*?```|~~~[\s\S]*?~~~|^[ \t]*(?:```|~~~)[\s\S]*$|(?:```|~~~)/gm
+const RE_FENCE = codeFenceAny()
 /** 允许的溢出量（以"汉字宽"为单位） */
 const OVERRUN = 4
 /**
@@ -177,7 +178,8 @@ function sentences(text: string): string[] {
  *  3) 归一化：把"标签词"从词首剔除——ICU 可能正好切在 `】` 后，留下一段中文开头的裸标签词，
  *     此时已无从判断它是标签而非正文，只能按词表剔除（词表在 chat 场景里不会出现在正文开头）。
  */
-const EMO_WORDS = new Set(['default', 'happy', 'excited', 'angry', 'refuse', 'sad', 'doubt', 'troubled', 'shy', 'surprised', 'dizzy', 'serious', 'speechless', 'think'])
+/** 情绪标签词表：唯一真相在 src/emotions.ts（宿主清洗与前端校验共用同一份） */
+const EMO_WORDS = VALID_EMO_TAGS
 export function cleanSpeech(text: string): string {
   let t = String(text)
     .replace(HTML_TAG, '') // 0) 模型偶发吐出的 HTML 片段（`<br>` 实测 447 段里 16 次）

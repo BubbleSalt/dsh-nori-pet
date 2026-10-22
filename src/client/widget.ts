@@ -10,6 +10,8 @@ import * as PIXI from 'pixi.js'
 import { cleanSpeech, SPEAK_MAX, spokenUnits, widthOf } from '../segmentation.js'
 import { PREFIX } from '../protocol.js'
 import { Live2DModel } from 'pixi-live2d-display/cubism4'
+import { VALID_EMO_TAGS } from '../emotions.js'
+import type { Emotion } from '../emotions.js'
 ;(window as any).PIXI = PIXI
 
 // 路由前缀来自 protocol.ts（与宿主、smoke-test 同一份）；宿主 hello 帧下发的 prefix 与之同源
@@ -423,7 +425,7 @@ function playBuffer(buf: ArrayBuffer, token: number): Promise<void> {
 
 // ── 情绪标签解析：改写层输出的每行以【情绪】开头，解析成逐句 {text, emo} ──
 const EMO_TAG_RE = /^【([^】]+)】\s*/
-const VALID_EMO_TAGS = new Set(['default', 'happy', 'excited', 'angry', 'refuse', 'sad', 'doubt', 'troubled', 'shy', 'surprised', 'dizzy', 'serious', 'speechless', 'think'])
+// 情绪词表来自 src/emotions.ts（宿主清洗用的是同一份，见该文件头注释）
 interface TaggedSentence { text: string; emo: Emotion | null }
 function parseTagged(text: string): TaggedSentence[] {
   return text.split('\n')
@@ -607,10 +609,7 @@ btnMute.addEventListener('click', () => {
 })
 
 // ─── 情绪枢纽：文本 → 表情 + 动作联动（纯 widget 端，零 LLM 成本） ──
-type Emotion =
-  | 'default' | 'happy' | 'excited' | 'angry' | 'refuse' | 'sad' | 'doubt'
-  | 'troubled' | 'shy' | 'surprised' | 'dizzy' | 'serious' | 'speechless'
-  | 'think'
+// Emotion 类型由 src/emotions.ts 的 EMOTIONS 元组派生（加情绪只改那一处）
 
 /**
  * 情绪 → Live2D 表现：

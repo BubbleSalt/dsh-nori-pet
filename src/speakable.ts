@@ -13,8 +13,10 @@
  *  - 文件清单（纯路径行、`xx.ts` 这类裸文件名行）
  */
 
-const CODE_BLOCK = /```[\s\S]*?```/g
-const CODE_BLOCK_OPEN = /^```[\s\S]*$/m
+import { codeFence, codeFenceOpen } from './textPatterns.js'
+
+const CODE_BLOCK = codeFence()
+const CODE_BLOCK_OPEN = codeFenceOpen()
 const DIFF = /^(diff --git|@@ |\+\+\+ |--- |Index: )/
 const JSON_LINE = /^[[{][\s\S]*[\]}],?$|^"[^"]+":\s/
 const LOG_LINE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}|^\[\d{2}:\d{2}|^(INFO|WARN|ERROR|DEBUG|TRACE)\b/
