@@ -375,6 +375,17 @@ function applyInner(ctx: AppContext, config: Config) {
             snap.config[k] = o
           }
         }
+        // 同义字段取生效值：nori.config.json 的 reframe 段里若写了 reframeModel/reframeBaseUrl 等，
+        // 覆盖的是**顶层同名键**（reframe.ts 的读取逻辑如此）。界面必须显示真正生效的那个值，
+        // 否则用户看到 deepseek-chat、实际跑 DeepSeek-Flash —— 这套两处定义就是坑。
+        const rf = snap.config.reframeEnabled
+        if (rf && typeof rf === 'object') {
+          for (const [k, v] of Object.entries(rf as Record<string, unknown>)) {
+            if (k.startsWith('reframe') && k !== 'reframe' && v !== undefined && v !== null) {
+              snap.config[k] = v
+            }
+          }
+        }
         res.end(JSON.stringify(snap))
         return
       }

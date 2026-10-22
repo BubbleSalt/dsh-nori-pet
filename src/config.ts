@@ -43,30 +43,30 @@ const schema = z.object({
   ttsTopK: z.number().default(12),
   ttsSpeedFactor: z.number().default(1.0),
   /** Nori 人设改写层：agent 输出先经 LLM 改写为 Nori 口吻再朗读 */
-  reframe: z.boolean().default(true),
+  reframeEnabled: z.boolean().default(true),
+  /**
+   * 改写相关的全部参数（对象）。与开关 reframeEnabled 分开命名：
+   * 一个名字只对应一种语义，避免布尔和对象同名。
+   * 字段：apiKey / baseUrl / model / maxTokens / timeoutMs / maxInput / trace / provider / apiKeyRef
+   * 注意：不提供内置模型名默认值（厂商会废弃旧型号），model 留空则由 provider 决定。
+   */
+  reframe: z.any().default({}),
   /** 改写 LLM 的 provider（dsh-llm 注册名） */
-  reframeProvider: z.string().default('deepseek-official'),
   /** 改写 LLM 的模型 */
-  reframeModel: z.string().default('deepseek-chat'),
   /** 改写单次调用的超时（毫秒）。实测真实负载（11.9K 人设 system + 材料）约 10s，
    * 网关波动时易撞线 → 放宽到 60s；失败仅降级原文，无副作用。可在 nori.config.json reframe.reframeTimeoutMs 运行时覆盖。 */
-  reframeTimeoutMs: z.number().min(1000).default(60000),
   /** 改写输入的最大字符数（超出截断）。只作用于材料（user），不含 system 里的预设人设。
    *  调大后超长文本可一次喂更大块，改写请求次数更少、输出更精炼（配合 splitBlocks/BATCH_MAX）。 */
-  reframeMaxInput: z.number().min(1).default(4000),
   /**
    * 改写单次调用的最大输出 token。推理型模型（DeepSeek-V4-Flash 等）思维链会先吃满
    * tokens 再出 content——512 常被 reasoning 占光导致 content 空、判 EMPTY 降级原文。
    * 非推理模型（deepseek-chat 等）512 足够，此处按需调大（如 2048）。
    */
-  reframeMaxTokens: z.number().min(1).default(2048),
   /**
    * Nori 专用 API key 的 credentials ref（如 DEEPSEEK_NORI_API_KEY）。
    * 设置后改写层直连 DeepSeek 官方 API（独立计量，不走主会话）；留空则走 dsh 内置 llm 服务。
    */
-  reframeApiKeyRef: z.string().default('DEEPSEEK_NORI_API_KEY'),
   /** 专用 key 直连的 API 地址（OpenAI 兼容 /chat/completions） */
-  reframeBaseUrl: z.string().default('https://api.deepseek.com/v1'),
   /**
    * 改写层输入/输出追踪日志（排障用，**默认开启**）。
    *
@@ -76,7 +76,6 @@ const schema = z.object({
    * 所以长期开着也不会无限增长——需要翻"刚才那句为什么这么念"时，历史就在手边。
    * 不想要这些内容落盘就设 false（nori.config.json 的 `reframe.trace` 支持热改）。
    */
-  reframeTrace: z.boolean().default(true),
   /** api_v2 守护：定时探测 9880，掉了自动拉起（桌面朗读保底） */
   ttsWatch: z.boolean().default(true),
   /** 守护探测间隔（毫秒）。下限 5s：填 0 会让 setInterval 退化成定时器风暴 + 反复 spawn */

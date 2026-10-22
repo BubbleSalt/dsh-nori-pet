@@ -60,7 +60,9 @@ export function createReframe(deps: ReframeDeps) {
 async function reframeText(text: string, mode: 'reframe' | 'summary' = 'reframe'): Promise<string | null> {
   if (!persona) return text // 人设缺失：不改写，直接以原文朗读（保持链路通）
   const t0 = Date.now()
-  const input = text.length > config.reframeMaxInput ? text.slice(0, config.reframeMaxInput) + '……' : text
+  const rf = (config.reframe ?? {}) as Record<string, unknown>
+  const maxInput = Number(rf.maxInput ?? 4000)
+  const input = text.length > maxInput ? text.slice(0, maxInput) : text
   // 两处都热读：reframe.txt（风格）与 summary.txt（概括规则）改完下一次请求就生效，无需重载
   const system = buildSystemPrompt({
     prompt: persona.prompt,
@@ -71,11 +73,12 @@ async function reframeText(text: string, mode: 'reframe' | 'summary' = 'reframe'
   // 运行时直读 nori.config.json reframe 段（明文，可随时改无需重装）：
   // apiKey / reframeBaseUrl / reframeModel / reframeMaxTokens / reframeTimeoutMs / reframeTrace
   let dedicatedKey = ''
-  let dedicatedBase = config.reframeBaseUrl
-  let dedicatedModel = config.reframeModel
-  let dedicatedMaxTokens = config.reframeMaxTokens
-  let dedicatedTimeoutMs = config.reframeTimeoutMs
-  let traceOn = config.reframeTrace
+  let dedicatedBase = ''
+  let dedicatedModel = ''
+  const configKeyRef = String((config.reframe as Record<string, unknown> | undefined)?.apiKeyRef ?? 'DEEPSEEK_NORI_API_KEY')
+  let dedicatedMaxTokens = 2048
+  let dedicatedTimeoutMs = 60000
+  let traceOn = true
   try {
     const nc = JSON.parse(readFileSync(join(repoRoot, 'nori.config.json'), 'utf8'))
     const rf = nc?.reframe ?? {}
@@ -97,8 +100,8 @@ async function reframeText(text: string, mode: 'reframe' | 'summary' = 'reframe'
     if (!dedicatedKey) {
       try {
         const creds: any = credentials
-        if (creds?.resolve && config.reframeApiKeyRef) {
-          const hit = await creds.resolve(config.reframeApiKeyRef)
+  if (creds?.resolve && configKeyRef) {
+    const hit = await creds.resolve(configKeyRef)
           if (hit && typeof hit.value === 'string' && hit.value.length > 10) dedicatedKey = hit.value
         }
       } catch { /* 解析失败则回退 */ }
@@ -156,18 +159,19 @@ async function reframeText(text: string, mode: 'reframe' | 'summary' = 'reframe'
     if (!llm || typeof llm.stream !== 'function') return null
     let out = ''
     for await (const chunk of llm.stream({
-      provider: config.reframeProvider,
-      model: config.reframeModel,
+    provider: String((config.reframe as Record<string, unknown> | undefined)?.provider ?? ''),
+    // 不硬编码模型名（deepseek-chat 之类已被官方废弃）：配置里没写就不传，由 provider 决定默认模型
+    model: String((config.reframe as Record<string, unknown> | undefined)?.model ?? '') || undefined,
       messages: [{ role: 'user', content: [{ type: 'text', text: input }] }],
       system,
       temperature: 0.8,
-      maxTokens: config.reframeMaxTokens,
+    maxTokens: dedicatedMaxTokens,
       signal: ctrl.signal,
     })) {
       if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') out += chunk.text
     }
     const trimmed = out.trim()
-    if (!trimmed) logs.appendErr('reframe llm EMPTY output; provider=' + config.reframeProvider + ' model=' + config.reframeModel + ' (推理模型思考链占满 max_tokens? 可调大 reframeMaxTokens)')
+    if (!trimmed) logs.appendErr('reframe llm EMPTY output; provider=' + String((config.reframe as Record<string, unknown> | undefined)?.provider ?? ''))
     logs.trace(input, trimmed, Date.now() - t0, traceOn, mode)
     return trimmed || null
   } catch (e) {
@@ -181,7 +185,7 @@ async function reframeText(text: string, mode: 'reframe' | 'summary' = 'reframe'
 
 /** 最近一次 reframeText 读到的 trace 开关（nori.config.json 可热改）：
  * traceSummary 在 reframeText 之后调用，用它跟主开关保持一致 */
-let lastTraceOn = config.reframeTrace
+let lastTraceOn = true
 
 /**
  * 按段落拆分文本块（\n\n / \n / 长句边界），每块约 150~350 字。
