@@ -512,24 +512,13 @@ if ($Origins -is [array] -and $Origins.Count -gt 0) {
 # 改写层配置（可选）：nori.config.json 的 reframe 段 → patch 里的 `reframe` **对象**。
 # ⚠ schema 已把 reframe 从"一串顶层 reframeXxx 键"改成单个对象（src/config.ts 的 z.object）：
 #   顶层再写 reframeModel 之类属于未知键，会让整份 config 校验失败、插件根本挂不上。
-# ⚠ 旧配置文件用 reframeBaseUrl/reframeModel 这种带前缀的名字，这里两种都认（新名优先）。
+# 键名与 src/config.ts 的 reframe 对象一致（baseUrl/model/maxTokens/...），不再接受旧前缀名
 $ReframeCfg = $cfgFile.reframe
 if ($ReframeCfg) {
-  $ReframeAlias = [ordered]@{
-    baseUrl   = 'reframeBaseUrl'
-    model     = 'reframeModel'
-    maxTokens = 'reframeMaxTokens'
-    timeoutMs = 'reframeTimeoutMs'
-    maxInput  = 'reframeMaxInput'
-    trace     = 'reframeTrace'
-    provider  = 'reframeProvider'
-    apiKeyRef = 'reframeApiKeyRef'
-  }
+  $ReframeKeys = @('baseUrl', 'model', 'maxTokens', 'timeoutMs', 'maxInput', 'trace', 'provider', 'apiKeyRef')
   $rfLines = @()
-  foreach ($k in $ReframeAlias.Keys) {
-    $oldName = $ReframeAlias[$k]
+  foreach ($k in $ReframeKeys) {
     $v = $ReframeCfg.$k
-    if ($null -eq $v) { $v = $ReframeCfg.$oldName }
     if ($null -eq $v) { continue }
     if ($v -is [bool]) {
       $rfLines += "      ${k}: $(if ($v) { 'true' } else { 'false' })"

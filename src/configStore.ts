@@ -12,23 +12,6 @@
  */
 import { readFileSync, writeFileSync, renameSync, copyFileSync, existsSync, unlinkSync } from 'node:fs'
 
-/** 顶层允许 UI 修改的键（白名单）。不在这里的一律只读/原样保留。 */
-export const EDITABLE_TOP_KEYS = [
-  'ttsUrl',
-  'refAudio',
-  'refPrompt',
-  'ttsTemperature',
-  'ttsTopK',
-  'maxSentence',
-  'volume',
-  'rate',
-  'scale',
-  'assetsDir',
-  'modelDir',
-  'model',
-  'reframe',
-  'sovits',
-] as const
 
 /** 密钥字段（写时特殊处理，读时脱敏） */
 export const SECRET_PATHS = ['reframe.apiKey'] as const

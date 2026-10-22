@@ -83,19 +83,14 @@ async function reframeText(text: string, mode: 'reframe' | 'summary' = 'reframe'
     const nc = JSON.parse(readFileSync(join(repoRoot, 'nori.config.json'), 'utf8'))
     const rf = nc?.reframe ?? {}
     if (typeof rf.apiKey === 'string' && rf.apiKey.trim().length > 10) dedicatedKey = rf.apiKey.trim()
-  // 键名统一后是 baseUrl/model/maxTokens/timeoutMs；旧配置带 reframe 前缀，读时两种都认
-  const pick = (a: string, b: string): unknown => ((rf as Record<string, unknown>)[a] !== undefined ? (rf as Record<string, unknown>)[a] : (rf as Record<string, unknown>)[b])
-  const baseV = pick('baseUrl', 'reframeBaseUrl')
-  if (typeof baseV === 'string' && baseV.trim()) dedicatedBase = baseV.trim()
-  const modelV = pick('model', 'reframeModel')
-  if (typeof modelV === 'string' && modelV.trim()) dedicatedModel = modelV.trim()
-  const maxTok = pick('maxTokens', 'reframeMaxTokens')
-  if (typeof maxTok === 'number' && maxTok > 0) dedicatedMaxTokens = maxTok
-  const timeoutV = pick('timeoutMs', 'reframeTimeoutMs')
-  if (typeof timeoutV === 'number' && timeoutV > 0) dedicatedTimeoutMs = timeoutV
+  // 键名与 config.ts 的 reframe 对象一致：baseUrl / model / maxTokens / timeoutMs / trace
+  const rfObj = rf as Record<string, unknown>
+  if (typeof rfObj.baseUrl === 'string' && rfObj.baseUrl.trim()) dedicatedBase = rfObj.baseUrl.trim()
+  if (typeof rfObj.model === 'string' && rfObj.model.trim()) dedicatedModel = rfObj.model.trim()
+  if (typeof rfObj.maxTokens === 'number' && rfObj.maxTokens > 0) dedicatedMaxTokens = rfObj.maxTokens
+  if (typeof rfObj.timeoutMs === 'number' && rfObj.timeoutMs > 0) dedicatedTimeoutMs = rfObj.timeoutMs
     // 追踪日志含对话原文，默认为关；这里支持在 nori.config.json 里随时开关
-    const traceV = pick('trace', 'reframeTrace')
-  if (typeof traceV === 'boolean') traceOn = traceV
+  if (typeof rfObj.trace === 'boolean') traceOn = rfObj.trace
   } catch { /* 无配置文件 → 用 dsh 配置层默认 */ }
   lastTraceOn = traceOn
 
