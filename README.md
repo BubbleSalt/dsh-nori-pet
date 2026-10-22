@@ -88,15 +88,6 @@ Nori 常驻在浏览器角落，随时可以摆弄：
 - 缺哪几种情绪的可视资源，会在浏览器 console 和 `GET /api/model-map` 的 `gaps` 里报出来
 - 模型加载失败 → 自动进入纸片人模式（`install.ps1` 也不再因此中断）
 
-**不想手写映射？让工具猜一份草稿**（依据是表情文件的参数指纹，因为第三方模型的表情名常是 `F01`/`F02`）：
-
-```bash
-node scripts/model-map-from-model.mjs Nori_web/my.model3.json        # 报告 + 可粘贴 JSON
-node scripts/model-map-from-model.mjs Nori_web/my.model3.json --write # 直接写进 nori.config.json
-```
-
-它会打印每个情绪认领了哪个表情、认不出的还剩哪些（只影响表情，不影响气泡和声音）。草稿需要人工核对。
-
 ---
 
 ## 🚀 快速开始
