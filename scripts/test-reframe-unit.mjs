@@ -6,7 +6,7 @@
  * 抽成 createReframe(deps) 后可以注入假 llm，把几个关键契约钉住：
  *   · 两条推理通道的返回值/空输出降级
  *   · 同一 turn 内**相同文本只投递一次**（曾导致同一段被改写播报两遍）
- *   · 概括走 sentinel turn `<N>-sum`、且被 capSpeech 硬截断
+ *   · 概括走 sentinel turn `<N>-sum`，且**不截断**（只记录超长）
  *   · 分块规则（单块上限 1000 字，短块合并）
  */
 import { test } from 'node:test'
@@ -48,8 +48,7 @@ function makeHarness({ llm, persona = { prompt: '你是Nori', reframe: '改写�
     llm,
     broadcast: (o) => seen.broadcasts.push(o),
     onAssistant: () => {},
-    capSpeech: (t, n, c) => (t.length > c ? t.slice(0, c) : t),
-    summaryCharsOf: () => 100,
+      summaryCharsOf: () => 100,
     dir: d,
   })
   return { r, seen, dir: d }
@@ -110,7 +109,7 @@ test('enqueueReframe：同一 turn 内相同文本只投递一次（去重）', 
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
-test('概括：sentinel turn <N>-sum + 跑飞兜底截断 + 记入 hasSummarized', async () => {
+test('概括：sentinel turn <N>-sum，超长也不截断（结论不能被切掉）+ 记入 hasSummarized', async () => {
   const long = '很长的概括内容。'.repeat(60) // 480 字，超过 400 的兜底阈值 → 截断
   const { r, seen, dir } = makeHarness({ llm: fakeLlm(long) })
   try {
@@ -119,7 +118,7 @@ test('概括：sentinel turn <N>-sum + 跑飞兜底截断 + 记入 hasSummarized
     const b = seen.broadcasts.find((x) => String(x.turn).endsWith('-sum'))
     assert.ok(b, '应广播一条 <N>-sum')
     assert.equal(b.turn, '3-sum')
-    assert.ok(b.text.length <= 400, '超过兜底阈值要截断，实测 ' + b.text.length)
+    assert.ok(b.text.length > 400, '不得截断：' + b.text.length)
     assert.equal(r.hasSummarized(3), true)
     assert.equal(r.hasSummarized(4), false)
   } finally { rmSync(dir, { recursive: true, force: true }) }

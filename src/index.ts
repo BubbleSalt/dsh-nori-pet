@@ -40,8 +40,6 @@ export const inject = ['webServer', 'llm', 'credentials', 'sessions']
 // 保持插件入口的对外 API 不变（dsh loader 按 `Config` 导出名读 schema）。
 export { Config } from './config.js'
 
-// capSpeech 已抽到 src/capSpeech.ts（保住开头+结尾，只丢中间；可单测）
-import { capSpeech } from './capSpeech.js'
 
 /**
  * 概括模式追加规则（接在 persona 之后）。设计约束来自实测需求：
@@ -151,12 +149,11 @@ function applyInner(ctx: AppContext, config: Config) {
     llm: (ctx as any).llm,
     broadcast,
     onAssistant: (out) => { stats.assistant += 1; stats.lastAssistant = out.slice(0, 60) },
-    capSpeech,
     summaryCharsOf: (turn) => pipelineRef?.summaryCharsOf(turn) ?? 0,
   })
 
   // ─── 播报管线（状态机）与事件订阅：实现在 src/pipeline.ts / src/events.ts ───
-  const pipeline = createPipeline({ config, logs, log, broadcast, reframe, extractText, capSpeech })
+  const pipeline = createPipeline({ config, logs, log, broadcast, reframe, extractText })
   const { stats } = pipeline
   pipelineRef = pipeline
   installEvents(ctx, { onAgentFrame: pipeline.handleAgentFrame, onSessionEvent: pipeline.handleSessionEvent, stats })

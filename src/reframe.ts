@@ -14,7 +14,6 @@ import type { Config } from './config.js'
 import type { NoriLogs } from './logs.js'
 import type { loadPersona, resolvePersonaPaths } from './prompt.js'
 import { buildSystemPrompt, readReframeHot, readSummaryHot } from './prompt.js'
-import { RUNAWAY_MAX_CHARS, RUNAWAY_MAX_SENTENCES } from './capSpeech.js'
 import { softCut } from './segmentation.js'
 import { extractSpeakable } from './speakable.js'
 import { addBounded } from './util.js'
@@ -40,13 +39,12 @@ export interface ReframeDeps {
   /** 统计与 /api/status 的 lastAssistant（宿主维护） */
   onAssistant: (out: string) => void
   /** 概括层硬截断（宿主测过 262 字的概括超长） */
-  capSpeech: (text: string, maxSentences: number, maxChars: number) => string
   /** 某 turn 被抑制的原文长度（兜底日志里用） */
   summaryCharsOf: (turn: number) => number
 }
 
 export function createReframe(deps: ReframeDeps) {
-  const { config, logs, log, repoRoot, persona, personaPaths, credentials, llm: llmSvc, broadcast, onAssistant, capSpeech, summaryCharsOf } = deps
+  const { config, logs, log, repoRoot, persona, personaPaths, credentials, llm: llmSvc, broadcast, onAssistant, summaryCharsOf } = deps
 
   /** 已发过概括的 turn（防重复播报）；只关心近期，故有界 */
   const summarizedTurns = new Set<number>()
@@ -314,11 +312,12 @@ async function summarizeAndBroadcast(sid: string, turn: number, text: string): P
   let out = await reframeText(text, 'summary')
   if (!out) out = extractSpeakable(text) // 概括失败 → 播精简后的原文（跳过代码/日志/清单），仍好过念全文
   if (!out) return
-  // 只拦"跑飞"：正常概括略超目标（3 句/140 字）不管 —— 多说两句只是多读几秒，
-  // 删掉结论才是真损失。超过 6 句/400 字才认为失控，且截断时保住开头和结尾。
-  const guarded = capSpeech(out, RUNAWAY_MAX_SENTENCES, RUNAWAY_MAX_CHARS)
-  if (guarded !== out) logs.appendErr(`[nori-pet] summary runaway ${out.length}→${guarded.length} chars (turn=${turn})`)
-  out = guarded
+  // **不做截断**：句数/字数都不是该切的理由 —— 切掉中间会把结论一起丢掉，
+  // 而"说得长"只是多读几秒。长度只作为观测指标记录，便于发现模型真的跑飞（复读/循环）。
+  const units = out.split(/[。！？!?]/).filter((x) => x.trim()).length
+  if (units > 8 || out.length > 600) {
+    logs.appendErr(`[nori-pet] summary long: ${units}句/${out.length}字 (turn=${turn}) —— 未截断，仅记录`)
+  }
   const ms = Date.now() - t0
   onAssistant(out)
   // turn 用 `<N>-sum` 标记"这是概括"；widget 侧会把它归一成同一个逻辑 turn N

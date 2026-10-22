@@ -47,7 +47,6 @@ export interface PipelineDeps {
   /** 从消息内容里取纯文本（宿主侧工具函数） */
   extractText: (content: unknown) => string
   /** 朗读长度硬截断（宿主侧工具函数） */
-  capSpeech: (text: string, maxSentences: number, maxChars: number) => string
 }
 
 export function createPipeline(deps: PipelineDeps): {
