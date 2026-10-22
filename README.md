@@ -271,6 +271,7 @@ GPT-SoVITS 是本地语音合成引擎（TTS）——Nori 用它把文字念成�
 | 某字被拖长后吞句（"嗯/唔"等鼻音） | AR 采样循环：确认 `ttsTemperature`/`ttsTopK` 不低于 0.9/12（speak 已内置拖长自动重试兜底）；**纯语气词句子现在会直接跳过不合成**（实测合成必然出怪音） |
 | 语音 503 `tts offline` | 9880 不可达：`Test-NetConnection 127.0.0.1 -Port 9880`；ttsWatch 会在 30s 内自动拉起 |
 | 念出听不懂的"外星文" | 文本层问题（URL/路径/命令/符号被前端剥光后 AR 自由发挥）：`src/speakText.ts` 已内置清理；新增可疑句式请用 `node scripts/test-tts-quality.mjs` 回归 |
+| 同一句被念两遍 / "连续改写两次" | 上游把同一块内容投喂了两次（`block-end` 是整块全文快照，provider 重试 / 与 `text-delta` 重叠 / 帧重复处理都会重复送）。现由**块水位**（`src/streamFeed.ts`）保证幂等：只播"还没播过的那截"。观测口：`/api/status` 的 `dupFeed` 计数 + 日志 `dup feed suppressed` |
 | 睡眠睁眼 / 头每 3 秒回正 | 已适配原版模型解决（睡眠动作在 Idle 组，配 `setIsLoop(true)` 稳住）；换成别的模型会睡眠退化 |
 | 日志 | 错误：`~/.dsh/logs/nori-pet/nori-pet-error.log`；改写追踪：`~/.dsh/logs/nori-pet/nori-pet-trace*.log`（**默认关闭**，见下方隐私说明） |
 
@@ -291,6 +292,9 @@ node scripts/test-speaktext-ab.mjs
 # 4) 改写层注水回归（需真实 LLM）：短材料会被撑成几句？
 node scripts/test-reframe-brevity.mjs            # 短材料：判定 ≤2 句、无注水句
 node scripts/test-reframe-brevity.mjs --long     # 反向回归：多要点材料要点不能丢
+
+# 5) 投喂幂等回归：同一块内容被送两次时是否只播一遍
+node scripts/test-stream-feed-dedup.mjs
 ```
 
 想验证"到底念对了没有"，再跑一趟 **ASR 回转**（用本地 faster-whisper 把合成音频转回汉字，
@@ -386,6 +390,7 @@ Nori 打开时会往页面挂一个全局对象 **`__noriPetWidget`**——按 *
 ```
 src/index.ts           宿主：会话监听 / 断句 / 改写 / TTS 代理 / 资产服务 / WebSocket / 安全校验
 src/speakText.ts       朗读文本清理：URL/路径/命令→可朗读说法、符号→读音、Markdown→剥、无内容→跳过
+src/streamFeed.ts      流式投喂水位：同一块内容被送多次时只播一遍（幂等投喂）
 src/segmentation.ts    断句与清洗（Intl.Segmenter 句粒度、情绪标签剥离、安全切点）
 src/prompt.ts          人设加载器（persona/*.txt → 改写层；缺失自动降级）
 src/client/widget.ts   浏览器 widget：Live2D 渲染、情绪、睡眠、摸头、UI 锚定（单独打包，不经宿主 tsc）

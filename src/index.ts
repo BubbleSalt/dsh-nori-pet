@@ -19,6 +19,8 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { cleanSpeech, softCut, spokenUnits } from './segmentation.js'
 import { extractSpeakable } from './speakable.js'
 import { toSpeakable } from './speakText.js'
+import { applyBlockEnd, applyTextDelta, blockKey, clearFeedByPrefix } from './streamFeed.js'
+import type { FeedState } from './streamFeed.js'
 import type { Socket } from 'node:net'
 import { homedir } from 'node:os'
 import { loadPersona, resolvePersonaPaths, readReframeHot } from './prompt.js'
@@ -399,6 +401,7 @@ function applyInner(ctx: AppContext, config: Config) {
   let lastBroadcast = ''
   let statChunks = 0
   let statTextDelta = 0
+  let statDupFeed = 0
   let statAssistant = 0
   let statTurnEnd = 0
   let statHello = 0
@@ -1157,6 +1160,14 @@ function applyInner(ctx: AppContext, config: Config) {
   //     `{ global: true }` 才能收到任何 agent 的帧——漏掉这个参数时监听器永不触发、
   //     且不报错（旧版因此整条流式播报静默，是"长内容一口气读完"的根因之一）。
   const attemptTurn = new Map<string, { turn: number; step: number }>()
+  /** 块投喂水位（见 streamFeed.ts）：保证同一块内容被投喂多次时只播一遍 */
+  const fedBlocks: FeedState = new Map()
+  /** 水位表容量上限：正常靠 turn/end 回收，这里兜底防异常结束的 attempt 让它无界增长 */
+  const pruneFeed = (): void => {
+    if (fedBlocks.size <= 256) return
+    const first = fedBlocks.keys().next().value
+    if (first !== undefined) fedBlocks.delete(first)
+  }
   ;(ctx as any).on('agent/assistant-stream', (payload: any) => {
     const frame = payload?.frame
     if (!frame) return
@@ -1179,11 +1190,30 @@ function applyInner(ctx: AppContext, config: Config) {
     // 协议（实测当前 DSH）：文本不走 text-delta，而是 `block-end` 携带整块内容：
     //   { type:'block-end', index, block:{ type:'text'|'reasoning'|'tool-call', text } }
     // 旧的 `text-delta` 分支保留兼容（其他 provider/版本可能仍发增量）。
-    if (c.type === 'text-delta') { if (typeof c.text === 'string') feed(c.text); return }
+    // ⚠ `block-end` 是**整块全文快照**，不是增量；同一块可能被投喂多次（provider 重试、
+    //   与 text-delta 重叠、帧重复处理）。纯追加会让同一段内容念两遍（实测：整段 ×2、
+    //   `A` `B` 之后又来一条 `A+B`）。这里用块水位把它变成幂等投喂，只补"还没投喂过的那截"。
+    if (c.type === 'text-delta') {
+      if (typeof c.text === 'string') {
+        const bk = blockKey(sid, ts?.turn ?? 0, ts?.step ?? 0, c.index)
+        feed(applyTextDelta(fedBlocks, bk, c.text))
+        pruneFeed()
+      }
+      return
+    }
     if (c.type !== 'block-end') return
     const block = c.block
     if (!block || block.type !== 'text' || typeof block.text !== 'string') return // 只播正文：reasoning 规划与 tool-call 参数不朗读
-    feed(block.text)
+    const bk = blockKey(sid, ts?.turn ?? 0, ts?.step ?? 0, c.index)
+    const r = applyBlockEnd(fedBlocks, bk, block.text)
+    if (r.delta) feed(r.delta)
+    else if (r.dup) {
+      statDupFeed += 1
+      // 只在真正发生重复投喂时记一行（正常情况不该出现；出现即说明上游在重复送同一块，
+      // 这条日志 + /api/status 的 dupFeed 就是它的观测口）
+      log(`[dsh-nori-pet] dup feed suppressed: ${bk} len=${block.text.length}`)
+    }
+    pruneFeed()
   }, { global: true })
   const delayedSub = setTimeout(() => {
     ;(ctx as any).on('session/event', (session: any, event: any) => {
@@ -1256,6 +1286,7 @@ function applyInner(ctx: AppContext, config: Config) {
           turnSummaryText.delete(data.turn)
           for (const k of [...stepBand.keys()]) if (k.startsWith(prefix)) stepBand.delete(k)
           for (const k of [...stepChars.keys()]) if (k.startsWith(prefix)) stepChars.delete(k)
+          clearFeedByPrefix(fedBlocks, prefix) // 块投喂水位随 turn 回收，防无界增长
           broadcast({ type: 'turn-end', session: sid, turn: data.turn, reason: data.reason?.kind })
           break
         }
@@ -1630,7 +1661,7 @@ function applyInner(ctx: AppContext, config: Config) {
     const path = url.pathname.slice(PREFIX.length)
     if (path === '/api/status' && req.method === 'GET') {
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ ok: true, tts: config.ttsUrl, model: 'Nori', prefix: PREFIX, ws: clients.size, events: eventCount, chunks: statChunks, textDelta: statTextDelta, assistant: statAssistant, turnEnd: statTurnEnd, hello: statHello, ack: statAck, lastAssistant, last: lastBroadcast, sent: lastSendFrame, recentBroadcasts }))
+      res.end(JSON.stringify({ ok: true, tts: config.ttsUrl, model: 'Nori', prefix: PREFIX, ws: clients.size, events: eventCount, chunks: statChunks, textDelta: statTextDelta, dupFeed: statDupFeed, assistant: statAssistant, turnEnd: statTurnEnd, hello: statHello, ack: statAck, lastAssistant, last: lastBroadcast, sent: lastSendFrame, recentBroadcasts }))
       return
     }
     if (path === '/api/ws-test' && req.method === 'GET') {

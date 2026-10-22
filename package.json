@@ -41,24 +41,26 @@
     "url": "^0.11.3"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && npm run build:client",
     "typecheck": "npm run typecheck:host && npm run typecheck:client",
     "typecheck:host": "tsc -p tsconfig.json --noEmit",
     "typecheck:client": "tsc -p tsconfig.widget.json --noEmit",
+    "build": "tsc -p tsconfig.json && npm run build:client",
     "build:client": "tsdown",
-    "test": "npm run test:preset && npm run test:segmentation && npm run test:speakable && npm run test:dedup && npm run test:timers && npm run test:log-retention && npm run test:guard-fallback && npm run test:smoke",
+    "test": "npm run test:preset && npm run test:segmentation && npm run test:speakable && npm run test:speaktext && npm run test:feed-dedup && npm run test:dedup && npm run test:timers && npm run test:log-retention && npm run test:guard-fallback && npm run test:smoke",
     "test:preset": "node scripts/test-model-preset.mjs",
     "test:segmentation": "node scripts/test-segmentation.mjs",
     "test:speakable": "node scripts/test-speakable.mjs",
+    "test:speaktext": "node scripts/test-speaktext.mjs",
+    "test:feed-dedup": "node scripts/test-stream-feed-dedup.mjs",
     "test:dedup": "node scripts/test-stream-dedup.mjs",
     "test:timers": "node scripts/test-timer-cleanup.mjs",
     "test:log-retention": "node scripts/test-log-retention.mjs",
     "test:guard-fallback": "node scripts/test-guard-fallback.mjs",
+    "test:reframe": "node scripts/test-reframe-brevity.mjs && node scripts/test-reframe-brevity.mjs --long",
     "test:guard": "node scripts/guard-release.mjs",
     "test:smoke": "node scripts/smoke-test.mjs",
     "guard": "node scripts/guard-release.mjs",
-    "guard:staged": "node scripts/guard-release.mjs --staged",
-    "test:reframe": "node scripts/test-reframe-brevity.mjs && node scripts/test-reframe-brevity.mjs --long"
+    "guard:staged": "node scripts/guard-release.mjs --staged"
   },
   "exports": {
     ".": {
