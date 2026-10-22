@@ -18,7 +18,7 @@ import type { Socket } from 'node:net'
 import { buildRuntimeTtsConfig } from './modelPreset.js'
 import type { Config } from './config.js'
 import { appendFatal, createLogs } from './logs.js'
-import { errMsg } from './util.js'
+import { errMsg, hashText } from './util.js'
 import { createSpeakHandler } from './tts.js'
 import { createReframe } from './reframe.js'
 import { createPipeline } from './pipeline.js'
@@ -138,9 +138,7 @@ function applyInner(ctx: AppContext, config: Config) {
     const o = obj as any
     if (o && typeof o.text === 'string') {
       const s = o.text as string
-      let h = 5381
-      for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0
-      recentBroadcasts.push({ ts: Date.now(), type: String(o.type ?? ''), h: h.toString(36), turn: typeof o.turn === 'number' ? o.turn : undefined, len: s.length })
+      recentBroadcasts.push({ ts: Date.now(), type: String(o.type ?? ''), h: hashText(s), turn: typeof o.turn === 'number' ? o.turn : undefined, len: s.length })
       if (recentBroadcasts.length > 20) recentBroadcasts.shift()
     }
     for (const c of clients) {
@@ -228,7 +226,7 @@ function applyInner(ctx: AppContext, config: Config) {
   async function handleAssets(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', 'http://localhost')
     let rel: string
-    try { rel = decodeURIComponent(url.pathname.slice(PREFIX.length)) } catch {
+    try { rel = decodeURIComponent(url.pathname.slice(PREFIX.length)) } catch { // 非法百分号转义 → 400（不是资产路径）
       res.writeHead(400, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ error: 'bad request' }))
       return
@@ -265,7 +263,7 @@ function applyInner(ctx: AppContext, config: Config) {
       })
       res.writeHead(200, { 'content-type': mime, 'content-length': st.size, 'cache-control': 'no-cache' })
       rs.pipe(res)
-    } catch {
+    } catch { // 资产缺失/读失败 → 404：静态文件缺失不该变成 500
       res.writeHead(404); res.end('not found')
     }
   }
@@ -283,7 +281,7 @@ function applyInner(ctx: AppContext, config: Config) {
         const host = new URL(origin).hostname
         if (LOCAL_HOSTS.has(host)) return true
         return config.allowedOrigins.includes(host)
-      } catch { return false }
+      } catch { return false } // Origin 不是合法 URL → 视为不可信
     }
     return true
   }
@@ -326,7 +324,7 @@ function applyInner(ctx: AppContext, config: Config) {
       lastSendFrame = msg.slice(0, 120)
       try { socket.write(encodeFrame(msg)) } catch { /* ignore */ }
     }
-    client.close = () => { try { socket.write(encodeFrame(Buffer.alloc(0), 8) as any); socket.end() } catch { socket.destroy() } }
+    client.close = () => { try { socket.write(encodeFrame(Buffer.alloc(0), 8) as any); socket.end() } catch { socket.destroy() } } // 关闭帧写失败就硬断开：这条连接本来就要丢
 
     function onFrame(frame: ParsedFrame): void {
       if (frame.opcode === 0x9) { // ping → pong

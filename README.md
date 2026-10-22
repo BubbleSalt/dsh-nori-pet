@@ -419,6 +419,9 @@ src/streamFeed.ts      流式投喂水位：同一块内容被送多次时只播
 src/segmentation.ts    断句与清洗（Intl.Segmenter 句粒度、情绪标签剥离、安全切点）
 src/prompt.ts          人设加载器（persona/*.txt → 改写层；缺失自动降级）
 src/modelPreset.ts     从 tts_infer.yaml 生成运行时权重配置（sovits 段热切换）
+src/emotions.ts        情绪词表 + Emotion 类型 + 关键词分类器（宿主清洗与前端表情共用唯一真相）
+src/textPatterns.ts    CJK 字符类 + 三种代码围栏语义（曾四处/三处各抄一份）
+src/speakQueue.ts      朗读队列：打断/追加/优先插入的排队策略（可单测，widget 注入依赖）
 src/client/widget.ts   浏览器 widget：Live2D 渲染、情绪、睡眠、摸头、UI 锚定（单独打包，不经宿主 tsc）
 src/client/url-shim.ts widget 打包用的浏览器安全 url 垫片（pixi 依赖 Node url 的替代）
 tsconfig.json          宿主编译配置（严格模式，含未使用检查）

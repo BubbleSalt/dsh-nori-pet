@@ -7,11 +7,15 @@
  * 依赖：bundle banner 内联的 live2dcubismcore.js（真实 core，先于本代码执行）。
  */
 import * as PIXI from 'pixi.js'
-import { cleanSpeech, SPEAK_MAX, spokenUnits, widthOf } from '../segmentation.js'
+import { SPEAK_MAX, spokenUnits, widthOf } from '../segmentation.js'
 import { PREFIX } from '../protocol.js'
 import { Live2DModel } from 'pixi-live2d-display/cubism4'
-import { VALID_EMO_TAGS } from '../emotions.js'
 import type { Emotion } from '../emotions.js'
+import { classifyEmotion } from '../emotions.js'
+import { parseTaggedSentences } from '../speakText.js'
+import type { TaggedSentence } from '../speakText.js'
+import { createSpeakQueue } from '../speakQueue.js'
+import { createTtsClient } from '../ttsClient.js'
 ;(window as any).PIXI = PIXI
 
 // 路由前缀来自 protocol.ts（与宿主、smoke-test 同一份）；宿主 hello 帧下发的 prefix 与之同源
@@ -331,58 +335,20 @@ function splitSentences(text: string): string[] {
   return spokenUnits(text, SPEAK_MAX).map((s) => s.trim()).filter((s) => s.length > 0)
 }
 
-/** 合成结果缓存：文本 → WAV。打断时**先合成新首句**再切旧音频，靠它做到无缝衔接，
- *  否则切断的瞬间是静音、还要等 TTS 好几秒（实测"停顿了一会才说话"）。上限 16 条。 */
-const ttsCache = new Map<string, ArrayBuffer>()
-const TTS_CACHE_MAX = 16
-function cacheTts(text: string, buf: ArrayBuffer): void {
-  if (ttsCache.size >= TTS_CACHE_MAX) {
-    const firstKey = ttsCache.keys().next().value
-    if (firstKey !== undefined) ttsCache.delete(firstKey)
-  }
-  ttsCache.set(text, buf)
-}
-
-/** 单句合成的客户端超时：宿主内部最多"两轮上游 + 拖长重生"（服务端总预算 40s），
- *  这里留出余量。**必须给超时**：fetch 永不返回时这句的 Promise 会挂死，
- *  而播报是串行队列 —— 一句卡住整条队列（用户观感"桌宠哑了、之后再也不说话"）。 */
-const TTS_FETCH_TIMEOUT_MS = 60000
-
-/** 向宿主合成一句音频；返回 ArrayBuffer（被打断/失败返回 null）。不打断当前播放。
- *  顺带把这条文本占的"汉字宽"报给宿主：/api/status 里能直接看到断句是否贴着预算。 */
-function fetchTts(text: string, token: number): Promise<ArrayBuffer | null> {
-  const hit = ttsCache.get(text)
-  if (hit) return Promise.resolve(token === playToken ? hit : null)
-  return fetch(PREFIX + '/api/speak', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    signal: AbortSignal.timeout(TTS_FETCH_TIMEOUT_MS),
-    body: JSON.stringify({
-      text,
-      budget: SPEAK_MAX,
-      units: widthOf(text),
-      // 行数是真机反馈：气泡实际占了几行，/api/status 里可以核对 34 这个数到底贴不贴两行
-      lines: lastBubbleLines,
-      dropped: droppedSpeakCount,
-    }),
-  })
-    .then(async (res) => {
-      // 204 = 宿主判定"这段没有可朗读内容"（纯符号/纯语气词）→ 静默跳过，不弹气泡、不重试。
-      // 这类文本若硬送合成，AR 会吐怪音（实测"嗯……唔……那个……"被唱成"嗯~~~n-n-n-n-n-n"）。
-      if (res.status === 204) return null
-      // 给用户看的气泡文案：503/连不上 = sovits 未上线（清晰易懂）；其它错误码保留 codes 便于排障
-      if (res.status === 503) { showBubble('（sovits 未上线）'); return null }
-      if (!res.ok) { showBubble('（TTS 未就绪：' + res.status + '）'); return null }
-      const buf = await res.arrayBuffer()
-      cacheTts(text, buf) // 打断时预合成的结果，下次直接命中
-      return token === playToken ? buf : null
-    })
-    .catch((e: any) => {
-      // 超时与"连不上"要分开说：前者是服务端太慢（还在跑），后者是 sovits 没起来
-      showBubble(e?.name === 'TimeoutError' ? '（TTS 超时）' : '（sovits 未上线）')
-      return null
-    })
-}
+/**
+ * 合成缓存与单句请求在 src/ttsClient.ts（超时、204/503/超时话术、缓存命中都在那里可单测）。
+ * 这里只把 widget 的运行时状态接进去。
+ */
+const tts = createTtsClient({
+  basePath: PREFIX,
+  unitsOf: (t) => widthOf(t),
+  lines: () => lastBubbleLines,
+  dropped: () => queue.dropped(),
+  currentToken: () => playToken,
+  onNotice: (msg) => showBubble(msg),
+  log: (m) => console.warn(m),
+})
+const fetchTts = (text: string, token: number): Promise<ArrayBuffer | null> => tts.get(text, token)
 
 /** 播放已合成的音频；返回 Promise，播放完或被打断时 resolve。 */
 function playBuffer(buf: ArrayBuffer, token: number): Promise<void> {
@@ -423,32 +389,11 @@ function playBuffer(buf: ArrayBuffer, token: number): Promise<void> {
   })
 }
 
-// ── 情绪标签解析：改写层输出的每行以【情绪】开头，解析成逐句 {text, emo} ──
-const EMO_TAG_RE = /^【([^】]+)】\s*/
-// 情绪词表来自 src/emotions.ts（宿主清洗用的是同一份，见该文件头注释）
-interface TaggedSentence { text: string; emo: Emotion | null }
-function parseTagged(text: string): TaggedSentence[] {
-  return text.split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .map((line) => {
-      const m = line.match(EMO_TAG_RE)
-      if (m && VALID_EMO_TAGS.has(m[1])) return { text: stripTags(line.slice(m[0].length)).trim(), emo: m[1] as Emotion }
-      return { text: stripTags(line).trim(), emo: null }
-    })
-}
-
-/** 剥掉残留的情绪标签：标签是控制标记，绝不能进入合成文本（否则会被当正文念出来）。
- *  正常输出每行标签在行首、已由 parseTagged 消费；此处兜底处理行中/行尾残留，
- *  以及 ICU 句级切分切断的残骸（`…【` / `serious】…`）。 */
-function stripTags(text: string): string {
-  return cleanSpeech(text)
-}
 
 /** 朗读：优先按【情绪】标签逐句（每句激活对应表情）；无标签文本回落 splitSentences 本地分类。
  * 预取策略：窗口内并行合成 ≤4 句；第一句就绪即打断当前播放入口、立即开播，播放中后台推进预取。 */
 async function speakText(text: string, token: number): Promise<void> {
-  const tagged = parseTagged(text)
+  const tagged = parseTaggedSentences(text)
   const useTagged = tagged.length > 0 && tagged.some((t) => t.emo !== null)
   let sentences: TaggedSentence[]
   if (useTagged) {
@@ -499,108 +444,25 @@ async function speakText(text: string, token: number): Promise<void> {
 
 // ─── 朗读队列：同 turn 的文本排队顺序读完，跨 turn 才打断 ───────
 let activeTurn: string | null = null // 归一后的逻辑 turn（`12` 与 `12-sum` 视为同一轮）
-const pendingTexts: string[] = []
-let pumping = false
-
-// ── 取证：播放文本 hash 环形缓冲（重复朗读检测，只 warn 不改行为）──
-const PLAY_HASH_MAX = 30
-const playHashes: string[] = []
-function hashText(s: string): string {
-  let h = 5381
-  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0
-  return h.toString(36)
-}
-function notePlayed(text: string): void {
-  const h = hashText(text)
-  if (playHashes.includes(h)) console.warn('[nori-pet] REPEAT PLAY detect: hash=' + h + ' text=' + text.slice(0, 30))
-  playHashes.push(h)
-  if (playHashes.length > PLAY_HASH_MAX) playHashes.shift()
-}
-
-/** 打断时被丢弃（改以气泡呈现）的文本条数——随 /api/speak 上报，便于核对"有没有话被吞" */
-let droppedSpeakCount = 0
-/** 打断预合成期间挂住队列：避免旧 speakText 循环把新文本当自己的句子播掉（会二次打断） */
-let interruptHold = 0
-
-/** 新 turn：打断当前朗读，重排为最新文本。
- *
- *  打断的两个体验问题都在这里治：
- *  1) **不要先掐断再说**——先帮新文本的首句合成好（进 ttsCache），再切旧音频。
- *     否则切断瞬间静音，还要等 TTS 好几秒才出声（实测："停顿了一会才说话"）。
- *  2) 打断**不等于丢掉内容**——队列里还没读的句子，声音停掉，但用气泡补出来。
- *     否则用户既听不到也看不到，只会怀疑"是不是没读出来"。 */
-function speakInterrupt(text: string): void {
-  notePlayed(text)
-  wakeUp() // 朗读唤醒
-  // 队列里没读的句子 → 气泡补齐（只补前两句，避免刷屏）
-  if (pendingTexts.length) {
-    const dropped = pendingTexts.splice(0, pendingTexts.length)
-    droppedSpeakCount += dropped.length
-    if (!muted) {
-      for (const t of dropped) {
-        const plain = cleanSpeech(t)
-        for (const u of spokenUnits(plain, SPEAK_MAX).slice(0, 2)) showBubble(u)
-      }
-    }
-    console.info(`[nori] interrupt: ${dropped.length} 条未读文本改以气泡呈现`)
-  }
-  pendingTexts.push(text)
-  interruptHold += 1 // 预合成期间挂住队列，防止旧的 speakText 循环把新文本当自己的句子先播一遍
-  const switchNow = (): void => {
-    playToken += 1
-    if (currentSrc) { try { currentSrc.stop() } catch { /* ignore */ } currentSrc = null }
-    interruptHold = Math.max(0, interruptHold - 1)
-    void pumpQueue()
-  }
-  // 首句预合成：命中缓存就立刻切；否则等合成好再切（旧音频继续说完，不留空白）
-  const firstUnit = spokenUnits(cleanSpeech(parseTagged(text)[0]?.text ?? text), SPEAK_MAX)[0]
-  if (muted || !firstUnit || ttsCache.has(firstUnit)) { switchNow(); return }
-  void fetchTts(firstUnit, playToken)
-    .then(() => switchNow())
-    .catch(() => switchNow())
-}
-
-/** 同 turn 追加：加入队列尾部，不打断当前（读完上一段再接） */
-function speakAppend(text: string): void {
-  notePlayed(text)
-  wakeUp() // 朗读唤醒
-  if (muted) {
-    const first = parseTagged(text)[0]
-    if (first && first.text) showBubble(first.text)
-    return
-  }
-  pendingTexts.push(text)
-  void pumpQueue()
-}
-
-async function pumpQueue(): Promise<void> {
-  if (pumping) return
-  pumping = true
-  try {
-    while (pendingTexts.length && interruptHold === 0) {
-      const text = pendingTexts.shift()!
-      await speakText(text, playToken)
-    }
-  } finally {
-    pumping = false
-  }
-}
-
+// ─── 朗读队列（打断/追加/优先插入的排队策略在 src/speakQueue.ts，可单测）──
+const queue = createSpeakQueue({
+  speakOne: (text, token) => speakText(text, token),
+  prewarm: (unit, token) => fetchTts(unit, token),
+  hasCached: (unit) => tts.has(unit),
+  currentToken: () => playToken,
+  bumpToken: () => { playToken += 1 },
+  stopCurrent: () => { if (currentSrc) { try { currentSrc.stop() } catch { /* ignore */ } currentSrc = null } },
+  isMuted: () => muted,
+  wake: () => wakeUp(),
+  onDropped: (units) => { if (!muted) for (const u of units) showBubble(u) },
+  onPreview: (unit) => showBubble(unit),
+  log: (m) => console.info(m),
+})
+const speakInterrupt = (text: string): void => queue.interrupt(text)
+const speakAppend = (text: string): void => queue.append(text)
+const speakPriority = (text: string): void => queue.priority(text)
 /** 兼容旧调用：独立触发（如打招呼）→ 打断重排 */
-function speak(text: string): void {
-  speakInterrupt(text)
-}
-
-/** 优先插入（摸头等反馈台词）：打断当前正在读的句子、插到队首立即说，
- * 但【保留等待队列】——摸头台词说完后，剩余文本继续朗读（不截断）。 */
-function speakPriority(text: string): void {
-  notePlayed(text)
-  wakeUp() // 朗读唤醒
-  playToken += 1 // 作废在途 TTS 与当前句
-  if (currentSrc) { try { currentSrc.stop() } catch { /* ignore */ } currentSrc = null }
-  pendingTexts.unshift(text) // 队首插入，保留其余等待文本
-  void pumpQueue()
-}
+const speak = (text: string): void => queue.interrupt(text)
 
 btnMute.addEventListener('click', () => {
   muted = !muted
@@ -635,26 +497,7 @@ const EMOTION_TABLE: Record<Emotion, { expr?: string; reaction?: number; holdMs?
   think:      { expr: '10_Doubt',   reaction: 3, holdMs: 15000 }, // 思考：Doubt + Stare_in（Param132 疑问嘴不影响 MouthOpenY，可正常张口）
 }
 
-/** 关键词 → 情绪（顺序即优先级：先命中先取） */
-const EMOTION_KEYWORDS: Array<[Emotion, RegExp]> = [
-  ['excited', /哇|天哪|居然|太棒|好耶|惊喜|没想到|万岁|好厉害|真厉害|吓一跳/],
-  ['happy', /开心|高兴|太好了|真好|嘿嘿|哈哈|嘻嘻|喜欢|爱了|棒|好呀|好哇|真不错|有趣|摸摸头|舒服/],
-  ['sad', /难过|伤心|遗憾|可惜|哭了|想哭|好痛|失落|寂寞|舍不得/],
-  ['angry', /生气|可恶|气死|气人|讨厌|过分|岂有此理|不干了|不行了/],
-  ['refuse', /拒绝|我不要|才不要|不要不要|别别别|不愿意|免了|算了|不去|不行不行|NoNo|说no/],
-  ['surprised', /竟然|居然|吃惊|惊讶|吓到|突然/],
-  ['troubled', /麻烦|难办|纠结|怎么办|头疼|犯难|为难|不知所措/],
-  ['doubt', /奇怪|怎么回|为什么|真的吗|是这样吗|疑问|嗯？|？|想不通/],
-  ['dizzy', /晕|眼花|天旋地转|昏/],
-  ['serious', /认真|严肃|重要|必须|一定|警告|注意|记住/],
-  ['speechless', /无语|说不出话|沉默|无言以对/],
-  ['shy', /害羞|不好意思|谢谢|麻烦你了|脸红/],
-]
-
-function classifyEmotion(text: string): Emotion {
-  for (const [e, re] of EMOTION_KEYWORDS) if (re.test(text)) return e
-  return 'default'
-}
+// 关键词 → 情绪的分类器在 src/emotions.ts（纯逻辑，可在 node 里直接单测）
 
 let lastExprApplied = '' // 当前实际应用的表情，避免同表情重复切换（口型/过渡不被频繁打断）
 let currentEmotion: Emotion = 'default'
@@ -928,7 +771,7 @@ function connect(): void {
       setThinking(false) // 有输出了，思考态结束
       // 情绪联动：优先 LLM 情绪标签（首句）；普通句只有命中关键词才切情绪——无情绪句
       // 不打断当前表情（驻留由 scheduleEmotionReset 统一管理，避免逐句推流把表情秒打回 default）
-      const firstTag = parseTagged(msg.text).find((t) => t.emo)
+      const firstTag = parseTaggedSentences(msg.text).find((t) => t.emo)
       if (firstTag && firstTag.emo) setEmotion(firstTag.emo)
       else {
         const c = classifyEmotion(msg.text)
@@ -1206,7 +1049,7 @@ function goSleep(): void {
   if (!model) { resetSleepTimer(); return }
   if (sleeping) return
   // 朗读中不入睡：长回复逐句播放可能超过 90s，播放完后的完整空闲再重新计时
-  if (currentSrc || pumping || pendingTexts.length) { resetSleepTimer(); return }
+  if (currentSrc || queue.busy()) { resetSleepTimer(); return }
   if (currentEmotion !== 'default') setEmotion('default') // 睡前清表情，防止带嘴/带眼表情残留睁眼
   sleeping = true
   playSleepMotion()
@@ -1278,7 +1121,7 @@ connect()
         expression: ex && ex.File ? { file: ex.File, name: ex.Name ?? null } : null,
         sleeping, stroke, thinking, emotion: currentEmotion,
         figure: { girl: +figureValue.toFixed(2), q: +qfigureValue.toFixed(2) },
-        speaking: !!(currentSrc || pumping || pendingTexts.length),
+        speaking: !!(currentSrc || queue.busy()),
       }
     } catch (e) { return { loaded: true, error: String(e) } }
   },

@@ -56,3 +56,12 @@ export function dropByPrefix<K extends string>(
   }
   return n
 }
+
+
+/** djb2 文本指纹（base36）。宿主广播指纹与 widget 重复朗读检测共用一种算法 ——
+ *  以前两侧各写一遍同样的 5381 循环，改一处就会让两边的"重复"判定口径不一致。 */
+export function hashText(s: string): string {
+  let h = 5381
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0
+  return h.toString(36)
+}

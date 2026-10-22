@@ -25,6 +25,8 @@
  *   `90%` → `百分之九十`；`0.9` → `零点九`；`3~5` → `三到五`。**不要**在插件侧重复转换。
  */
 
+import { VALID_EMO_TAGS } from './emotions.js'
+import type { Emotion } from './emotions.js'
 import { cleanSpeech } from './segmentation.js'
 
 import { CJK_ALNUM, codeFence } from './textPatterns.js'
@@ -228,4 +230,27 @@ export function friendlyApprovalReason(reason: string): string {
   const m = raw.match(/^escalate sandbox to (\S+?):\s*([\s\S]*)$/)
   if (m) return `允许本次操作使用 ${m[1]} 权限：${m[2]}`
   return raw
+}
+
+
+/** 行首情绪标签（改写层每行以【情绪】开头） */
+const EMO_TAG_RE = /^【([^】]+)】\s*/
+
+/** 逐句 {text, emo}：剥标签、剥控制标记（标签绝不能进合成文本，否则会被当正文念出来） */
+/** 逐句 {text, emo}：emo 为 null 表示该行没有显式标签 */
+export interface TaggedSentence { text: string; emo: Emotion | null }
+export function parseTaggedSentences(text: string): TaggedSentence[] {
+  return text.split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => {
+      const m = line.match(EMO_TAG_RE)
+      if (m && VALID_EMO_TAGS.has(m[1])) return { text: stripTags(line.slice(m[0].length)).trim(), emo: m[1] as Emotion }
+      return { text: stripTags(line).trim(), emo: null }
+    })
+}
+
+/** 剥掉残留的情绪标签与残骸（含 ICU 切分留下的 `…【` / `serious】…`） */
+export function stripTags(text: string): string {
+  return cleanSpeech(text)
 }

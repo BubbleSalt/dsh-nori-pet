@@ -57,7 +57,7 @@ export function readReframeHot(reframePath: string, cached: string): string {
     const s = readFileSync(reframePath, 'utf8')
     const t = stripBom(s)
     return t.trim() ? t : cached
-  } catch {
+  } catch { // 读失败 → 退回启动时缓存的副本（见上方注释）
     return cached
   }
 }
@@ -71,7 +71,7 @@ export function loadPersona(repoRoot: string, cfg: PersonaConfig = {}): Persona 
     const reframe = stripBom(readFileSync(reframePath, 'utf8'))
     if (!prompt.trim() || !reframe.trim()) return null
     return { prompt, reframe }
-  } catch {
+  } catch { // 读取/权限失败 → 当作人设缺失：改写层降级为原文朗读
     return null
   }
 }

@@ -60,7 +60,7 @@ export function wavFrameRms(buf: Buffer): number[] {
       rms[f] = Math.sqrt(sum / frameN)
     }
     return rms
-  } catch {
+  } catch { // WAV 非法或被截断 → 无帧数据（调用方按无长音处理，不阻断播报）
     return []
   }
 }

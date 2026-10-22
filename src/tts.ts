@@ -109,7 +109,7 @@ export function createSpeakHandler(deps: SpeakHandlerDeps): (req: IncomingMessag
         Number.isFinite(units) && units > 0 ? units : undefined,
         Number.isFinite(lines) && lines > 0 ? lines : undefined,
       )
-    } catch {
+    } catch { // body 不是合法 JSON → 400
       json(400, { error: 'invalid json' })
       return
     }
@@ -232,7 +232,7 @@ export function createSpeakHandler(deps: SpeakHandlerDeps): (req: IncomingMessag
             if (maxContiguousSpeech(nb) <= maxContiguousSpeech(buf)) buf = nb
             else break
           } else { clearTimeout(timer); break }
-        } catch {
+        } catch { // 拖长重生是尽力而为：这次重生失败就保留上一版音频
           break
         } finally {
           clearTimeout(timer)
@@ -240,7 +240,7 @@ export function createSpeakHandler(deps: SpeakHandlerDeps): (req: IncomingMessag
       }
       res.writeHead(200, { 'content-type': ct, 'content-length': buf.length, 'cache-control': 'no-store' })
       res.end(buf)
-    } catch (e) {
+    } catch (e) { // 上游合成失败 → 503（前端据此区分 sovits 未上线 / 超时）
       json(503, { error: 'tts offline: ' + String((e as Error)?.message ?? e).slice(0, 120) })
     }
   }

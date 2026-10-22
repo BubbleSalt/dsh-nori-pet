@@ -161,7 +161,7 @@ function sentences(text: string): string[] {
       } else out.push(s)
     }
     return out
-  } catch { return [text] }
+  } catch { return [text] } // Intl.Segmenter 不可用 → 整段当一句（宁可长，不丢内容）
 }
 
 /**
