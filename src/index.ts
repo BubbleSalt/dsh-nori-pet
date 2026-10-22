@@ -38,25 +38,8 @@ export const inject = ['webServer', 'llm', 'credentials', 'sessions']
 // 保持插件入口的对外 API 不变（dsh loader 按 `Config` 导出名读 schema）。
 export { Config } from './config.js'
 
-/**
- * 朗读文本硬截断：按句累加，超过 maxSentences 句或 maxChars 字就停。
- * 用于概括输出的兜底——提示词约束实测会被超，超长的"概括"会重新变成长朗读。
- * 情绪标签（【emo】）算作所在句的前缀，不会被单独切断。
- */
-function capSpeech(text: string, maxSentences: number, maxChars: number): string {
-  // 只按句末标点切：概括输出很短，且情绪标签【emo】自带全角括号不会被切断，无需 ICU 分词
-  const units = String(text).split(/(?<=[。！？!?…；;\n])/).filter((s) => s.trim().length > 0)
-  const out: string[] = []
-  let len = 0
-  for (const u of units) {
-    if (out.length >= maxSentences) break
-    if (len + u.length > maxChars && out.length > 0) break
-    out.push(u.trim())
-    len += u.trim().length
-  }
-  return out.join('')
-}
-
+// capSpeech 已抽到 src/capSpeech.ts（保住开头+结尾，只丢中间；可单测）
+import { capSpeech } from './capSpeech.js'
 
 /**
  * 概括模式追加规则（接在 persona 之后）。设计约束来自实测需求：
@@ -104,9 +87,9 @@ export function apply(ctx: AppContext, config: Config) {
 function applyInner(ctx: AppContext, config: Config) {
   if (!config.enabled) return
   // 人设资产（persona/ 或配置覆盖）；缺失 → 改写层降级为原文朗读（启动即判定，进程内只读一次）
-  const persona = loadPersona(dirname(HOST_DIR), { personaPrompt: config.personaPrompt, personaReframe: config.personaReframe })
+  const persona = loadPersona(dirname(HOST_DIR), { personaPrompt: config.personaPrompt, personaReframe: config.personaReframe, personaSummary: config.personaSummary })
   // 改写任务指令的路径（persona/reframe.txt）：每次改写请求热读一次，改风格无需重载插件
-  const personaPaths = resolvePersonaPaths(dirname(HOST_DIR), { personaPrompt: config.personaPrompt, personaReframe: config.personaReframe })
+  const personaPaths = resolvePersonaPaths(dirname(HOST_DIR), { personaPrompt: config.personaPrompt, personaReframe: config.personaReframe, personaSummary: config.personaSummary })
   if (!persona) log('[dsh-nori-pet] persona 人设文件缺失（persona/prompt.txt 或 persona/reframe.txt），改写层关闭：直接朗读原始输出')
   const clients = new Set<PetClient>()
   // 宿主侧（传输层）状态：WS 握手计数 + 最近一条广播/发送帧（都只给 /api/status 取证用）

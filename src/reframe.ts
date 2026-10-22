@@ -13,7 +13,8 @@ import { join } from 'node:path'
 import type { Config } from './config.js'
 import type { NoriLogs } from './logs.js'
 import type { loadPersona, resolvePersonaPaths } from './prompt.js'
-import { readReframeHot } from './prompt.js'
+import { buildSystemPrompt, readReframeHot, readSummaryHot } from './prompt.js'
+import { RUNAWAY_MAX_CHARS, RUNAWAY_MAX_SENTENCES } from './capSpeech.js'
 import { softCut } from './segmentation.js'
 import { extractSpeakable } from './speakable.js'
 import { addBounded } from './util.js'
@@ -50,18 +51,6 @@ export function createReframe(deps: ReframeDeps) {
   /** 已发过概括的 turn（防重复播报）；只关心近期，故有界 */
   const summarizedTurns = new Set<number>()
 
-const SUMMARY_RULES = [
-'【本次任务：概括】上面是 dsh 一轮输出的全文。请把它概括成我会朗读的一段话。',
-'规则：',
-'1. 长度上限（硬约束，实测容易超）：总共不超过 3 句、不超过 140 字。宁可少说，不可啰嗦——',
-'   超长的概括会重新变成"长朗读"。每句都必须短，不要写长复合句。',
-'2. 必须保留的事实：文件名/路径、数字（端口、行号、耗时、数量）、命令、结论（成功/失败/待办）、',
-'   阻塞原因、需要用户确认或授权的事。',
-'3. 可以丢的内容：中间过程、重复叙述、"我接下来要……"这类预告、无信息量的过渡句。',
-'4. 不要复述开头：开头几句可能已经逐句读过了，直接讲"结论 + 要你做的事"，不要重复。',
-'5. 严禁编造。不确定的部分就说"细节在屏幕上"。',
-'6. 只输出要朗读的话，不要加任何前缀、编号、标题、markdown 标记。',
-].join('\n')
 
 /**
  * 把一段文本经 LLM 改写为 Nori 口吻；失败返回 null（调用方降级用原文）。
@@ -72,7 +61,12 @@ async function reframeText(text: string, mode: 'reframe' | 'summary' = 'reframe'
   if (!persona) return text // 人设缺失：不改写，直接以原文朗读（保持链路通）
   const t0 = Date.now()
   const input = text.length > config.reframeMaxInput ? text.slice(0, config.reframeMaxInput) + '……' : text
-  const system = persona.prompt + '\n\n' + readReframeHot(personaPaths.reframePath, persona.reframe) + (mode === 'summary' ? '\n\n' + SUMMARY_RULES : '')
+  // 两处都热读：reframe.txt（风格）与 summary.txt（概括规则）改完下一次请求就生效，无需重载
+  const system = buildSystemPrompt({
+    prompt: persona.prompt,
+    reframe: readReframeHot(personaPaths.reframePath, persona.reframe),
+    summary: readSummaryHot(personaPaths.summaryPath, persona.summary),
+  }, mode)
 
   // 运行时直读 nori.config.json reframe 段（明文，可随时改无需重装）：
   // apiKey / reframeBaseUrl / reframeModel / reframeMaxTokens / reframeTimeoutMs / reframeTrace
@@ -314,10 +308,11 @@ async function summarizeAndBroadcast(sid: string, turn: number, text: string): P
   let out = await reframeText(text, 'summary')
   if (!out) out = extractSpeakable(text) // 概括失败 → 播精简后的原文（跳过代码/日志/清单），仍好过念全文
   if (!out) return
-  // 长度硬兜底：prompt 约束实测会被超（3111 字原文曾概括出 262 字）→ 超长时按句截断
-  const capped = capSpeech(out, 4, 150)
-  if (capped !== out) logs.appendErr(`[nori-pet] summary truncated ${out.length}→${capped.length} chars (turn=${turn})`)
-  out = capped
+  // 只拦"跑飞"：正常概括略超目标（3 句/140 字）不管 —— 多说两句只是多读几秒，
+  // 删掉结论才是真损失。超过 6 句/400 字才认为失控，且截断时保住开头和结尾。
+  const guarded = capSpeech(out, RUNAWAY_MAX_SENTENCES, RUNAWAY_MAX_CHARS)
+  if (guarded !== out) logs.appendErr(`[nori-pet] summary runaway ${out.length}→${guarded.length} chars (turn=${turn})`)
+  out = guarded
   const ms = Date.now() - t0
   onAssistant(out)
   // turn 用 `<N>-sum` 标记"这是概括"；widget 侧会把它归一成同一个逻辑 turn N

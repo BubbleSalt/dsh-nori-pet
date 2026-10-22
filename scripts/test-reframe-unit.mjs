@@ -110,8 +110,8 @@ test('enqueueReframe：同一 turn 内相同文本只投递一次（去重）', 
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
-test('概括：sentinel turn <N>-sum + capSpeech 硬截断 + 记入 hasSummarized', async () => {
-  const long = '很长的概括内容。'.repeat(60) // 480 字，必须被截到 150
+test('概括：sentinel turn <N>-sum + 跑飞兜底截断 + 记入 hasSummarized', async () => {
+  const long = '很长的概括内容。'.repeat(60) // 480 字，超过 400 的兜底阈值 → 截断
   const { r, seen, dir } = makeHarness({ llm: fakeLlm(long) })
   try {
     r.enqueueReframe('s1', 3, '很长的原文', 'summary')
@@ -119,7 +119,7 @@ test('概括：sentinel turn <N>-sum + capSpeech 硬截断 + 记入 hasSummarize
     const b = seen.broadcasts.find((x) => String(x.turn).endsWith('-sum'))
     assert.ok(b, '应广播一条 <N>-sum')
     assert.equal(b.turn, '3-sum')
-    assert.ok(b.text.length <= 150, '必须被 capSpeech 截断，实测 ' + b.text.length)
+    assert.ok(b.text.length <= 400, '超过兜底阈值要截断，实测 ' + b.text.length)
     assert.equal(r.hasSummarized(3), true)
     assert.equal(r.hasSummarized(4), false)
   } finally { rmSync(dir, { recursive: true, force: true }) }
