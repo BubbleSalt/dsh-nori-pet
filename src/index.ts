@@ -360,8 +360,20 @@ function applyInner(ctx: AppContext, config: Config) {
     const path = url.pathname.slice(PREFIX.length)
     // 模型契约：前端据此决定模型路径/口型参数/情绪映射（换模型不用重编译 widget）
     if (path === '/api/model-map' && req.method === 'GET') {
-      const map = mergeModelMap(config.model)
-      const body = JSON.stringify({ ...map, gaps: modelGaps(map) })
+      // 模型契约属于**运行时配置**（nori.config.json 的 model 段，热读），不是 dsh 插件 Config：
+      // 用户改配置不需要重装/改 patch；nori.config.json 优先于插件 Config 里的同名段。
+      let fileModel: unknown = {}
+      try { fileModel = JSON.parse(readFileSync(join(dirname(HOST_DIR), 'nori.config.json'), 'utf8')).model ?? {} } catch { /* 无配置文件 → 用插件 Config */ }
+      const map = mergeModelMap({ ...(config.model as object), ...(fileModel as object) })
+      // 字段名与 nori.config.json 的 model 段完全一致（file 而非 modelPath）——
+      // 同一个东西两个名字，正是这次「接口返回 Haru、页面还是 Nori」的根因。
+      const body = JSON.stringify({
+        file: map.modelPath,
+        mouthParam: map.mouthParam,
+        idleGroup: map.idleGroup,
+        emotions: map.emotions,
+        gaps: modelGaps(map),
+      })
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
       res.end(body)
       return

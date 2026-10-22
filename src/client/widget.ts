@@ -943,6 +943,8 @@ const wakeUp = (): void => sleep.wake()
 initLive2D()
 
 ;(window as any).__noriPetWidget = {
+  /** 诊断：当前生效的模型契约（换模型没反应时先看这个） */
+  modelMap: () => ({ path: MAP.modelPath, mouth: MAP.mouthParam, idle: MAP.idleGroup, gaps: modelGaps(MAP), loaded: !!model }),
   root, showBubble, speak,
   get model() { return model },
   diag: () => ({ speak: { ...speakStats }, wsState: ws.healthy() ? 1 : -1, wsRetry: ws.retries(), muted, lastMsg, lastSpeak, scale: scaleFactor,

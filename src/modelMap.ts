@@ -69,7 +69,9 @@ export function mergeModelMap(raw: unknown, base: ModelMap = DEFAULT_MODEL_MAP):
   if (!raw || typeof raw !== 'object') return base
   const o = raw as Record<string, unknown>
   const out: ModelMap = { ...base, emotions: { ...base.emotions } }
-  if (typeof o.file === 'string' && o.file.trim()) out.modelPath = o.file.trim()
+  // 兼容两种来源：配置文件写 `file`，宿主 /api/model-map 回传的是解析后的 `modelPath`
+  const file = typeof o.file === 'string' ? o.file : typeof o.modelPath === 'string' ? o.modelPath : ''
+  if (file.trim()) out.modelPath = file.trim()
   if (typeof o.mouthParam === 'string' && o.mouthParam.trim()) out.mouthParam = o.mouthParam.trim()
   if (typeof o.idleGroup === 'string' && o.idleGroup.trim()) out.idleGroup = o.idleGroup.trim()
   if (o.emotions && typeof o.emotions === 'object') {
