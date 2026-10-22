@@ -447,6 +447,8 @@ const queue = createSpeakQueue({
 })
 const speakInterrupt = (text: string): void => queue.interrupt(text)
 const speakAppend = (text: string): void => queue.append(text)
+/** 概括覆盖：丢掉尚未开播的细粒度排队，改成读这段概括（正在播的那句不打断） */
+const speakReplace = (text: string): void => queue.replacePending(text)
 const speakPriority = (text: string): void => queue.priority(text)
 /** 兼容旧调用：独立触发（如打招呼）→ 打断重排 */
 const speak = (text: string): void => queue.interrupt(text)
@@ -684,7 +686,8 @@ function handleWsMessage(raw: string, reply: (data: string) => void): void {
       // 同一轮的话排队而不是抢断（早先按 typeof number 判断，概括那批会打断自己）
       const route = planAssistantRoute(activeTurn, ev.turn)
       activeTurn = route.base
-      if (route.action === 'append') speakAppend(ev.text)
+      if (route.action === 'replace') speakReplace(ev.text)
+      else if (route.action === 'append') speakAppend(ev.text)
       else speakInterrupt(ev.text)
       return
     }

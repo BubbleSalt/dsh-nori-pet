@@ -39,6 +39,8 @@ export interface SpeakQueueDeps {
 
 export interface SpeakQueue {
   interrupt: (text: string) => void
+  /** 用这段文本**替换**尚未开播的排队内容（概括覆盖细粒度播报用；不打断正在播的那句） */
+  replacePending: (text: string) => void
   append: (text: string) => void
   priority: (text: string) => void
   /** 队列里还有活（含正在播）——睡觉计时器等据此让路 */
@@ -113,6 +115,24 @@ export function createSpeakQueue(deps: SpeakQueueDeps): SpeakQueue {
     void prewarm(firstUnit, currentToken()).then(switchNow, switchNow)
   }
 
+  /**
+   * 概括覆盖：丢掉尚未开播的排队内容，换成这一段。
+   * 与 interrupt 的区别——不 bumpToken、不 stopCurrent：正在播的那句照常播完，
+   * 也不会把被丢掉的文本再以气泡形式补出来（那些内容本来就会被概括覆盖）。
+   */
+  function replacePending(text: string): void {
+    notePlayed(text)
+    wake()
+    if (isMuted()) {
+      const first = parseTaggedSentences(text)[0]
+      if (first && first.text) onPreview(first.text)
+      return
+    }
+    pending.splice(0, pending.length)
+    pending.push(text)
+    void pump()
+  }
+
   /** 同 turn 追加：加入队列尾部，不打断当前（读完上一段再接） */
   function append(text: string): void {
     notePlayed(text)
@@ -138,6 +158,7 @@ export function createSpeakQueue(deps: SpeakQueueDeps): SpeakQueue {
 
   return {
     interrupt,
+    replacePending,
     append,
     priority,
     busy: () => pumping || pending.length > 0,

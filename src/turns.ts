@@ -10,7 +10,7 @@
 export type TurnRoute = {
   /** 归一后的逻辑 turn（`12` 与 `12-sum` → `12`）；null = 没有 turn 身份 */
   base: string | null
-  action: 'append' | 'interrupt'
+  action: 'append' | 'interrupt' | 'replace'
 }
 
 export function planAssistantRoute(current: string | null, turn: number | string | null | undefined): TurnRoute {
@@ -18,6 +18,8 @@ export function planAssistantRoute(current: string | null, turn: number | string
   const base = raw === null ? null : raw.replace(/-sum$/, '')
   if (base === null) return { base: null, action: 'interrupt' }
   const cur = current === null ? null : current.replace(/-sum$/, '') // 入参也归一：调用方存的是 base 也好、原始 turn 也好，判定都一致
+  // 概括帧（N-sum）同轮到达 → 替换掉尚未开播的细粒度内容，别让同一段话被讲两遍
+  if (cur !== null && base === cur && raw !== null && raw.endsWith('-sum')) return { base, action: 'replace' }
   if (cur === null || base === cur) return { base, action: 'append' }
   return { base, action: 'interrupt' }
 }

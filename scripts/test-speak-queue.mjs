@@ -122,3 +122,23 @@ test('busy：有在途朗读或排队时为真（睡觉计时器据此让路）'
   await step()
   assert.equal(q.busy(), false)
 })
+
+test('replacePending：丢掉未开播的排队内容，换成概括，且不打断正在播的那句', async () => {
+  const { q, calls, token, step } = makeQueue({ hold: true })
+  q.interrupt('第一段很长的话，正在朗读中')
+  await tick()
+  q.append('排队中的细粒度第二段')
+  q.append('排队中的细粒度第三段')
+  await tick()
+  const before = token()
+  const stoppedBefore = calls.stopped
+  q.replacePending('整轮的概括')
+  await tick()
+  assert.equal(token(), before, '不该 bumpToken（正在播的那句要读完）')
+  assert.equal(calls.stopped, stoppedBefore, '不该 stopCurrent')
+  assert.equal(q.pendingCount(), 1, '排队的细粒度内容被替换成一条概括')
+  assert.deepEqual(calls.bubbles, [], '被覆盖的内容不再以气泡补出来（否则又看两遍）')
+  await step()
+  await step()
+  assert.ok(calls.spoke.includes('整轮的概括'), '概括要接上播')
+})
