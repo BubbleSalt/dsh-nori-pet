@@ -50,6 +50,8 @@ export interface EmotionDriverDeps {
   playIdle: () => void
   /** 诊断输出（必填：表情应用失败必须留下痕迹） */
   log: (msg: string, err?: unknown) => void
+  /** 情绪→表现映射（模型契约）；不传则用 Nori 默认表。每次调用时取，便于配置热更新 */
+  table?: () => Record<Emotion, { expr?: string; reaction?: number; holdMs?: number }>
 }
 
 export interface EmotionOptions {
@@ -94,7 +96,7 @@ export function createEmotionDriver(deps: EmotionDriverDeps): EmotionDriver {
     }
     const changed = currentEmotion !== e
     currentEmotion = e
-    const cfg = EMOTION_TABLE[e]
+    const cfg = (deps.table ? deps.table() : EMOTION_TABLE)[e]
     const expr = cfg.expr
     if (!expr) { deps.log('[nori-pet] emotion has no expression: ' + e); return }
     // 仅在实际变化（或 force 重申）时才应用，避免逐句推流反复打断过渡/口型

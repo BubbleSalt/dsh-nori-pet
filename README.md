@@ -49,18 +49,53 @@ Nori 常驻在浏览器角落，随时可以摆弄：
 ## 📦 你需要准备的资产
 
 > 模型 / 声线 / 授权人设文本是第三方 IP（见文末[许可](#许可与第三方资产)），**不进仓库、不随 Release 分发**。
-> 改写任务指令（`persona/reframe.txt`）无版权问题，**随仓库提供**。
+> 改写任务指令（`persona/reframe.txt`）与概括规则（`persona/summary.txt`）无版权问题，**随仓库提供**。
 > 仓库自带空占位目录：克隆后把文件放进对应目录即可（放好后重跑 `.\install.ps1`）。
 
 | 资产 | 放哪 | 必需？ | 缺失时会发生什么 |
 |---|---|---|---|
-| Nori Live2D 模型（原版 `Nori_web`） | `Nori_web/` | **必需** | `install.ps1` 直接报错停止（桌宠需要模型才能跑） |
+| Live2D 模型（任意 Cubism4，或原版 `Nori_web`） | `Nori_web/`，或配置 `model.file` | 可选 | **纸片人模式**：气泡 + 语音正常，表情/动作不可用（不再中断安装） |
 | 声线样本 `wav`（Nori 声音） | `voice/` | 可选 | 能装、能动，但语音用 GPT-SoVITS 服务端默认音色 |
 | 人设文本 `prompt.txt` | `persona/` | 可选 | 改写层自动关闭，直接朗读 assistant 原始输出（改写任务指令 `reframe.txt` 已随仓库提供） |
 | Live2D Core | `cubism_sdk/Core/` | — | 不用管：install 自动从官方 CDN 下载 |
 | GPT-SoVITS 部署 + 默认权重 | 仓库外 | 可选 | 语音不可用，其余正常（见[下方章节](#gpt-sovits可选)） |
 
 **资产获取途径**：暂未公开，待公布（作者整理好分发渠道后会在此补充）。
+
+### 🔌 换模型：模型契约
+
+模型是第三方 IP，仓库不分发。任何 **Cubism4** 模型都能接上，只要在 `nori.config.json` 里写清映射
+（不配置 = 用 Nori 原版值，本机行为不变）：
+
+```json
+{
+  "model": {
+    "file": "Nori_web/my.model3.json",
+    "mouthParam": "ParamMouthOpenY",
+    "idleGroup": "Idle",
+    "emotions": {
+      "happy":  { "expr": "Smile",  "reaction": 0 },
+      "sad":    { "expr": "Tears" },
+      "think":  { "expr": "Doubt",  "reaction": 3, "holdMs": 15000 }
+    }
+  }
+}
+```
+
+- `expr` = 模型 `model3.json` 里 `Expressions` 的 `Name`；`reaction` = `Motions.Reactions` 组的下标
+- **逐字段覆盖**：只写你想改的，其余沿用默认；14 种情绪不必全配
+- **缺项不是错误**：某个情绪没配 → 该情绪只是没有表情，气泡和声音照常
+- 缺哪几种情绪的可视资源，会在浏览器 console 和 `GET /api/model-map` 的 `gaps` 里报出来
+- 模型加载失败 → 自动进入纸片人模式（`install.ps1` 也不再因此中断）
+
+**不想手写映射？让工具猜一份草稿**（依据是表情文件的参数指纹，因为第三方模型的表情名常是 `F01`/`F02`）：
+
+```bash
+node scripts/model-map-from-model.mjs Nori_web/my.model3.json        # 报告 + 可粘贴 JSON
+node scripts/model-map-from-model.mjs Nori_web/my.model3.json --write # 直接写进 nori.config.json
+```
+
+它会打印每个情绪认领了哪个表情、认不出的还剩哪些（只影响表情，不影响气泡和声音）。草稿需要人工核对。
 
 ---
 

@@ -144,7 +144,13 @@ $preModelDir = if ([string]$cfgFile.modelDir) { Resolve-ModelDir ([string]$cfgFi
 $preProbeOk = $false; $preProbeErr = ''
 try { $preProbeOk = [bool](Test-Path (Join-Path $preModelDir 'Nori.model3.json')) } catch { $preProbeErr = $_.Exception.Message }
 if (-not $preProbeOk) {
-  throw "Nori 模型缺失：未找到 Nori.model3.json（$preModelDir）。请先把 Live2D 模型放入仓库 Nori_web/ 目录（含 Nori.model3.json），再重跑本脚本。$(if ($preProbeErr) { "（探测该路径时报错：$preProbeErr）" })"
+  # 模型是第三方 IP（仓库不分发）：缺了**不再硬停** —— 桌宠会进入"纸片人模式"（气泡 + 语音正常，
+  # 表情/动作不可用）。装了模型后再重跑本脚本即可启用；想用自己的模型就改 nori.config.json 的 model 段。
+  Write-Host ""
+  Write-Warning "未找到模型（$preModelDir 下没有 Nori.model3.json）：继续安装，桌宠将进入纸片人模式。"
+  Write-Warning "  · 想用 Nori 原版模型：把模型放进 Nori_web/（含 Nori.model3.json）后重跑本脚本"
+  Write-Warning "  · 想用自己的模型：放进任意目录，并在 nori.config.json 配 model.file / model.emotions"
+  if ($preProbeErr) { Write-Warning "  · 探测该路径时报错：$preProbeErr" }
 }
 
 # ---- 0c) 配置引导：nori.config.json 缺失/为空时，交互式生成并让用户填写 ----
@@ -285,7 +291,8 @@ if (-not $ModelDir) {
 $modelProbeOk = $false; $modelProbeErr = ''
 try { $modelProbeOk = [bool](Test-Path (Join-Path $ModelDir 'Nori.model3.json')) } catch { $modelProbeErr = $_.Exception.Message }
 if (-not $ModelDir -or -not $modelProbeOk) {
-  throw "model dir unavailable (nori.config.json modelDir 或仓库内 Nori_web)：$ModelDir$(if ($modelProbeErr) { "（探测该路径时报错：$modelProbeErr）" })"
+  # 同上：模型缺失不阻断安装。配置里仍写默认 'Nori_web'，用户之后把模型放进去重跑即可。
+  Write-Warning "model dir unavailable（$ModelDir）$(if ($modelProbeErr) { "：$modelProbeErr" }) —— 继续安装，桌宠进入纸片人模式"
 }
 # 模型完整性校验（只查不改，保证安装效果一致）：只适配原版 Nori_web——睡眠动作
 # 00_Sleep 在 Idle 组（idle 池一员），缺失时睡眠会退化（不出错但不闭眼），提示换回原版。

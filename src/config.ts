@@ -92,6 +92,8 @@ const schema = z.object({
   personaPrompt: z.string().default(''),
   /** 改写任务补充指令文件（绝对/相对仓库根；留空探测 persona/reframe.txt） */
   personaReframe: z.string().default(''),
+  /** 模型契约（file/mouthParam/idleGroup/emotions）：换模型不用改代码，见 src/modelMap.ts */
+  model: z.any().default({}),
   /** 概括任务规则文件（绝对/相对仓库根；留空探测 persona/summary.txt；缺失则用内置默认规则） */
   personaSummary: z.string().default(''),
   /** WS/API 额外放行的 Origin 主机名（缺省仅 localhost/127.0.0.1；浏览器跨站请求一律拒绝） */

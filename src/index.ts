@@ -20,6 +20,7 @@ import type { Config } from './config.js'
 import { appendFatal, createLogs } from './logs.js'
 import { errMsg, hashText } from './util.js'
 import { createSpeakHandler } from './tts.js'
+import { mergeModelMap, modelGaps } from './modelMap.js'
 import { createReframe } from './reframe.js'
 import { createPipeline } from './pipeline.js'
 import { installEvents } from './events.js'
@@ -357,6 +358,14 @@ function applyInner(ctx: AppContext, config: Config) {
     }
     const url = new URL(req.url ?? '/', 'http://localhost')
     const path = url.pathname.slice(PREFIX.length)
+    // 模型契约：前端据此决定模型路径/口型参数/情绪映射（换模型不用重编译 widget）
+    if (path === '/api/model-map' && req.method === 'GET') {
+      const map = mergeModelMap(config.model)
+      const body = JSON.stringify({ ...map, gaps: modelGaps(map) })
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      res.end(body)
+      return
+    }
     if (path === '/api/status' && req.method === 'GET') {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ ok: true, tts: config.ttsUrl, model: 'Nori', prefix: PREFIX, ws: clients.size, events: stats.events, chunks: stats.chunks, textDelta: stats.textDelta, dupFeed: stats.dupFeed, assistant: stats.assistant, turnEnd: stats.turnEnd, hello: statHello, ack: statAck, lastAssistant: stats.lastAssistant, last: lastBroadcast, sent: lastSendFrame, recentBroadcasts, recentSpeaks }))

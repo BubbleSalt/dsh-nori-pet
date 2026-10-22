@@ -10,6 +10,9 @@ dist/
 *.7z
 *.zip
 
+# ── 开发文档：写给自己看的过程稿，不入库 ────────
+docs/
+
 # ── 本地缓存 / 备份（不入库）───────────────────
 .npm-cache/
 .backup-*/
@@ -29,10 +32,11 @@ dist/
 
 # ── 团队资产原件：授权人设由用户放置到 persona/（不入库）；人设原文档如置于根目录请勿提交 ──
 
-# ── 人设资产（授权文本 prompt.txt 不入库；改写任务指令 reframe.txt 随仓库提供）─
+# ── 人设资产（授权文本 prompt.txt 不入库；改写任务指令 reframe.txt、概括规则 summary.txt 随仓库提供）─
 persona/*
 !.gitkeep
 !persona/reframe.txt
+!persona/summary.txt
 
 # ── 本机安装配置（含机器路径；模板 nori.config.example.json 入库）─
 nori.config.json
@@ -52,3 +56,5 @@ ffmpeg/*
 # 教训：曾经把 REVIEW-2026-10-18.md 提交进公开仓库，结果它自己成了隐私面
 #（里面写着本机内网端点的主机名:端口、故障画像、密钥长度），还要专门回炉清理历史。
 REVIEW-*.md
+# 换模型验证用的第三方样例模型（Live2D 官方样例，仅本机测试，不入库）
+.tmp-*/

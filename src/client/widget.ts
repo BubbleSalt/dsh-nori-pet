@@ -9,6 +9,7 @@
 import * as PIXI from 'pixi.js'
 import { SPEAK_MAX, spokenUnits, widthOf } from '../segmentation.js'
 import { PREFIX } from '../protocol.js'
+import { DEFAULT_MODEL_MAP, mergeModelMap, modelGaps, type ModelMap } from '../modelMap.js'
 import { Live2DModel } from 'pixi-live2d-display/cubism4'
 import type { Emotion } from '../emotions.js'
 import { parseTaggedSentences } from '../speakText.js'
@@ -34,7 +35,7 @@ import { parseClientEvent } from '../clientProtocol.js'
 // 口型驱动：ParamMouthOpenY（编辑器实测 = 张嘴 open 参数，运行时表情管道证实有效）。
 // 关键时序：变形在 model.update()（csmUpdateModel）时按参数值计算，之后 setParameterValueById
 // 只改存储不重算顶点 → 必须把口型写在 coreModel.update() 之前，让变形用我们的值。
-const MOUTH_ID = 'ParamMouthOpenY'
+let MOUTH_ID = DEFAULT_MODEL_MAP.mouthParam // 模型契约可覆盖（见 loadModelMap）
 const LOGICAL_W = 300
 const LOGICAL_H = 280
 const DPR = Math.min(window.devicePixelRatio || 1, 2)
@@ -485,11 +486,31 @@ const emotionDriver = createEmotionDriver({
     const em = (model as any).internalModel.motionManager.expressionManager
     if (em?.resetExpression) em.resetExpression()
   },
-  playIdle: () => { model!.motion('Idle', 0) },
+  playIdle: () => { model!.motion(MAP.idleGroup, 0) },
   log: (m, err) => console.warn(m, err ?? ''),
+  table: () => MAP.emotions,
 })
 const setEmotion = (e: Emotion, opts?: { force?: boolean; forceReaction?: boolean; noReaction?: boolean }): void => emotionDriver.set(e, opts)
 const setThinking = (on: boolean): void => emotionDriver.setThinking(on)
+
+// ─── 模型契约（nori.config.json 的 model 段，宿主经 /api/model-map 下发） ──
+// 拿不到就用 Nori 默认值：本机行为与重构前一致；换模型只需改配置，不用重编译 widget。
+let MAP: ModelMap = DEFAULT_MODEL_MAP
+async function loadModelMap(): Promise<void> {
+  try {
+    const r = await fetch(PREFIX + '/api/model-map')
+    if (r.ok) MAP = mergeModelMap(await r.json())
+    else console.warn('[nori-pet] /api/model-map 返回', r.status, '，沿用默认模型映射')
+  } catch (err) {
+    console.warn('[nori-pet] 读取模型映射失败，沿用默认（Nori）', err)
+  }
+  MOUTH_ID = MAP.mouthParam
+  const gaps = modelGaps(MAP)
+  if (gaps.length) {
+    // 缺资源不是错误：这些情绪只会没有表情/动作，气泡与声音照常
+    console.warn('[nori-pet] 模型缺这些情绪的可视资源（仅影响表情）:', gaps.join(','))
+  }
+}
 
 // ─── Live2D ──────────────────────────────────────────────────────
 let app: PIXI.Application | null = null
@@ -534,10 +555,18 @@ async function startModel(): Promise<void> {
       autoStart: true,
       antialias: true,
     })
-    const m = await Live2DModel.from(PREFIX + '/assets/Nori.model3.json', {
-      autoInteract: false,
-      motionPreload: 'none' as any, // 库类型枚举与实际运行值不一致，运行时行为正确
-    })
+    await loadModelMap()
+    let m: any
+    try {
+      m = await Live2DModel.from(PREFIX + '/' + MAP.modelPath, {
+        autoInteract: false,
+        motionPreload: 'none' as any, // 库类型枚举与实际运行值不一致，运行时行为正确
+      })
+    } catch (err) {
+      // 纸片人模式：模型是第三方 IP，克隆者可能没有。气泡 + 声音与模型无关，必须还能用。
+      console.warn('[nori-pet] Live2D 模型未加载（' + MAP.modelPath + '），进入纸片人模式：气泡与语音正常，表情/动作不可用', err)
+      return
+    }
     model = m
     // pixi-live2d-display@0.4 的 peerDeps 是 @pixi/* v6，而本 bundle 的 EventBoundary 来自 pixi.js v7：
     // v6 对象把 isInteractive 当作布尔属性，v7 命中测试按方法调用 → 指针移到画布即抛
