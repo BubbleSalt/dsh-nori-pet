@@ -31,22 +31,23 @@ function get(path) {
   })
 }
 
-/** 裸 WS 升级：origin 传 'LOCAL' 用 BASE 自身，传其他字符串原样带上 */
-function upgrade(origin) {
+/** 裸 WS 升级：origin 传 'LOCAL' 用 BASE 自身，传其他字符串原样带上。
+ *  bare=true 时不带 RFC6455 握手头（Upgrade/Connection）——用于验证宿主会拒掉这种伪升级。 */
+function upgrade(origin, bare = false) {
   return new Promise((resolve) => {
     const url = new URL(BASE)
     const key = randomBytes(16).toString('base64')
+    const headers = {
+      'Sec-WebSocket-Key': key,
+      'Sec-WebSocket-Version': '13',
+      Origin: origin === 'LOCAL' ? BASE : origin,
+    }
+    if (!bare) Object.assign(headers, { Connection: 'Upgrade', Upgrade: 'websocket' })
     const req = http.request({
       hostname: url.hostname,
       port: url.port || 80,
       path: PREFIX + '/ws',
-      headers: {
-        Connection: 'Upgrade',
-        Upgrade: 'websocket',
-        'Sec-WebSocket-Key': key,
-        'Sec-WebSocket-Version': '13',
-        Origin: origin === 'LOCAL' ? BASE : origin,
-      },
+      headers,
     })
     req.on('upgrade', (res) => {
       const expect = createHash('sha1').update(key + WS_GUID).digest('base64')
@@ -83,6 +84,12 @@ try {
   const evil = await upgrade('http://evil.example.com')
   check('跨站 Origin WS 被拒', !evil.upgraded,
     evil.upgraded ? '意外升级成功' : evil.status !== undefined ? 'HTTP ' + evil.status : '连接销毁')
+
+  // 只带 Sec-WebSocket-Key、不带 Upgrade/Connection 的伪升级必须被拒（旧版会直接 101 升格，
+  // 留下一个永远不说话的半开 socket 常驻 clients 表）
+  const bare = await upgrade('LOCAL', true)
+  check('缺 Upgrade/Connection 头的伪升级被拒', !bare.upgraded,
+    bare.upgraded ? '意外升级成功' : bare.status !== undefined ? 'HTTP ' + bare.status : '连接销毁')
 
   if (failed) {
     console.error(failed + ' check(s) failed')

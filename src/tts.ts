@@ -21,6 +21,11 @@ import { maxContiguousSpeech } from './wav.js'
 
 /** 单次上游请求的超时（毫秒）。覆盖"拿到响应头"与"读完响应体"两段 */
 const UPSTREAM_TIMEOUT_MS = 30000
+/**
+ * 单个 /api/speak 请求的**总预算**（毫秒）：重试 + 拖长重生都会再打上游，
+ * 不封顶时最坏情况是 2 次合成 + 3 次重生 ≈ 150s —— 面板那边的播报队列会跟着卡死。
+ */
+const TOTAL_BUDGET_MS = 40000
 /** 4xx/5xx 后重试前的等待（毫秒）：GPT-SoVITS Windows 热路径偶发 "tts failed" */
 const RETRY_DELAY_MS = 800
 /** "拖长"判定阈值（秒）与重生次数上限：AR 在鼻音叹词上采样循环，实测 >3.5s 不间断有声 */
@@ -159,11 +164,13 @@ export function createSpeakHandler(deps: SpeakHandlerDeps): (req: IncomingMessag
     if (tts.refPrompt) url.searchParams.set('prompt_text', tts.refPrompt)
     try {
       // 上游偶发推理 400（GPT-SoVITS Windows 热路径偶发 "tts failed"）：对 4xx/5xx 单次重试
+      const deadline = Date.now() + TOTAL_BUDGET_MS
       let lastStatus = 0
       let upBody = ''
       let buf: Buffer | null = null
       let ct = 'audio/wav'
       for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0 && Date.now() > deadline) break // 预算耗尽就别再打一次上游
         const ctrl = new AbortController()
         const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_MS)
         let r: Response
@@ -210,7 +217,7 @@ export function createSpeakHandler(deps: SpeakHandlerDeps): (req: IncomingMessag
       // 安全网：最长连续语音 >3.5s 判定为 AR 采样循环拖长（"嗯/唔"等鼻音叹词偶发），
       // 用更高随机性参数（0.95/15）重生成替换，最多 3 次；仅当结果更短才采用。
       let guardLoops = 0
-      while (buf && maxContiguousSpeech(buf) > LOOP_SPEECH_SEC && guardLoops < LOOP_REGEN_MAX) {
+      while (buf && maxContiguousSpeech(buf) > LOOP_SPEECH_SEC && guardLoops < LOOP_REGEN_MAX && Date.now() < deadline) {
         guardLoops++
         const warm = new URL(url)
         warm.searchParams.set('temperature', '0.95')

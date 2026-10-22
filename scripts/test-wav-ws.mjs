@@ -160,6 +160,14 @@ test('parseFrame：ping 帧（0x9）与 16 位长度客户端帧', () => {
   assert.equal(p.consumed, frame.length)
 })
 
+test('parseFrame：fin 标志（分片消息靠它判定收齐）', () => {
+  // 0x81 = FIN=1 文本帧；0x01 = FIN=0 文本起始帧；0x00 = FIN=0 续帧
+  assert.equal(parseFrame(encodeFrame('done')).fin, true, 'encodeFrame 总是打 FIN=1')
+  assert.equal(parseFrame(Buffer.from([0x01, 0x02, 0x61, 0x62])).fin, false, 'FIN=0 起始帧')
+  assert.equal(parseFrame(Buffer.from([0x00, 0x02, 0x63, 0x64])).fin, false, 'FIN=0 续帧')
+  assert.equal(parseFrame(Buffer.from([0x80, 0x02, 0x65, 0x66])).fin, true, 'FIN=1 续帧')
+})
+
 test('acceptKey：RFC 6455 §1.3 官方示例向量', () => {
   assert.equal(acceptKey('dGhlIHNhbXBsZSBub25jZQ=='), 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=')
 })

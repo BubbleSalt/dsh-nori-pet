@@ -37,6 +37,8 @@ export function encodeFrame(payload: Buffer | string, opcode = 1): Buffer {
 
 export interface ParsedFrame {
   opcode: number
+  /** FIN=1：本帧是消息的最后一帧（0x1 起始帧 / 0x0 续帧的分片靠它判定收齐） */
+  fin: boolean
   payload: Buffer
   /** 本帧占用的字节数（调用方据此从缓冲区切除） */
   consumed: number
@@ -74,5 +76,5 @@ export function parseFrame(buf: Buffer): ParsedFrame | null {
     payload = Buffer.from(payload)
     for (let i = 0; i < payload.length; i++) payload[i] = payload[i]! ^ maskKey[i % 4]!
   }
-  return { opcode, payload, consumed: off + len }
+  return { opcode, fin: (b0 & 0x80) !== 0, payload, consumed: off + len }
 }

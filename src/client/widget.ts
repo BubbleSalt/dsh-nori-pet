@@ -341,6 +341,11 @@ function cacheTts(text: string, buf: ArrayBuffer): void {
   ttsCache.set(text, buf)
 }
 
+/** 单句合成的客户端超时：宿主内部最多"两轮上游 + 拖长重生"（服务端总预算 40s），
+ *  这里留出余量。**必须给超时**：fetch 永不返回时这句的 Promise 会挂死，
+ *  而播报是串行队列 —— 一句卡住整条队列（用户观感"桌宠哑了、之后再也不说话"）。 */
+const TTS_FETCH_TIMEOUT_MS = 60000
+
 /** 向宿主合成一句音频；返回 ArrayBuffer（被打断/失败返回 null）。不打断当前播放。
  *  顺带把这条文本占的"汉字宽"报给宿主：/api/status 里能直接看到断句是否贴着预算。 */
 function fetchTts(text: string, token: number): Promise<ArrayBuffer | null> {
@@ -349,6 +354,7 @@ function fetchTts(text: string, token: number): Promise<ArrayBuffer | null> {
   return fetch(PREFIX + '/api/speak', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
+    signal: AbortSignal.timeout(TTS_FETCH_TIMEOUT_MS),
     body: JSON.stringify({
       text,
       budget: SPEAK_MAX,
@@ -369,7 +375,11 @@ function fetchTts(text: string, token: number): Promise<ArrayBuffer | null> {
       cacheTts(text, buf) // 打断时预合成的结果，下次直接命中
       return token === playToken ? buf : null
     })
-    .catch(() => { showBubble('（sovits 未上线）'); return null })
+    .catch((e: any) => {
+      // 超时与"连不上"要分开说：前者是服务端太慢（还在跑），后者是 sovits 没起来
+      showBubble(e?.name === 'TimeoutError' ? '（TTS 超时）' : '（sovits 未上线）')
+      return null
+    })
 }
 
 /** 播放已合成的音频；返回 Promise，播放完或被打断时 resolve。 */

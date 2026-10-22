@@ -1038,6 +1038,16 @@ function applyInner(ctx: AppContext, config: Config) {
       socket.destroy()
       return
     }
+    // RFC6455 握手头校验：只认 Sec-WebSocket-Key 是不够的——任何普通 GET（被中间件/
+    // 宿主转发进来的 HTTP 请求）只要带了该头就会被升格成 WS 连接，然后以"半开 socket"
+    // 常驻 clients 列表。必须同时要求 Upgrade: websocket 且 Connection 含 upgrade。
+    const upgradeHdr = String(req.headers.upgrade ?? '').toLowerCase()
+    const connHdr = String(req.headers.connection ?? '').toLowerCase()
+    if (upgradeHdr !== 'websocket' || !connHdr.includes('upgrade')) {
+      try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n') } catch { /* ignore */ }
+      socket.destroy()
+      return
+    }
     const key = (req.headers['sec-websocket-key'] as string) || ''
     if (!key) { socket.destroy(); return }
     const accept = acceptKey(key)
@@ -1067,16 +1077,19 @@ function applyInner(ctx: AppContext, config: Config) {
         return
       }
       if (frame.opcode === 0x8) { clients.delete(client); socket.end(); return }
+      // 文本消息（0x1）/续帧（0x0）：按 fin 标志累积，直到整条消息收齐才解析。
+      // 旧版不看 fin——每条帧都当场 JSON.parse 后清空，分片消息会被截断丢弃（浏览器发大消息就会）。
       if (frame.opcode === 0x1 || frame.opcode === 0x0) {
+        if (frame.opcode === 0x1) fragParts = [] // 新消息从干净的累积器开始
         fragParts.push(frame.payload)
-        // 简化：单帧即完整消息（浏览器 WebSocket 发送小 JSON 不会分片）
+        if (!frame.fin) return
         const text = Buffer.concat(fragParts).toString('utf8')
+        fragParts = []
         try {
           const msg = JSON.parse(text)
           if (msg && msg.type === 'hello' && typeof msg.sessionId === 'string') { client.sessionId = msg.sessionId; statHello += 1 }
           if (msg && msg.type === 'ack') statAck += 1
         } catch { /* 非 JSON 忽略 */ }
-        fragParts = []
       }
     }
 
@@ -1179,11 +1192,21 @@ function applyInner(ctx: AppContext, config: Config) {
     else log('[dsh-nori-pet] api_v2 watchdog: GPT-SoVITS not found (set gsvBase/venvPy or place in repo); respawn disabled')
     // 探测地址跟随 ttsUrl（旧版硬编码 9880，自定义端口会对着错误端口探测/拉起）
     let probeUrl = 'http://127.0.0.1:9880/tts?text=%E6%B5%8B&media_type=wav'
+    // 拉起时用的 host/port 也跟随 ttsUrl。旧版只让**探测**跟随、拉起仍写死 `-p 9880`：
+    // 自定义端口（比如 9881）会"探测 9881 失败 → 在 9880 拉起 → 再探测 9881 仍失败"，
+    // 于是每 10~46s 拉一个秒退的重型进程，既起不来也不报错。
+    let spawnHost = '127.0.0.1'
+    let spawnPort = '9880'
+    let spawnLocal = true // ttsUrl 指向远程机器时不该在本机拉起
     try {
       const pu = new URL(config.ttsUrl)
       pu.searchParams.set('text', '测')
       pu.searchParams.set('media_type', 'wav')
       probeUrl = pu.toString()
+      // hostname 拿去比对前先还原成不带方括号的形式（URL 里 IPv6 是 '[::1]'）
+      spawnLocal = LOCAL_HOSTS.has(pu.hostname) || pu.hostname === '[::1]'
+      spawnHost = spawnLocal ? pu.hostname.replace(/^\[|\]$/g, '') : '127.0.0.1'
+      spawnPort = pu.port || (pu.protocol === 'https:' ? '443' : '80')
     } catch { log('[dsh-nori-pet] ttsUrl 非法，watchdog 探测退回默认 9880：' + config.ttsUrl) }
     // numba 缓存与 ffmpeg：仓库内（audio/、ffmpeg/）或环境变量，避免写死机器路径
     const numbaCache = process.env.NUMBA_CACHE_DIR || join(dirname(HOST_DIR), 'audio', 'numba_cache')
@@ -1200,6 +1223,8 @@ function applyInner(ctx: AppContext, config: Config) {
         } catch { /* 网络错误/超时 → 判定需要拉起 */ }
         if (alive) { nextSpawnAllowedAt = 0; return }
         if (!GSV_BASE || !VENV_PY) return
+        // ttsUrl 指向远程机器：本地拉起没有意义（拉了也不会被探测到），只探测不拉起
+        if (!spawnLocal) return
         // 刚拉起的进程仍在冷启动（模型加载要几十秒）→ 不要重复拉起
         const now = Date.now()
         for (const [child, until] of spawnWaitUntil) if (until <= now) spawnWaitUntil.delete(child)
@@ -1231,7 +1256,7 @@ function applyInner(ctx: AppContext, config: Config) {
         } catch (e) { log('[dsh-nori-pet] tts model preset 读取配置失败: ' + errMsg(e)) }
         try {
           const { spawn } = await import('node:child_process')
-          const child = spawn(VENV_PY, ['api_v2.py', '-a', '127.0.0.1', '-p', '9880', '-c', ttsCfgArg], {
+          const child = spawn(VENV_PY, ['api_v2.py', '-a', spawnHost, '-p', spawnPort, '-c', ttsCfgArg], {
             cwd: GSV_BASE,
             stdio: 'ignore',
             detached: false,
@@ -1254,7 +1279,7 @@ function applyInner(ctx: AppContext, config: Config) {
             spawnWaitUntil.delete(child)
             if (code !== 0) log('[dsh-nori-pet] api_v2 exited code=' + code + '（若端口被占用或权重缺失会秒退，下次探测才会重试）')
           })
-          log('[dsh-nori-pet] api_v2 watchdog: spawning pid=' + (child.pid ?? '?') + ' (9880 was down)')
+          log('[dsh-nori-pet] api_v2 watchdog: spawning pid=' + (child.pid ?? '?') + ' (' + spawnHost + ':' + spawnPort + ' was down)')
           nextSpawnAllowedAt = Date.now() + SPAWN_GRACE_MS
         } catch (e) {
           log('[dsh-nori-pet] api_v2 watchdog spawn failed: ' + String(e))
