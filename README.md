@@ -425,6 +425,13 @@ src/speakQueue.ts      朗读队列：打断/追加/优先插入的排队策略�
 src/ttsClient.ts       TTS 客户端：合成缓存 + 单句请求 + 204/503/超时话术（可单测）
 src/turns.ts           turn 路由：一条 assistant 文本该排队还是打断（`12` 与 `12-sum` 同一轮）
 src/sleepTimer.ts      入睡计时器：turn 未结束不睡、朗读中不睡、假醒防御（可单测）
+src/patStroke.ts       摸头判定：按住时长/拖动距离/台词冷却/头部跟随归一化（可单测）
+src/clientLayout.ts    布局换算：收边、缩放档位、画布尺寸（可单测）
+src/wsClient.ts        WebSocket 传输：握手、后台不重连、退避重试、自愈 ensure（可单测）
+src/bubbleQueue.ts     气泡队列：每条独立淡出、同屏上限 6、行数回报（可单测）
+src/lipSync.ts         口型换算：RMS → 张嘴度、播放收尾判定（可单测）
+src/playback.ts        音频播放：token 作废、口型交还、句柄清理（可单测）
+src/emotionDriver.ts   情绪表现：表情门控、小动作时机、驻留回落、思考态（可单测）
 src/client/widget.ts   浏览器 widget：Live2D 渲染、情绪、睡眠、摸头、UI 锚定（单独打包，不经宿主 tsc）
 src/client/url-shim.ts widget 打包用的浏览器安全 url 垫片（pixi 依赖 Node url 的替代）
 tsconfig.json          宿主编译配置（严格模式，含未使用检查）

@@ -18,6 +18,7 @@ import type { Config } from './config.js'
 import { cleanSpeech } from './segmentation.js'
 import { endWithPeriod, toSpeakable } from './speakText.js'
 import { maxContiguousSpeech } from './wav.js'
+import { CJK_CLASS } from './textPatterns.js'
 
 /** 单次上游请求的超时（毫秒）。覆盖"拿到响应头"与"读完响应体"两段 */
 const UPSTREAM_TIMEOUT_MS = 30000
@@ -50,7 +51,8 @@ export function normalizeSpeakText(raw: string): string {
   // 情绪标签是控制标记、不是正文：断句/截断后可能残留（ICU 会切在 `【` 与 `serious` 之间），
   // 必须在送去合成前剥干净，否则 GPT-SoVITS 会把"serious】"当文本念出来（用户实测听到过）
   t = cleanSpeech(t)
-  t = t.replace(/([\u4e00-\u9fff])\s*([A-Za-z]{2,}[A-Za-z0-9'\-]*)/g, '$1，$2')
+  // 中文紧贴拉丁词（`用index.ts`）在 TTS 里会连读，插一个逗号断开；CJK 范围取共享类，别再抄一份
+  t = t.replace(new RegExp(`([${CJK_CLASS}])\\s*([A-Za-z]{2,}[A-Za-z0-9'\\-]*)`, 'g'), '$1，$2')
   return endWithPeriod(t)
 }
 

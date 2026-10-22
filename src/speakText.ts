@@ -30,7 +30,7 @@ import type { Emotion } from './emotions.js'
 import { classifyEmotion } from './emotions.js'
 import { cleanSpeech } from './segmentation.js'
 
-import { CJK_ALNUM, codeFence } from './textPatterns.js'
+import { CJK_ALNUM, CJK_CLASS, codeFence } from './textPatterns.js'
 
 export interface SpeakTextOptions {
   /** 是否朗读 URL（false = 直接删掉；默认 true，读作"某个链接"） */
@@ -70,7 +70,11 @@ const stripLineRef = (s: string): string => s.replace(/(?::\d+(?:-\d+)?|#L\d+(?:
  * 用户说的"莫名其妙"。所以要先把整条路径吃掉，再只把文件名放回去。
  * ⚠ 尾串**排除中文**：`C:/a/b里的内容` 不能把"里的内容"一起吞掉（会吃掉正文）。
  */
-const RE_PATH = /(?:[A-Za-z]:[\\/]|~[\\/]|\\\\)[^\s，。！？；、）】」》"…\u4e00-\u9fff\u3000-\u303f]*|(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+/g
+const RE_PATH = new RegExp(
+  String.raw`(?:[A-Za-z]:[\\/]|~[\\/]|\\\\)[^\s，。！？；、）】」》"…${CJK_CLASS}\u3000-\u303f]*`
+  + String.raw`|(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+`,
+  'g',
+)
 /** 行内代码 `` `…` ``：agent 的路径几乎都在里面，按代码跨识别才能吃掉**带空格的路径** */
 const RE_CODE_SPAN = /`([^`\n]{1,200})`/g
 

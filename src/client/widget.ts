@@ -22,6 +22,12 @@ import { PAT_REPLIES, createPatDetector, inHeadZone } from '../patStroke.js'
 import { SCALE_STEP, canvasSize as sizeFor, clampPos as clampPosTo, clampScale, defaultPos, stepScale, wheelScale } from '../clientLayout.js'
 import { createWsClient } from '../wsClient.js'
 import type { WsLike } from '../wsClient.js'
+import { createBubbleQueue } from '../bubbleQueue.js'
+
+import { createPlayback } from '../playback.js'
+import type { AudioCtxLike } from '../playback.js'
+import { createEmotionDriver } from '../emotionDriver.js'
+import { parseClientEvent } from '../clientProtocol.js'
 ;(window as any).PIXI = PIXI
 
 // 路由前缀来自 protocol.ts（与宿主、smoke-test 同一份）；宿主 hello 帧下发的 prefix 与之同源
@@ -258,33 +264,39 @@ dragHandle.addEventListener('wheel', onWheel, { passive: false })
   })
 }
 
-// ─── 气泡（每条独立气泡 + 各自 10 秒后独立淡出） ────────────────
-const MAX_BUBBLES = 6
+// 播报结果统计：气泡出现 ≠ 有声音（合成失败/被宿主热重载打断时就是静默气泡）。
+// 这三个数在 window.__noriPetWidget.diag().speak 里能直接看到，别靠猜。
+const speakStats = { requested: 0, played: 0, skipped: 0, failed: 0 }
+
+// ─── 气泡：每条独立淡出、同屏上限 6，策略在 src/bubbleQueue.ts（可单测）──
 /** 上一条气泡实际渲染了几行（真机反馈，随 /api/speak 上报供对账） */
 let lastBubbleLines = 0
-function showBubble(text: string): void {
-  const bub = document.createElement('div')
-  bub.className = 'bub'
-  bub.textContent = text
-  bubble.appendChild(bub)
+const bubbles = createBubbleQueue<HTMLDivElement>({
+  mount: (text) => {
+    const bub = document.createElement('div')
+    bub.className = 'bub'
+    bub.textContent = text
+    bubble.appendChild(bub)
+    return bub
+  },
+  fade: (bub) => bub.classList.add('fading'),
+  remove: (bub) => { try { bub.remove() } catch { /* 已被上层移除 */ } },
   // 数一下这条气泡实际占了几行：断句预算（SPEAK_MAX=34）是按"一行 17 个汉字"定的，
   // 行数是唯一能验证它的真机信号，报给宿主就能在 /api/status 里看到 34 是不是刚好两行。
-  try {
-    const rect = bub.getBoundingClientRect()
-    const cs = getComputedStyle(bub)
-    const lh = parseFloat(cs.lineHeight) || (parseFloat(cs.fontSize) || 13) * 1.4
-    const innerH = rect.height - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0)
-      - (parseFloat(cs.borderTopWidth) || 0) - (parseFloat(cs.borderBottomWidth) || 0)
-    lastBubbleLines = Math.max(1, Math.round(innerH / lh))
-  } catch { /* ignore */ }
-  // 普通 column：DOM 第一个在顶部（最旧）—— 超出上限时移除顶部最旧
-  while (bubble.children.length > MAX_BUBBLES) bubble.removeChild(bubble.firstChild!)
-  // 每条独立淡出：10 秒后淡出并收起，不影响其他气泡
-  window.setTimeout(() => {
-    bub.classList.add('fading')
-    window.setTimeout(() => { try { bub.remove() } catch { /* ignore */ } }, 450)
-  }, 20000)
-}
+  measureLines: (bub) => {
+    try {
+      const rect = bub.getBoundingClientRect()
+      const cs = getComputedStyle(bub)
+      const lh = parseFloat(cs.lineHeight) || (parseFloat(cs.fontSize) || 13) * 1.4
+      const innerH = rect.height - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0)
+        - (parseFloat(cs.borderTopWidth) || 0) - (parseFloat(cs.borderBottomWidth) || 0)
+      return Math.max(1, Math.round(innerH / lh))
+    } catch { return null }
+  },
+  retag: (bub, text) => { bub.textContent = text },
+  onLines: (n) => { lastBubbleLines = n },
+})
+const showBubble = (text: string): HTMLDivElement => bubbles.show(text)
 
 // ─── 语音（TTS → WAV → 播放 → RMS → 口型；句子分段 + 打断重排） ──
 let audioCtx: AudioContext | null = null
@@ -345,45 +357,17 @@ const tts = createTtsClient({
 })
 const fetchTts = (text: string, token: number): Promise<ArrayBuffer | null> => tts.get(text, token)
 
-/** 播放已合成的音频；返回 Promise，播放完或被打断时 resolve。 */
-function playBuffer(buf: ArrayBuffer, token: number): Promise<void> {
-  return new Promise((resolve) => {
-    ;(async () => {
-      if (token !== playToken || muted) { resolve(); return }
-      const ctx2 = getCtx()
-      // 自动播放策略：suspended 时静默尝试恢复——解锁引导已由"睡着等待首次点击"完成，无需再提示
-      try { await ctx2.resume() } catch { /* ignore */ }
-      if (token !== playToken || muted) { resolve(); return }
-      const audio = await ctx2.decodeAudioData(buf)
-      if (token !== playToken || muted) { resolve(); return }
-      const src = ctx2.createBufferSource()
-      src.buffer = audio
-      const analyser = ctx2.createAnalyser()
-      analyser.fftSize = 512
-      src.connect(analyser)
-      analyser.connect(ctx2.destination)
-      currentSrc = src
-      const data = new Uint8Array(analyser.fftSize)
-      const start = performance.now()
-      const loop = (): void => {
-        if (token !== playToken) { mouthTarget = -1; setMouth(0); return }
-        if (performance.now() - start >= audio.duration * 1000) { mouthTarget = -1; setMouth(0); return }
-        analyser.getByteTimeDomainData(data)
-        let sum = 0
-        for (let i = 0; i < data.length; i++) {
-          const v = (data[i] - 128) / 128
-          sum += v * v
-        }
-        mouthTarget = Math.min(1, Math.sqrt(sum / data.length) * 7)
-        requestAnimationFrame(loop)
-      }
-      loop()
-      src.onended = () => { mouthTarget = -1; setMouth(0); if (currentSrc === src) currentSrc = null; src.disconnect(); resolve() }
-      src.start()
-    })()
-  })
-}
-
+/** 播放：解码/起播/口型/收尾在 src/playback.ts（token 作废、口型交还都有断言） */
+const playback = createPlayback({
+  getCtx: () => getCtx() as unknown as AudioCtxLike,
+  isMuted: () => muted,
+  currentToken: () => playToken,
+  onMouth: (v) => { mouthTarget = v; if (v < 0) setMouth(0) }, // v<0 = 交还口型：立刻闭嘴，之后交给表情/呼吸
+  onSourceChange: (src) => { currentSrc = src as AudioBufferSourceNode | null },
+  raf: (fn) => { requestAnimationFrame(fn) },
+  now: () => performance.now(),
+})
+const playBuffer = (buf: ArrayBuffer, token: number): Promise<void> => playback.play(buf, token)
 
 /** 朗读：优先按【情绪】标签逐句（每句激活对应表情）；无标签文本回落 splitSentences 本地分类。
  * 预取策略：窗口内并行合成 ≤4 句；第一句就绪即打断当前播放入口、立即开播，播放中后台推进预取。 */
@@ -430,9 +414,17 @@ async function speakText(text: string, token: number): Promise<void> {
     if (emo && !sleep.isSleeping()) setEmotion(emo) // LLM 情绪标签 → 逐句激活表情
     // 句首清场：表情切换可能残留嘴部参数，先归零再开播（保证口型从 0 跟随音量）
     try { (model as any).internalModel.coreModel.setParameterValueById(MOUTH_ID, 0, 1.0) } catch { /* ignore */ }
-    showBubble(sentences[i].text)
+    const bub = showBubble(sentences[i].text)
+    speakStats.requested += 1
     const buf = await fetchMap.get(i)!
-    if (token !== playToken || !buf) break
+    if (token !== playToken) break // 被打断：气泡留着（用户仍该看到这句话）
+    if (!buf) {
+      // 合成失败（sovits 未上线 / 超时 / 宿主热重载中）→ 气泡必须写清楚，别让它看着像正常播报
+      speakStats.failed += 1
+      bubbles.retag(bub, sentences[i].text + '（没读出来）')
+      break
+    }
+    speakStats.played += 1
     await playBuffer(buf, token)
   }
 }
@@ -475,91 +467,27 @@ btnMute.addEventListener('click', () => {
  * 标签→表情严格语义对应（happy=开心笑等）；口型独立于表情（cm.update 前置写 MouthOpenY）。
  * default = 纯待机：不应用表情（模型无 00_Default 表达式），直接回 Idle 0（00_Idle）。
  */
-const EMOTION_TABLE: Record<Emotion, { expr?: string; reaction?: number; holdMs?: number }> = {
-  default:    { }, // 无表情：回待机动作（setEmotion 特判 Idle 0）
-  happy:      { expr: '13_Happy',   reaction: 5 }, // 开心笑 + WakuWaku_in
-  excited:    { expr: '01_KiraKira', reaction: 6 }, // 星星眼 + Wakuwaku_loop
-  angry:      { expr: '03_Angry',   reaction: 7 },
-  refuse:     { expr: '11_Disgust', reaction: 12 }, // 拒绝：厌恶脸 + NoNoNo
-  sad:        { expr: '08_Tears' },
-  doubt:      { expr: '10_Doubt',   reaction: 8 },
-  troubled:   { expr: '09_Troubled', reaction: 9 },
-  shy:        { expr: '04_Shy',   reaction: 0 }, // Nod
-  surprised:  { expr: '01_KiraKira', reaction: 2 }, // 星光眼 + Stare_loop
-  dizzy:      { expr: '02_Dizzy',   reaction: 10 },
-  serious:    { expr: '12_Serious' },
-  speechless: { expr: '06_Speechless', reaction: 1 }, // ShakeHead
-  think:      { expr: '10_Doubt',   reaction: 3, holdMs: 15000 }, // 思考：Doubt + Stare_in（Param132 疑问嘴不影响 MouthOpenY，可正常张口）
-}
+// 情绪 → 表情/动作表在 src/emotionDriver.ts（与驻留回落规则一起可单测）
 
 // 关键词 → 情绪的分类器在 src/emotions.ts（纯逻辑，可在 node 里直接单测）
 
-let lastExprApplied = '' // 当前实际应用的表情，避免同表情重复切换（口型/过渡不被频繁打断）
-let currentEmotion: Emotion = 'default'
-let thinking = false
-let emotionTimer: number | null = null
-
-/** 表情驻留到期 → 回落 default（think 由 setThinking 独立管理，不在这里回收） */
-function scheduleEmotionReset(ms: number): void {
-  if (emotionTimer) window.clearTimeout(emotionTimer)
-  emotionTimer = window.setTimeout(() => {
-    if (!thinking && currentEmotion !== 'default') setEmotion('default')
-  }, ms)
-}
-
-/**
- * 切换情绪：换表情，情绪变化时附带播一次对应小动作（朗读中不抢）。
- * opts.force=true 强制重申表情（摸头等直接反馈场景，无视同表情门控）；
- * opts.forceReaction=true 强制播一次对应小动作（朗读中也能给反馈）；
- * opts.noReaction=true 不播小动作（揉头等需要保持头部跟随的场景）。
- * default = 纯待机：不应用表情（模型无 00_Default），直接回 Idle 0（00_Idle）并清表情门控。
- */
-function setEmotion(e: Emotion, opts?: { force?: boolean; forceReaction?: boolean; noReaction?: boolean }): void {
-  if (!model) return
-  if (sleep.isSleeping()) return // 睡觉不动表情（闭眼状态归睡觉逻辑管）
-  if (e === 'default') {
-    currentEmotion = 'default'
-    lastExprApplied = '' // 清门控：下一个表情无条件生效（"无表情在位"语义）
-    if (emotionTimer) { window.clearTimeout(emotionTimer); emotionTimer = null }
-    // 表情回中性（resetExpression = 无表情驻留，pixi 库语义）
-    try {
-      const em = (model as any).internalModel.motionManager.expressionManager
-      if (em?.resetExpression) em.resetExpression()
-    } catch { /* ignore */ }
-    if (!pat.active()) { try { model.motion('Idle', 0) } catch { /* ignore */ } } // 回待机动作
-    return
-  }
-  const changed = currentEmotion !== e
-  currentEmotion = e
-  const cfg = EMOTION_TABLE[e]
-  const expr = cfg.expr!
-  // 仅在实际表情变化（或 force 重申）时才调用 expression（同情绪连续句不再打断过渡/口型）
-  if (opts?.force || expr !== lastExprApplied) {
-    try {
-      model.expression(expr)
-      lastExprApplied = expr // 仅成功才记录——失败则下次继续重试，不会被门控吞掉
-    } catch (err) {
-      console.warn('[nori-pet] expression fail:', expr, err)
-    }
-  }
-  // noReaction：摸头等需要保持头部跟随的场景禁用 reaction 动作；揉头中（stroke）也一律不播，防头部曲线回盖
-  if (typeof cfg.reaction === 'number' && !pat.active() && !opts?.noReaction && (opts?.forceReaction || (changed && !currentSrc))) {
-    try { model.motion('Reactions', cfg.reaction) } catch { /* ignore */ }
-  }
-  scheduleEmotionReset(cfg.holdMs ?? 8000)
-}
-
-/** 思考态开关：agent 工作中显示沉思表情；结束收回（不覆盖朗读中的真实情绪） */
-function setThinking(on: boolean): void {
-  if (on) {
-    thinking = true
-    setEmotion('think')
-    return
-  }
-  if (!thinking) return
-  thinking = false
-  if (currentEmotion === 'think') setEmotion('default')
-}
+// ─── 情绪表现：表与规则在 src/emotionDriver.ts，这里只接模型操作 ──
+const emotionDriver = createEmotionDriver({
+  ready: () => !!model,
+  sleeping: () => sleep.isSleeping(),
+  patActive: () => pat.active(),
+  speaking: () => !!currentSrc,
+  applyExpression: (expr) => { model!.expression(expr) },
+  playMotion: (group, index) => { model!.motion(group, index) },
+  resetExpression: () => {
+    const em = (model as any).internalModel.motionManager.expressionManager
+    if (em?.resetExpression) em.resetExpression()
+  },
+  playIdle: () => { model!.motion('Idle', 0) },
+  log: (m, err) => console.warn(m, err ?? ''),
+})
+const setEmotion = (e: Emotion, opts?: { force?: boolean; forceReaction?: boolean; noReaction?: boolean }): void => emotionDriver.set(e, opts)
+const setThinking = (on: boolean): void => emotionDriver.setThinking(on)
 
 // ─── Live2D ──────────────────────────────────────────────────────
 let app: PIXI.Application | null = null
@@ -730,60 +658,54 @@ function initLive2D(): void {
   void startModel()
 }
 
-/** 协议分发：agent 输出 → 气泡 + 朗读；turn/情绪/权限申请都在这里路由 */
+/** 协议分发：字段解析在 src/clientProtocol.ts（turn 两形态/emote 白名单/空文本都有断言） */
 function handleWsMessage(raw: string, reply: (data: string) => void): void {
-  let msg: any
-  try { msg = JSON.parse(raw) } catch { return }
+  const ev = parseClientEvent(raw)
+  if (!ev) return
   lastMsg = raw.slice(0, 120)
   reply(JSON.stringify({ type: 'ack' }))
-  if (msg.type === 'approval' && typeof msg.text === 'string' && msg.text) {
-    // 权限申请提醒：打断当前朗读优先播报（原文，提醒用户回来处理）
-    lastSpeak = msg.text.slice(0, 60)
-    activeTurn = null
-    setThinking(false)
-    setEmotion('surprised') // 惊一下：权限申请需要用户注意
-    speakInterrupt(msg.text)
-    return
-  }
-  if (msg.type === 'assistant' && typeof msg.text === 'string' && msg.text) {
-    lastSpeak = msg.text.slice(0, 60)
-    setThinking(false) // 有输出了，思考态结束
-    // 情绪联动：优先 LLM 情绪标签（首句）；普通句只有命中关键词才切情绪——无情绪句
-    // 不打断当前表情（驻留由 scheduleEmotionReset 统一管理，避免逐句推流把表情秒打回 default）
-    const emo = emotionForAssistantText(msg.text)
-    if (emo) setEmotion(emo)
-    // turn 身份：改写路径给的是**数字** `12`，概括路径给的是**字符串** `12-sum`。
-    // 早先这里只认数字，于是概括那批拿到 null → 落到 speakInterrupt（打断）→
-    // playToken += 1 → 正在读的那句被腰斩、队列里剩下的句子作废（实测："第一句读了一半…
-    // 第二句气泡出现并打断朗读"，最后一句凭空消失）。改成统一按字符串比较，
-    // 并把 `N-sum` 归一到同一个逻辑 turn `N`（都是同一轮回答的话，应当排队而不是抢断）。
-    const route = planAssistantRoute(activeTurn, msg.turn)
-    activeTurn = route.base
-    if (route.action === 'append') speakAppend(msg.text)
-    else speakInterrupt(msg.text)
-    return
-  }
-  // 思考表情：agent 工作中（用户发言 / 工具调用）→ 沉思；turn 结束回收
-  if (msg.type === 'user') {
-    sleep.setTurnActive(true) // turn 激活：清入睡计时（turn 未结束不入睡）
-    sleep.setTurnActive(true)
-    wakeUp() // 用户开口即唤醒，不等到第一句回答
-    setThinking(true)
-    return
-  }
-  if (msg.type === 'tool') { setThinking(true); return }
-  if (msg.type === 'turn-end') {
-    sleep.setTurnActive(false) // turn 结束：入睡计时此刻才开始
-    setThinking(false)
-    resetSleepTimer()
-    return
-  }
-  // emote：宿主 /api/emote 手动触发（验证情绪联动用）
-  if (msg.type === 'emote') {
-    const e = String(msg.e ?? '')
-    if (e in EMOTION_TABLE) { setThinking(false); setEmotion(e as Emotion) }
-    if (typeof msg.text === 'string' && msg.text) { activeTurn = null; speakInterrupt(msg.text) }
-    return
+  switch (ev.kind) {
+    case 'approval':
+      // 权限申请提醒：打断当前朗读优先播报（原文，提醒用户回来处理）
+      lastSpeak = ev.text.slice(0, 60)
+      activeTurn = null
+      setThinking(false)
+      setEmotion('surprised') // 惊一下：权限申请需要用户注意
+      speakInterrupt(ev.text)
+      return
+    case 'assistant': {
+      lastSpeak = ev.text.slice(0, 60)
+      setThinking(false) // 有输出了，思考态结束
+      // 情绪联动：优先 LLM 情绪标签（首句）；普通句只有命中关键词才切情绪——无情绪句
+      // 不打断当前表情（驻留由 emotionDriver 统一管理，避免逐句推流把表情秒打回 default）
+      const emo = emotionForAssistantText(ev.text)
+      if (emo) setEmotion(emo)
+      // turn 身份：改写路径给数字 12，概括路径给字符串 12-sum —— 归一化在 planAssistantRoute 里，
+      // 同一轮的话排队而不是抢断（早先按 typeof number 判断，概括那批会打断自己）
+      const route = planAssistantRoute(activeTurn, ev.turn)
+      activeTurn = route.base
+      if (route.action === 'append') speakAppend(ev.text)
+      else speakInterrupt(ev.text)
+      return
+    }
+    // 思考表情：agent 工作中（用户发言 / 工具调用）→ 沉思；turn 结束回收
+    case 'user':
+      sleep.setTurnActive(true) // turn 激活：清入睡计时（turn 未结束不入睡）
+      wakeUp() // 用户开口即唤醒，不等到第一句回答
+      setThinking(true)
+      return
+    case 'tool': setThinking(true); return
+    case 'turn-end':
+      sleep.setTurnActive(false) // turn 结束：入睡计时此刻才开始
+      setThinking(false)
+      resetSleepTimer()
+      return
+    // emote：宿主 /api/emote 手动触发（验证情绪联动用）
+    case 'emote':
+      if (ev.emotion) { setThinking(false); setEmotion(ev.emotion) }
+      if (ev.text) { activeTurn = null; speakInterrupt(ev.text) }
+      return
+    default: return
   }
 }
 
@@ -959,7 +881,7 @@ function playSleepMotion(): void {
 const sleep = createSleepTimer({
   canSleep: () => !!model && !currentSrc && !queue.busy(),
   onSleep: () => {
-    if (currentEmotion !== 'default') setEmotion('default') // 睡前清表情，防带嘴/带眼的残留睁眼
+    if (emotionDriver.current() !== 'default') setEmotion('default') // 睡前清表情，防带嘴/带眼的残留睁眼
     playSleepMotion()
     showBubble('唔……Nori要睡着了。')
   },
@@ -986,13 +908,12 @@ const resetSleepTimer = (): void => sleep.reset()
 const wakeUp = (): void => sleep.wake()
 
 
-
 initLive2D()
 
 ;(window as any).__noriPetWidget = {
   root, showBubble, speak,
   get model() { return model },
-  diag: () => ({ wsState: ws.healthy() ? 1 : -1, wsRetry: ws.retries(), muted, lastMsg, lastSpeak, scale: scaleFactor,
+  diag: () => ({ speak: { ...speakStats }, wsState: ws.healthy() ? 1 : -1, wsRetry: ws.retries(), muted, lastMsg, lastSpeak, scale: scaleFactor,
     pos: root.style.left || root.style.right, top: root.style.top || root.style.bottom }),
   // 调试：让 Nori 说一段带标签的句子（完整走朗读 + 情绪标签链路）。
   // 用法：__noriPetWidget.say('【happy】晚饭吃什么好呀~\n【think】嗯……想想')
@@ -1023,7 +944,7 @@ initLive2D()
         motion: cur,        // 当前播放动作（group = Idle[0,2,3] / Sleep[0] / Reactions[0..12]）
         reserved: reserve,  // 排队待播的下一动作（如有）
         expression: ex && ex.File ? { file: ex.File, name: ex.Name ?? null } : null,
-        sleeping: sleep.isSleeping(), stroke: pat.active(), thinking, emotion: currentEmotion,
+        sleeping: sleep.isSleeping(), stroke: pat.active(), thinking: emotionDriver.isThinking(), emotion: emotionDriver.current(),
         figure: { girl: +figureValue.toFixed(2), q: +qfigureValue.toFixed(2) },
         speaking: !!(currentSrc || queue.busy()),
       }
